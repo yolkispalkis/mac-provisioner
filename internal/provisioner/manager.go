@@ -16,6 +16,10 @@ import (
 	"mac-provisioner/internal/stats"
 )
 
+/*=====================================================================
+  STRUCT
+  =====================================================================*/
+
 type Manager struct {
 	dfuManager   *dfu.Manager
 	notifier     *notification.Manager
@@ -33,8 +37,12 @@ func New(dfuMgr *dfu.Manager, notifier *notification.Manager, stats *stats.Manag
 	}
 }
 
+/*=====================================================================
+  PUBLIC — ОСНОВНАЯ ОБРАБОТКА
+  =====================================================================*/
+
 func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
-	/* ---------- защита от повторной обработки ---------- */
+	/*----- защита от параллельной обработки одного и того же -----*/
 	m.processingMu.Lock()
 	if m.processing[dev.SerialNumber] {
 		m.processingMu.Unlock()
@@ -49,166 +57,147 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 		m.processingMu.Unlock()
 	}()
 
-	log.Printf("🔄 Начинается обработка устройства %s (%s)", dev.SerialNumber, dev.Model)
-	startTime := time.Now()
+	start := time.Now()
 	m.stats.DeviceStarted()
+	targetID := dev.SerialNumber
 
-	targetIdentifier := dev.SerialNumber
-
-	/* ---------- DFU ---------- */
+	/*------------------------ DFU ------------------------*/
 	if !dev.IsDFU {
 		m.notifier.EnteringDFUMode(dev.SerialNumber)
-		log.Printf("📱 Попытка перевода в DFU режим для устройства %s", dev.SerialNumber)
+		log.Printf("📱 Переводим %s в DFU…", dev.SerialNumber)
 
 		if err := m.dfuManager.EnterDFUMode(dev.SerialNumber); err != nil {
-			log.Printf("❌ Ошибка перехода в DFU режим: %v", err)
-			if strings.Contains(err.Error(), "ручного входа") {
-				m.notifier.ManualDFURequired(dev.SerialNumber)
-				m.notifier.WaitingForDFU(dev.SerialNumber)
-				if ecid := m.waitForManualDFU(ctx, 60); ecid != "" {
-					targetIdentifier = ecid
-				} else {
-					m.fail(dev.SerialNumber, startTime, "Устройство не перешло в DFU")
-					return
-				}
-			} else {
-				m.fail(dev.SerialNumber, startTime, err.Error())
-				return
-			}
-		} else {
-			if ecid := m.dfuManager.GetFirstDFUECID(); ecid != "" {
-				targetIdentifier = ecid
-			}
+			m.handleDFUError(ctx, dev, start, err)
+			return
 		}
-	} else if dev.ECID != "" { // уже DFU
-		targetIdentifier = dev.ECID
 	}
 
-	/* ---------- RESTORE ---------- */
-	m.notifier.StartingRestore(dev.SerialNumber)
-	log.Printf("🔧 Начинается восстановление для %s (id: %s)", dev.SerialNumber, targetIdentifier)
+	/* если уже DFU → ECID */
+	if dev.IsDFU && dev.ECID != "" {
+		targetID = dev.ECID
+	}
 
-	if err := m.restoreDevice(ctx, targetIdentifier, dev.SerialNumber); err != nil {
-		log.Printf("❌ Ошибка восстановления %s: %v", targetIdentifier, err)
+	/*--------------------- RESTORE ---------------------*/
+	m.notifier.StartingRestore(dev.SerialNumber)
+	if err := m.restoreDevice(ctx, targetID, dev.SerialNumber); err != nil {
+		log.Printf("❌ restore error: %v", err)
 		m.notifier.RestoreFailed(dev.SerialNumber, err.Error())
 		m.notifier.PlayAlert()
-		m.stats.DeviceCompleted(false, time.Since(startTime))
+		m.stats.DeviceCompleted(false, time.Since(start))
 		return
 	}
 
 	m.notifier.RestoreCompleted(dev.SerialNumber)
 	m.notifier.PlaySuccess()
-	m.stats.DeviceCompleted(true, time.Since(startTime))
-	log.Printf("✅ Успешно восстановлено %s за %v", dev.SerialNumber, time.Since(startTime).Round(time.Second))
+	m.stats.DeviceCompleted(true, time.Since(start))
+	log.Printf("✅ %s восстановлен за %v", dev.SerialNumber, time.Since(start).Round(time.Second))
 }
 
-/* ====================================================================
-   RESTORE SECTION
-   ==================================================================== */
+/*=====================================================================
+  DFU ERROR HANDLER
+  =====================================================================*/
 
-func (m *Manager) restoreDevice(ctx context.Context, identifier, originalSerial string) error {
-	log.Printf("Начинается восстановление для идентификатора %s…", identifier)
+func (m *Manager) handleDFUError(
+	ctx context.Context, dev *device.Device, started time.Time, err error,
+) {
+	log.Printf("❌ DFU error: %v", err)
 
-	var cmd *exec.Cmd
+	// Требуется ручной DFU
+	if strings.Contains(err.Error(), "ручного") {
+		m.notifier.ManualDFURequired(dev.SerialNumber)
+		m.notifier.WaitingForDFU(dev.SerialNumber)
 
-	/* --- определяем формат идентификатора --- */
-	if strings.HasPrefix(strings.ToLower(identifier), "dfu-") {
-		identifier = strings.TrimPrefix(strings.ToLower(identifier), "dfu-")
-	}
-	if strings.HasPrefix(strings.ToLower(identifier), "0x") {
-		// cfgutil ожидает ECID в ДЕСЯТИЧНОМ формате → конвертируем
-		dec, err := hexToDec(identifier)
-		if err != nil {
-			return fmt.Errorf("не удалось конвертировать ECID %s: %w", identifier, err)
-		}
-		log.Printf("ℹ️  ECID %s → десятичный %s", identifier, dec)
-		identifier = dec
-	}
-
-	/* --- формируем команду --- */
-	if isDigits(identifier) {
-		cmd = exec.Command("cfgutil", "restore", "-e", identifier, "--erase")
-	} else {
-		cmd = exec.Command("cfgutil", "restore", "-s", identifier, "--erase")
-	}
-
-	/* --- выполняем --- */
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("cfgutil restore завершился с ошибкой: %w (%s)", err, string(out))
-	}
-
-	return m.waitForRestoreCompletion(ctx, identifier, originalSerial)
-}
-
-/* ====================================================================
-   HELPERS
-   ==================================================================== */
-
-// hexToDec("0x1A2B") -> "6699"
-func hexToDec(hexStr string) (string, error) {
-	hexStr = strings.TrimPrefix(strings.ToLower(hexStr), "0x")
-	value, err := strconv.ParseUint(hexStr, 16, 64)
-	if err != nil {
-		return "", err
-	}
-	return strconv.FormatUint(value, 10), nil
-}
-
-func isDigits(s string) bool {
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return false
+		if ecid := m.waitForManualDFU(ctx, 60*time.Second); ecid != "" {
+			dev.ECID = ecid
+			dev.IsDFU = true
+			return // продолжаем workflow — теперь устройство в DFU
 		}
 	}
-	return s != ""
-}
 
-/* ---------- ожидание ручного DFU ---------- */
-
-func (m *Manager) waitForManualDFU(ctx context.Context, seconds int) string {
-	for i := 0; i < seconds/2; i++ {
-		select {
-		case <-ctx.Done():
-			return ""
-		default:
-		}
-		time.Sleep(2 * time.Second)
-
-		if devs := m.dfuManager.GetDFUDevices(); len(devs) > 0 {
-			return devs[0].ECID
-		}
-		if i%5 == 0 {
-			log.Printf("⏳ Ожидаем DFU… %d/%d с", i*2, seconds)
-		}
-	}
-	return ""
-}
-
-/* ---------- завершение/статистика при ошибке ---------- */
-
-func (m *Manager) fail(serial string, started time.Time, errMsg string) {
-	m.notifier.RestoreFailed(serial, errMsg)
+	// Любая другая ошибка = отказ
+	m.notifier.RestoreFailed(dev.SerialNumber, err.Error())
 	m.notifier.PlayAlert()
 	m.stats.DeviceCompleted(false, time.Since(started))
 }
 
-/* ====================================================================
-   ОСТАВШИЕСЯ МЕТОДЫ (getDeviceStatus, waitForRestoreCompletion и т.д.)
-   --------------------------------------------------------------------
-   Ниже код не изменялся; оставлен как был.
-   ==================================================================== */
+/*=====================================================================
+  RESTORE (cfgutil)
+  =====================================================================*/
 
-func (m *Manager) waitForRestoreCompletion(ctx context.Context, identifier, originalSerial string) error {
-	/* оригинальная логика … */
-	maxWait := 30 * time.Minute
-	interval := 30 * time.Second
+func (m *Manager) restoreDevice(
+	ctx context.Context, identifier string, originalSerial string,
+) error {
+	log.Printf("🔧 restore start: identifier=%s", identifier)
 
-	timeout := time.After(maxWait)
-	ticker := time.NewTicker(interval)
+	// 1. Нормализуем идентификатор
+	useECID := false
+	id := strings.TrimPrefix(strings.ToLower(identifier), "dfu-")
+
+	if strings.HasPrefix(id, "0x") {
+		dec, err := hexToDec(id)
+		if err != nil {
+			return fmt.Errorf("ECID %s convert: %w", id, err)
+		}
+		id = dec
+	}
+	if isDigits(id) {
+		useECID = true
+	}
+
+	// 2. Формируем команду cfgutil
+	var cmd *exec.Cmd
+	if useECID {
+		cmd = exec.Command("cfgutil", "restore", "--ecid", id, "--erase")
+	} else {
+		cmd = exec.Command("cfgutil", "restore", "-s", id, "--erase")
+	}
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("cfgutil restore: %w\n%s", err, string(out))
+	}
+
+	// 3. Ждём окончания
+	return m.waitForRestoreCompletion(ctx, id, originalSerial)
+}
+
+/*=====================================================================
+  WAIT HELPERS
+  =====================================================================*/
+
+// ждём, пока пользователь вручную введёт Мак в DFU
+func (m *Manager) waitForManualDFU(ctx context.Context, timeout time.Duration) string {
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	lastStatus := ""
+	deadline := time.After(timeout)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ""
+		case <-deadline:
+			return ""
+		case <-ticker.C:
+			if list := m.dfuManager.GetDFUDevices(); len(list) > 0 {
+				return list[0].ECID
+			}
+		}
+	}
+}
+
+/*=====================================================================
+  STATUS POLLING
+  =====================================================================*/
+
+func (m *Manager) waitForRestoreCompletion(
+	ctx context.Context, identifier string, originalSerial string,
+) error {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	timeout := time.After(30 * time.Minute)
+	prev := ""
 
 	for {
 		select {
@@ -222,9 +211,9 @@ func (m *Manager) waitForRestoreCompletion(ctx context.Context, identifier, orig
 				continue
 			}
 
-			if status != lastStatus && status != "Устройство не найдено" {
+			if status != prev && status != "Устройство не найдено" {
 				m.notifier.RestoreProgress(originalSerial, m.getReadableStatus(status))
-				lastStatus = status
+				prev = status
 			}
 			if m.isRestoreComplete(status) {
 				return nil
@@ -246,18 +235,20 @@ func (m *Manager) getDeviceStatus(identifier string) (string, error) {
 	return "Устройство не найдено", nil
 }
 
-/* ----------- reading status helpers (не изменялись) ----------- */
+/*=====================================================================
+  STATUS HELPERS
+  =====================================================================*/
 
-func (m *Manager) getReadableStatus(status string) string {
-	s := strings.ToLower(status)
+func (m *Manager) getReadableStatus(s string) string {
+	l := strings.ToLower(s)
 	switch {
-	case strings.Contains(s, "dfu"), strings.Contains(s, "recovery"):
+	case strings.Contains(l, "dfu"), strings.Contains(l, "recovery"):
 		return "в режиме восстановления"
-	case strings.Contains(s, "restoring"):
+	case strings.Contains(l, "restoring"):
 		return "восстанавливает прошивку"
-	case strings.Contains(s, "available"):
+	case strings.Contains(l, "available"):
 		return "доступно"
-	case strings.Contains(s, "paired"):
+	case strings.Contains(l, "paired"):
 		return "сопряжено и готово"
 	default:
 		return "неизвестный статус"
@@ -265,9 +256,32 @@ func (m *Manager) getReadableStatus(status string) string {
 }
 
 func (m *Manager) isRestoreComplete(status string) bool {
-	s := strings.ToLower(status)
-	return !strings.Contains(s, "dfu") &&
-		!strings.Contains(s, "recovery") &&
-		!strings.Contains(s, "restoring") &&
-		(strings.Contains(s, "available") || strings.Contains(s, "paired"))
+	l := strings.ToLower(status)
+	return !strings.Contains(l, "dfu") &&
+		!strings.Contains(l, "recovery") &&
+		!strings.Contains(l, "restoring") &&
+		(strings.Contains(l, "available") || strings.Contains(l, "paired"))
+}
+
+/*=====================================================================
+  UTILITIES
+  =====================================================================*/
+
+// hex "0x1A2B" → "6699"
+func hexToDec(h string) (string, error) {
+	h = strings.TrimPrefix(h, "0x")
+	v, err := strconv.ParseUint(h, 16, 64)
+	if err != nil {
+		return "", err
+	}
+	return strconv.FormatUint(v, 10), nil
+}
+
+func isDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return s != ""
 }

@@ -15,13 +15,16 @@ type Device struct {
 }
 
 func (d *Device) NeedsProvisioning() bool {
-	if !d.IsDFU {
-		return false
+	// Если уже в DFU - готов к прошивке (нужен ECID)
+	if d.IsDFU {
+		return d.ECID != ""
 	}
-	if d.ECID == "" {
-		return false
-	}
-	return true
+	// Если обычный Mac - нужно перевести в DFU
+	return d.IsNormalMac()
+}
+
+func (d *Device) IsNormalMac() bool {
+	return !d.IsDFU && d.SerialNumber != "" && d.IsValidSerial()
 }
 
 func (d *Device) IsProvisioned() bool {
@@ -35,7 +38,7 @@ func (d *Device) IsValidSerial() bool {
 	if strings.HasPrefix(d.SerialNumber, "DFU-") {
 		return len(d.SerialNumber) > 4
 	}
-	// Логика для обычных SN (сейчас не используется)
+	// Логика для обычных серийных номеров Mac
 	if len(d.SerialNumber) < 8 || len(d.SerialNumber) > 20 {
 		return false
 	}
@@ -49,9 +52,12 @@ func (d *Device) IsValidSerial() bool {
 }
 
 func (d *Device) GetFriendlyName() string {
-	if d.ECID != "" {
+	if d.IsDFU && d.ECID != "" {
 		cleanECID := strings.TrimPrefix(strings.ToLower(d.ECID), "0x")
 		return fmt.Sprintf("%s (ECID: ...%s)", d.Model, getLastNChars(cleanECID, 6))
+	}
+	if d.SerialNumber != "" {
+		return fmt.Sprintf("%s (SN: %s)", d.Model, d.SerialNumber)
 	}
 	return d.Model
 }
@@ -73,8 +79,6 @@ func (d *Device) GetReadableModel() string {
 	}
 	return d.Model
 }
-
-// extractPortNumber был удален, так как не использовался.
 
 func (d *Device) String() string {
 	return fmt.Sprintf("Device{SN:%s, Model:%s, State:%s, DFU:%v, ECID:%s, USBLoc:%s}",

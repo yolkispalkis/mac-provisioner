@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -27,15 +28,13 @@ func main() {
 		cfg.Monitoring.CheckInterval, cfg.Notifications.Voice)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	// defer cancel() // Отменяем в конце main
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	notifier := notification.New(cfg.Notifications)
-	statsMgr := stats.New() // Изменено имя переменной для избежания конфликта с пакетом
+	statsMgr := stats.New()
 	dfuManager := dfu.New()
-	// Передаем cfg.Monitoring в NewMonitor
 	deviceMonitor := device.NewMonitor(cfg.Monitoring)
 	provisionerManager := provisioner.New(dfuManager, notifier, statsMgr)
 
@@ -45,31 +44,28 @@ func main() {
 	if err := deviceMonitor.Start(ctx); err != nil {
 		log.Fatalf("❌ Ошибка запуска мониторинга устройств: %v", err)
 	}
-	// defer deviceMonitor.Stop() // Stop вызывается перед выходом из main
 
-	go handleDeviceEvents(ctx, deviceMonitor, provisionerManager, notifier)
-	go printStats(ctx, statsMgr, 10*time.Minute) // Передаем statsMgr
+	go handleDeviceEvents(ctx, deviceMonitor, provisionerManager, notifier, dfuManager)
+	go printStats(ctx, statsMgr, 10*time.Minute)
 	go debugConnectedDevices(ctx, deviceMonitor, 30*time.Second)
 
 	log.Println("✅ Mac Provisioner запущен. Нажмите Ctrl+C для остановки.")
-	log.Println("🔌 Подключите Mac в DFU/Recovery режиме через USB-C для автоматической прошивки...")
+	log.Println("🔌 Подключите Mac через USB-C для автоматической прошивки...")
 
-	<-sigChan // Ожидаем сигнал завершения
+	<-sigChan
 	log.Println("🛑 Завершение работы Mac Provisioner...")
-	notifier.SystemShutdown() // Уведомление о завершении
+	notifier.SystemShutdown()
 
-	cancel() // Отменяем контекст, чтобы все горутины завершились
+	cancel()
+	deviceMonitor.Stop()
 
-	deviceMonitor.Stop() // Останавливаем монитор явно
-
-	// Даем время для завершения уведомлений и других фоновых задач
 	log.Println("⏳ Ожидание завершения фоновых задач...")
 	time.Sleep(3 * time.Second)
 	log.Println("👋 Mac Provisioner остановлен.")
 }
 
-func handleDeviceEvents(ctx context.Context, monitor *device.Monitor, provManager *provisioner.Manager, notifier *notification.Manager) {
-	log.Println("🎧 Запуск обработчика событий устройств (DFU/Recovery)...")
+func handleDeviceEvents(ctx context.Context, monitor *device.Monitor, provManager *provisioner.Manager, notifier *notification.Manager, dfuManager *dfu.Manager) {
+	log.Println("🎧 Запуск обработчика событий устройств...")
 
 	for {
 		select {
@@ -87,21 +83,36 @@ func handleDeviceEvents(ctx context.Context, monitor *device.Monitor, provManage
 
 			switch event.Type {
 			case device.EventConnected:
-				// С новым монитором, мы в основном будем видеть только DFU/Recovery устройства.
-				log.Printf("🔌 Подключено устройство: %s (%s) - состояние: %s, DFU: %v",
-					event.Device.SerialNumber, event.Device.GetFriendlyName(), event.Device.State, event.Device.IsDFU)
-
-				// NeedsProvisioning теперь просто проверяет IsDFU (и валидность ECID)
-				if event.Device.NeedsProvisioning() {
-					log.Printf("🔧 Устройство %s (ECID: %s) нуждается в прошивке.",
+				if event.Device.IsDFU && event.Device.ECID != "" {
+					// Устройство уже в DFU/Recovery - сразу прошиваем
+					log.Printf("🔧 DFU устройство %s (ECID: %s) готово к прошивке.",
 						event.Device.GetFriendlyName(), event.Device.ECID)
-					notifier.DeviceDetected(event.Device) // Уведомление о DFU устройстве
+					notifier.DeviceDetected(event.Device)
 					go provManager.ProcessDevice(ctx, event.Device)
+				} else if event.Device.IsNormalMac() {
+					// Обычный Mac - переводим в DFU
+					log.Printf("💻 Обнаружен обычный Mac %s (%s). Переводим в DFU режим...",
+						event.Device.GetFriendlyName(), event.Device.SerialNumber)
+					notifier.DeviceConnected(event.Device)
+					notifier.EnteringDFUMode(event.Device)
+
+					go func(dev *device.Device) {
+						if err := dfuManager.EnterDFUMode(ctx, dev.SerialNumber); err != nil {
+							log.Printf("❌ Не удалось перевести %s в DFU: %v", dev.SerialNumber, err)
+							if err.Error() == "macvdmtool недоступен, автоматический вход в DFU невозможен" {
+								notifier.ManualDFURequired(dev)
+								dfuManager.OfferManualDFU(dev.SerialNumber)
+							} else {
+								notifier.Error(fmt.Sprintf("Ошибка входа в DFU для %s: %v", dev.SerialNumber, err))
+							}
+						} else {
+							log.Printf("✅ Устройство %s успешно переведено в DFU режим", dev.SerialNumber)
+							notifier.DFUModeEntered(dev)
+						}
+					}(event.Device)
 				} else {
-					// Этот блок маловероятен, если NeedsProvisioning = IsDFU
-					log.Printf("❓ Устройство %s (%s) подключено, но не требует прошивки (IsDFU: %v, ECID: '%s'). Это неожиданно.",
-						event.Device.GetFriendlyName(), event.Device.State, event.Device.IsDFU, event.Device.ECID)
-					// notifier.DeviceReady(event.Device) // DeviceReady для DFU устройств не имеет смысла
+					log.Printf("❓ Подключено неизвестное устройство: %s (DFU: %v, ECID: '%s')",
+						event.Device.GetFriendlyName(), event.Device.IsDFU, event.Device.ECID)
 				}
 
 			case device.EventDisconnected:
@@ -110,26 +121,29 @@ func handleDeviceEvents(ctx context.Context, monitor *device.Monitor, provManage
 				notifier.DeviceDisconnected(event.Device)
 
 			case device.EventStateChanged:
-				// Изменение состояния для DFU устройств маловероятно, кроме как при отключении.
-				// Если оно перешло из DFU в не-DFU, оно исчезнет из system_profiler (и будет Disconnected).
 				log.Printf("🔄 Изменение состояния устройства: %s (%s) - %s. DFU: %v",
 					event.Device.SerialNumber, event.Device.GetFriendlyName(), event.Device.State, event.Device.IsDFU)
 
-				// Если оно как-то изменилось, но все еще DFU и требует прошивки
-				if event.Device.NeedsProvisioning() {
-					log.Printf("🔧 Устройство %s (%s) изменило состояние, но все еще нуждается в прошивке.",
-						event.Device.GetFriendlyName(), event.Device.State)
+				// Если устройство перешло в DFU и готово к прошивке
+				if event.Device.IsDFU && event.Device.ECID != "" {
+					log.Printf("🔧 Устройство %s перешло в DFU и готово к прошивке.",
+						event.Device.GetFriendlyName())
+					notifier.DFUModeEntered(event.Device)
 					go provManager.ProcessDevice(ctx, event.Device)
+				} else if event.Device.IsNormalMac() {
+					// Устройство вернулось в обычный режим (возможно, после прошивки)
+					log.Printf("✅ Устройство %s вернулось в обычный режим.",
+						event.Device.GetFriendlyName())
+					notifier.DeviceReady(event.Device)
 				}
 			}
 		}
 	}
 }
 
-// printStats и debugConnectedDevices с небольшими изменениями для имен переменных и интервалов
 func printStats(ctx context.Context, statsMgr *stats.Manager, interval time.Duration) {
 	if interval == 0 {
-		interval = 10 * time.Minute // Значение по умолчанию
+		interval = 10 * time.Minute
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -148,7 +162,7 @@ func printStats(ctx context.Context, statsMgr *stats.Manager, interval time.Dura
 
 func debugConnectedDevices(ctx context.Context, monitor *device.Monitor, interval time.Duration) {
 	if interval == 0 {
-		interval = 30 * time.Second // Значение по умолчанию
+		interval = 30 * time.Second
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -160,15 +174,29 @@ func debugConnectedDevices(ctx context.Context, monitor *device.Monitor, interva
 			log.Println("🔍 Отладка подключенных устройств остановлена.")
 			return
 		case <-ticker.C:
-			devicesList := monitor.GetConnectedDevices() // Имя переменной изменено
+			devicesList := monitor.GetConnectedDevices()
 			if len(devicesList) > 0 {
-				log.Printf("🔍 Отладка: Подключено DFU/Recovery устройств: %d", len(devicesList))
+				dfuCount := 0
+				normalCount := 0
+				for _, dev := range devicesList {
+					if dev.IsDFU {
+						dfuCount++
+					} else {
+						normalCount++
+					}
+				}
+				log.Printf("🔍 Отладка: Подключено устройств: %d DFU/Recovery + %d обычных Mac", dfuCount, normalCount)
 				for i, dev := range devicesList {
-					log.Printf("  %d. SN: %s (Модель: %s, Состояние: %s, ECID: %s, DFU: %v, NeedsProv: %v)",
-						i+1, dev.SerialNumber, dev.Model, dev.State, dev.ECID, dev.IsDFU, dev.NeedsProvisioning())
+					if dev.IsDFU {
+						log.Printf("  %d. DFU: %s (Модель: %s, Состояние: %s, ECID: %s, NeedsProv: %v)",
+							i+1, dev.SerialNumber, dev.Model, dev.State, dev.ECID, dev.NeedsProvisioning())
+					} else {
+						log.Printf("  %d. MAC: %s (Модель: %s, Состояние: %s, NeedsProv: %v)",
+							i+1, dev.SerialNumber, dev.Model, dev.State, dev.NeedsProvisioning())
+					}
 				}
 			} else {
-				log.Println("🔍 Отладка: Подключенных DFU/Recovery устройств не обнаружено (system_profiler).")
+				log.Println("🔍 Отладка: Подключенных Apple устройств не обнаружено.")
 			}
 		}
 	}

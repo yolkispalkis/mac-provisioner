@@ -45,22 +45,26 @@ func NewMonitor(cfg config.MonitoringConfig) *Monitor {
 	}
 }
 
-// Обновленные константы для Vendor ID
+// Константы для Apple устройств
 const (
 	appleVendorIDHex    = "0x05ac"
 	appleVendorIDString = "apple_vendor_id"
-	dfuModePIDAS        = "0x1281"
-	recoveryModePIDAS   = "0x1280"
-	dfuModePIDIntelT2   = "0x1227"
+	appleManufacturer   = "Apple Inc."
+
+	// DFU/Recovery режимы (известные PID)
+	dfuModePIDAS      = "0x1281"
+	recoveryModePIDAS = "0x1280"
+	dfuModePIDIntelT2 = "0x1227"
 )
 
 type SPUSBItem struct {
-	Name       string      `json:"_name"`
-	ProductID  string      `json:"product_id,omitempty"`
-	VendorID   string      `json:"vendor_id,omitempty"`
-	SerialNum  string      `json:"serial_num,omitempty"`
-	LocationID string      `json:"location_id,omitempty"`
-	SubItems   []SPUSBItem `json:"_items,omitempty"`
+	Name         string      `json:"_name"`
+	ProductID    string      `json:"product_id,omitempty"`
+	VendorID     string      `json:"vendor_id,omitempty"`
+	SerialNum    string      `json:"serial_num,omitempty"`
+	LocationID   string      `json:"location_id,omitempty"`
+	Manufacturer string      `json:"manufacturer,omitempty"`
+	SubItems     []SPUSBItem `json:"_items,omitempty"`
 }
 
 type SPUSBDataType struct {
@@ -82,6 +86,90 @@ func extractECIDFromString(s string) string {
 	return strings.TrimSpace(sub[:endIndex])
 }
 
+// Проверяет, является ли устройство Apple устройством
+func isAppleDevice(item *SPUSBItem) bool {
+	return strings.EqualFold(item.VendorID, appleVendorIDHex) ||
+		strings.EqualFold(item.VendorID, appleVendorIDString) ||
+		strings.Contains(item.Manufacturer, appleManufacturer)
+}
+
+// Проверяет, является ли устройство DFU/Recovery по PID
+func isDFURecoveryByPID(productID string) (bool, string, string) {
+	pidLower := strings.ToLower(productID)
+	switch pidLower {
+	case dfuModePIDAS:
+		return true, "DFU", "Apple Silicon (DFU Mode)"
+	case recoveryModePIDAS:
+		return true, "Recovery", "Apple Silicon (Recovery Mode)"
+	case dfuModePIDIntelT2:
+		return true, "DFU", "Intel T2 (DFU Mode)"
+	}
+	return false, "", ""
+}
+
+// Проверяет, является ли устройство DFU/Recovery по имени
+func isDFURecoveryByName(name string) (bool, string) {
+	nameLower := strings.ToLower(name)
+	if strings.Contains(nameLower, "dfu mode") {
+		return true, "DFU"
+	}
+	if strings.Contains(nameLower, "recovery mode") {
+		return true, "Recovery"
+	}
+	return false, ""
+}
+
+// Проверяет, является ли серийный номер ECID-ом
+func isECIDFormat(serialNum string) bool {
+	if serialNum == "" {
+		return false
+	}
+	// ECID обычно содержит "ECID:" или выглядит как hex
+	if strings.Contains(serialNum, "ECID:") {
+		return true
+	}
+	// Проверяем, что это не обычный серийный номер Mac
+	// Обычные серийные номера Mac имеют формат типа "00008103-000C599E36BB001E"
+	if strings.Contains(serialNum, "-") && len(serialNum) > 15 {
+		return false
+	}
+	return false
+}
+
+// Проверяет, является ли это обычным Mac устройством
+func isNormalMacDevice(item *SPUSBItem) bool {
+	if !isAppleDevice(item) {
+		return false
+	}
+
+	// Если это DFU/Recovery - не обычный Mac
+	if isDFU, _, _ := isDFURecoveryByPID(item.ProductID); isDFU {
+		return false
+	}
+	if isDFU, _ := isDFURecoveryByName(item.Name); isDFU {
+		return false
+	}
+
+	// Проверяем по имени устройства
+	nameLower := strings.ToLower(item.Name)
+	macKeywords := []string{"macbook", "imac", "mac mini", "mac studio", "mac pro"}
+	for _, keyword := range macKeywords {
+		if strings.Contains(nameLower, keyword) {
+			return true
+		}
+	}
+
+	// Если есть серийный номер в формате Mac и это Apple устройство
+	if item.SerialNum != "" &&
+		item.SerialNum != "N/A" &&
+		!isECIDFormat(item.SerialNum) &&
+		isAppleDevice(item) {
+		return true
+	}
+
+	return false
+}
+
 func (m *Monitor) Start(ctx context.Context) error {
 	if m.running {
 		return fmt.Errorf("монитор уже запущен")
@@ -90,10 +178,6 @@ func (m *Monitor) Start(ctx context.Context) error {
 	m.ctx, m.cancel = context.WithCancel(ctx)
 
 	log.Println("🔍 Запуск мониторинга USB устройств (через system_profiler)...")
-
-	if err := m.checkCfgutilStillNeeded(); err != nil {
-		log.Printf("⚠️ %v (cfgutil все еще нужен для операций восстановления)", err)
-	}
 
 	if err := m.initialScan(); err != nil {
 		log.Printf("⚠️ Начальное сканирование (system_profiler): %v", err)
@@ -118,14 +202,6 @@ func (m *Monitor) Stop() {
 }
 
 func (m *Monitor) Events() <-chan Event { return m.eventChan }
-
-func (m *Monitor) checkCfgutilStillNeeded() error {
-	if _, err := exec.LookPath("cfgutil"); err == nil {
-		log.Println("✅ cfgutil доступен (найден в $PATH) и будет использован для операций восстановления.")
-		return nil
-	}
-	return fmt.Errorf("cfgutil недоступен в $PATH. Установите Apple Configurator, он необходим для операций восстановления")
-}
 
 func (m *Monitor) monitorLoop() {
 	t := time.NewTicker(m.config.CheckInterval)
@@ -167,11 +243,10 @@ func (m *Monitor) checkDevices() {
 
 	currentDeviceMap := make(map[string]*Device, len(currentSPDevices))
 	for _, dev := range currentSPDevices {
-		if dev.SerialNumber != "" { // SerialNumber теперь "DFU-<ECID>"
+		if dev.SerialNumber != "" {
 			currentDeviceMap[dev.SerialNumber] = dev
 		} else {
-			// Этого не должно происходить, если extractDevicesRecursively отфильтровывает устройства без ECID
-			log.Printf("Предупреждение: Обнаружено обработанное устройство без серийного номера: %s", dev.Model)
+			log.Printf("Предупреждение: Обнаружено устройство без серийного номера: %s", dev.Model)
 		}
 	}
 
@@ -229,72 +304,81 @@ func (m *Monitor) fetchCurrentUSBDevices() []*Device {
 	}
 
 	var detectedDevices []*Device
-	for _, usbControllerInfo := range data.Items { // SPUSBDataType это массив контроллеров/хабов верхнего уровня
+	for _, usbControllerInfo := range data.Items {
 		m.extractDevicesRecursively(&usbControllerInfo, &detectedDevices)
 	}
 	return detectedDevices
 }
 
 func (m *Monitor) extractDevicesRecursively(spItem *SPUSBItem, devices *[]*Device) {
-	// Расширенное логирование для отладки
-	// log.Printf("DEBUG_USB_MONITOR: Checking item: Name='%s', VID='%s', PID='%s', SN_Raw='%s'", spItem.Name, spItem.VendorID, spItem.ProductID, spItem.SerialNum)
+	// Проверяем, является ли это Apple устройством
+	if !isAppleDevice(spItem) {
+		// Рекурсивно проверяем подэлементы
+		if spItem.SubItems != nil {
+			for i := range spItem.SubItems {
+				m.extractDevicesRecursively(&spItem.SubItems[i], devices)
+			}
+		}
+		return
+	}
 
-	isApple := strings.EqualFold(spItem.VendorID, appleVendorIDHex) || strings.EqualFold(spItem.VendorID, appleVendorIDString)
+	// Это Apple устройство, определяем тип
+	var dev *Device
 
-	if isApple {
-		// log.Printf("DEBUG_USB_MONITOR: Apple VID ('%s') matched. Name='%s', PID='%s'", spItem.VendorID, spItem.Name, spItem.ProductID)
-		pidLower := strings.ToLower(spItem.ProductID)
-		isDFUMode := false
-		deviceState := "Unknown"
-		deviceModel := spItem.Name // Имя USB устройства, не обязательно модель Mac
-
-		// matchedPID был здесь, но удален, так как не используется
-		switch pidLower {
-		case dfuModePIDAS:
-			isDFUMode = true
-			deviceState = "DFU"
-			deviceModel = "Apple Silicon (DFU Mode)"
-		case recoveryModePIDAS:
-			isDFUMode = true
-			deviceState = "Recovery"
-			deviceModel = "Apple Silicon (Recovery Mode)"
-		case dfuModePIDIntelT2:
-			isDFUMode = true
-			deviceState = "DFU"
-			deviceModel = "Intel T2 (DFU Mode)"
+	// Сначала проверяем DFU/Recovery по PID
+	if isDFU, state, model := isDFURecoveryByPID(spItem.ProductID); isDFU {
+		dev = &Device{
+			Model:       model,
+			State:       state,
+			IsDFU:       true,
+			USBLocation: spItem.LocationID,
 		}
 
-		// Логирование случая, когда PID не подошел, можно оставить или убрать,
-		// если оно больше не нужно для отладки.
-		// if !isDFUMode && isApple { // Проверяем, что isDFUMode все еще false
-		// 	log.Printf("DEBUG_USB_MONITOR: Apple device, but PID '%s' for '%s' did not match DFU/Recovery PIDs.", pidLower, spItem.Name)
-		// }
+		// Для DFU устройств извлекаем ECID
+		parsedECID := extractECIDFromString(spItem.SerialNum)
+		if parsedECID != "" {
+			dev.ECID = parsedECID
+			dev.SerialNumber = "DFU-" + strings.ToLower(dev.ECID)
+		} else {
+			log.Printf("⚠️ DFU/Recovery device (%s) - ECID not found in serial_num: '%s'. Device will be ignored.", model, spItem.SerialNum)
+			dev = nil // Игнорируем DFU без ECID
+		}
+	} else if isDFU, state := isDFURecoveryByName(spItem.Name); isDFU {
+		// Проверяем DFU/Recovery по имени (fallback)
+		dev = &Device{
+			Model:       spItem.Name,
+			State:       state,
+			IsDFU:       true,
+			USBLocation: spItem.LocationID,
+		}
 
-		if isDFUMode {
-			dev := &Device{
-				Model:       deviceModel,
-				State:       deviceState,
-				IsDFU:       true,
-				USBLocation: spItem.LocationID,
-			}
-
-			parsedECID := extractECIDFromString(spItem.SerialNum)
-			if parsedECID != "" {
-				dev.ECID = parsedECID
-				dev.SerialNumber = "DFU-" + strings.ToLower(dev.ECID)
-				// log.Printf("DEBUG_USB_MONITOR: DFU/Recovery device created: SN='%s', Model='%s', ECID='%s'", dev.SerialNumber, dev.Model, dev.ECID)
-			} else {
-				log.Printf("⚠️ DFU/Recovery device (%s) - ECID not found in serial_num: '%s'. Device will be ignored.", deviceModel, spItem.SerialNum)
-			}
-
-			if dev.ECID != "" && dev.IsValidSerial() {
-				*devices = append(*devices, dev)
-			} else if dev.ECID != "" {
-				log.Printf("⚠️ DFU/Recovery device (ECID: %s) has invalid SerialNumber ('%s') after ECID parsing. Device will be ignored.", dev.ECID, dev.SerialNumber)
-			}
+		parsedECID := extractECIDFromString(spItem.SerialNum)
+		if parsedECID != "" {
+			dev.ECID = parsedECID
+			dev.SerialNumber = "DFU-" + strings.ToLower(dev.ECID)
+		} else {
+			log.Printf("⚠️ DFU/Recovery device (%s) - ECID not found in serial_num: '%s'. Device will be ignored.", spItem.Name, spItem.SerialNum)
+			dev = nil
+		}
+	} else if isNormalMacDevice(spItem) {
+		// Это обычный Mac
+		dev = &Device{
+			Model:        spItem.Name,
+			State:        "Normal",
+			IsDFU:        false,
+			SerialNumber: spItem.SerialNum,
+			USBLocation:  spItem.LocationID,
 		}
 	}
 
+	// Добавляем устройство, если оно валидно
+	if dev != nil && dev.IsValidSerial() {
+		*devices = append(*devices, dev)
+		log.Printf("🔍 Обнаружено устройство: %s (SN: %s, DFU: %v, State: %s)",
+			dev.Model, dev.SerialNumber, dev.IsDFU, dev.State)
+	}
+
+	// Рекурсивно проверяем подэлементы
 	if spItem.SubItems != nil {
 		for i := range spItem.SubItems {
 			m.extractDevicesRecursively(&spItem.SubItems[i], devices)
@@ -322,16 +406,20 @@ func (m *Monitor) initialScan() error {
 	m.devicesMutex.Lock()
 	defer m.devicesMutex.Unlock()
 
-	count := 0
+	dfuCount := 0
+	normalCount := 0
 	for _, dev := range devices {
-		// Проверяем, что это DFU устройство с валидным SerialNumber (на основе ECID)
-		if dev.IsDFU && dev.SerialNumber != "" { // IsValidSerial уже учтено в extractDevicesRecursively
+		if dev.IsDFU && dev.SerialNumber != "" {
 			log.Printf("📱 Найдено при запуске (DFU/Recovery): %s (%s) - %s, ECID: %s",
 				dev.SerialNumber, dev.Model, dev.State, dev.ECID)
-			count++
+			dfuCount++
+		} else if !dev.IsDFU && dev.SerialNumber != "" {
+			log.Printf("💻 Найдено при запуске (Normal Mac): %s (%s) - %s",
+				dev.SerialNumber, dev.Model, dev.State)
+			normalCount++
 		}
 	}
-	log.Printf("✅ Начальное сканирование (system_profiler): %d DFU/Recovery устройств обнаружено.", count)
+	log.Printf("✅ Начальное сканирование (system_profiler): %d DFU/Recovery + %d обычных Mac устройств обнаружено.", dfuCount, normalCount)
 	return nil
 }
 

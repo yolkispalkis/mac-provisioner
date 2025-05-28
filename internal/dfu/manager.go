@@ -10,33 +10,35 @@ import (
 	"strings"
 	"time"
 
-	"mac-provisioner/internal/device" // Используется для device.Device
+	"mac-provisioner/internal/device"
 )
 
-// Обновленные константы для Vendor ID (должны быть синхронизированы с monitor.go)
+// Константы для Apple устройств (синхронизированы с monitor.go)
 const (
 	appleVendorIDHex_DFUManager    = "0x05ac"
 	appleVendorIDString_DFUManager = "apple_vendor_id"
+	appleManufacturer_DFUManager   = "Apple Inc."
 	dfuModePIDAS_DFUManager        = "0x1281"
 	recoveryModePIDAS_DFUManager   = "0x1280"
 	dfuModePIDIntelT2_DFUManager   = "0x1227"
 )
 
-// Структуры для парсинга JSON (должны быть синхронизированы с monitor.go)
+// Структуры для парсинга JSON (синхронизированы с monitor.go)
 type SPUSBItem_DFUManager struct {
-	Name       string                 `json:"_name"`
-	ProductID  string                 `json:"product_id,omitempty"`
-	VendorID   string                 `json:"vendor_id,omitempty"`
-	SerialNum  string                 `json:"serial_num,omitempty"`
-	LocationID string                 `json:"location_id,omitempty"`
-	SubItems   []SPUSBItem_DFUManager `json:"_items,omitempty"`
+	Name         string                 `json:"_name"`
+	ProductID    string                 `json:"product_id,omitempty"`
+	VendorID     string                 `json:"vendor_id,omitempty"`
+	SerialNum    string                 `json:"serial_num,omitempty"`
+	LocationID   string                 `json:"location_id,omitempty"`
+	Manufacturer string                 `json:"manufacturer,omitempty"`
+	SubItems     []SPUSBItem_DFUManager `json:"_items,omitempty"`
 }
 
 type SPUSBDataType_DFUManager struct {
 	Items []SPUSBItem_DFUManager `json:"SPUSBDataType"`
 }
 
-// Вспомогательная функция для извлечения ECID (должна быть синхронизирована с monitor.go)
+// Вспомогательные функции (синхронизированы с monitor.go)
 func extractECIDFromString_DFUManager(s string) string {
 	marker := "ECID:"
 	index := strings.Index(s, marker)
@@ -51,6 +53,36 @@ func extractECIDFromString_DFUManager(s string) string {
 	return strings.TrimSpace(sub[:endIndex])
 }
 
+func isAppleDevice_DFUManager(item *SPUSBItem_DFUManager) bool {
+	return strings.EqualFold(item.VendorID, appleVendorIDHex_DFUManager) ||
+		strings.EqualFold(item.VendorID, appleVendorIDString_DFUManager) ||
+		strings.Contains(item.Manufacturer, appleManufacturer_DFUManager)
+}
+
+func isDFURecoveryByPID_DFUManager(productID string) (bool, string, string) {
+	pidLower := strings.ToLower(productID)
+	switch pidLower {
+	case dfuModePIDAS_DFUManager:
+		return true, "DFU", "Apple Silicon (DFU Mode)"
+	case recoveryModePIDAS_DFUManager:
+		return true, "Recovery", "Apple Silicon (Recovery Mode)"
+	case dfuModePIDIntelT2_DFUManager:
+		return true, "DFU", "Intel T2 (DFU Mode)"
+	}
+	return false, "", ""
+}
+
+func isDFURecoveryByName_DFUManager(name string) (bool, string) {
+	nameLower := strings.ToLower(name)
+	if strings.Contains(nameLower, "dfu mode") {
+		return true, "DFU"
+	}
+	if strings.Contains(nameLower, "recovery mode") {
+		return true, "Recovery"
+	}
+	return false, ""
+}
+
 type Manager struct{}
 
 func New() *Manager { return &Manager{} }
@@ -59,7 +91,7 @@ func (m *Manager) EnterDFUMode(ctx context.Context, serialNumber string) error {
 	if m.hasMacvdmtool() {
 		return m.enterDFUWithMacvdmtool(ctx, serialNumber)
 	}
-	return m.enterDFUWithCfgutilRebootThenManual(ctx, serialNumber)
+	return fmt.Errorf("macvdmtool недоступен, автоматический вход в DFU невозможен")
 }
 
 func (m *Manager) hasMacvdmtool() bool {
@@ -83,25 +115,27 @@ func (m *Manager) enterDFUWithMacvdmtool(ctx context.Context, originalSerial str
 	return m.WaitForDFUMode(ctx, originalSerial, 2*time.Minute)
 }
 
-func (m *Manager) enterDFUWithCfgutilRebootThenManual(ctx context.Context, serialNumber string) error {
-	log.Printf("ℹ️ macvdmtool недоступен или не сработал. Попытка 'cfgutil reboot' для %s, затем ручной DFU.", serialNumber)
-	cmd := exec.CommandContext(ctx, "cfgutil", "reboot", "-s", serialNumber)
-	if err := cmd.Run(); err != nil {
-		log.Printf("⚠️ Ошибка 'cfgutil reboot -s %s': %v.", serialNumber, err)
-	} else {
-		log.Println("✅ Команда 'cfgutil reboot' отправлена.")
-		select {
-		case <-time.After(5 * time.Second):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	return fmt.Errorf("требуется ручной вход в DFU") // Сигнализируем о необходимости ручных действий
-}
-
 func (m *Manager) OfferManualDFU(serialOrHint string) {
-	log.Printf(`ТРЕБУЕТСЯ РУЧНОЙ ВХОД В DFU для устройства (связанного с %s).
-(Инструкции)...`, serialOrHint) // Сокращено для краткости
+	log.Printf(`
+🔧 ТРЕБУЕТСЯ РУЧНОЙ ВХОД В DFU для устройства %s
+
+Инструкции для входа в DFU режим:
+
+Apple Silicon Mac (M1/M2/M3):
+1. Выключите Mac полностью
+2. Нажмите и удерживайте кнопку питания
+3. Продолжайте удерживать до появления окна параметров загрузки
+4. Нажмите "Параметры", затем "Продолжить"
+5. В Утилитах выберите "Утилиты" > "Восстановить систему безопасности"
+
+Intel Mac с T2:
+1. Выключите Mac полностью
+2. Нажмите и удерживайте правый Shift + левый Control + левый Option
+3. Удерживая эти клавиши, нажмите и удерживайте кнопку питания
+4. Удерживайте все клавиши 10 секунд, затем отпустите
+
+После входа в DFU режим устройство будет автоматически обнаружено.
+`, serialOrHint)
 }
 
 func (m *Manager) WaitForDFUMode(ctx context.Context, purposeHint string, timeout time.Duration) error {
@@ -122,7 +156,6 @@ func (m *Manager) WaitForDFUMode(ctx context.Context, purposeHint string, timeou
 				log.Printf("✅ Обнаружено DFU/Recovery устройство (для %s).", purposeHint)
 				return nil
 			}
-			// log.Printf("⌛ ...все еще ожидаем DFU/Recovery для %s...", purposeHint) // Убрал, чтобы не спамить
 		}
 	}
 }
@@ -137,7 +170,6 @@ func (m *Manager) GetDFUDevices(ctx context.Context) []*device.Device {
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		// Не логируем ошибки здесь агрессивно, т.к. функция часто вызывается
 		return nil
 	}
 	var data SPUSBDataType_DFUManager
@@ -152,53 +184,43 @@ func (m *Manager) GetDFUDevices(ctx context.Context) []*device.Device {
 }
 
 func (m *Manager) extractDFUDevicesRecursive(spItem *SPUSBItem_DFUManager, devices *[]*device.Device) {
-	// log.Printf("DEBUG_USB_DFUMGR: Checking item: Name='%s', VID='%s', PID='%s', SN_Raw='%s'", spItem.Name, spItem.VendorID, spItem.ProductID, spItem.SerialNum)
-	isApple := strings.EqualFold(spItem.VendorID, appleVendorIDHex_DFUManager) || strings.EqualFold(spItem.VendorID, appleVendorIDString_DFUManager)
-
-	if isApple {
-		// log.Printf("DEBUG_USB_DFUMGR: Apple VID ('%s') matched. Name='%s', PID='%s'", spItem.VendorID, spItem.Name, spItem.ProductID)
-		pidLower := strings.ToLower(spItem.ProductID)
-		isDFUMode := false
-		deviceState := "Unknown"
-		deviceModel := spItem.Name
-
-		// matchedPID был здесь, но удален, так как не используется
-		switch pidLower {
-		case dfuModePIDAS_DFUManager:
-			isDFUMode = true
-			deviceState = "DFU"
-			deviceModel = "Apple Silicon (DFU Mode)"
-		case recoveryModePIDAS_DFUManager:
-			isDFUMode = true
-			deviceState = "Recovery"
-			deviceModel = "Apple Silicon (Recovery Mode)"
-		case dfuModePIDIntelT2_DFUManager:
-			isDFUMode = true
-			deviceState = "DFU"
-			deviceModel = "Intel T2 (DFU Mode)"
+	if !isAppleDevice_DFUManager(spItem) {
+		if spItem.SubItems != nil {
+			for i := range spItem.SubItems {
+				m.extractDFUDevicesRecursive(&spItem.SubItems[i], devices)
+			}
 		}
+		return
+	}
 
-		// if !isDFUMode && isApple {
-		//     log.Printf("DEBUG_USB_DFUMGR: Apple device, but PID '%s' for '%s' did not match DFU/Recovery PIDs.", pidLower, spItem.Name)
-		// }
+	var dev *device.Device
 
-		if isDFUMode {
-			dev := &device.Device{
-				Model: deviceModel, State: deviceState, IsDFU: true, USBLocation: spItem.LocationID,
-			}
-			parsedECID := extractECIDFromString_DFUManager(spItem.SerialNum)
-			if parsedECID != "" {
-				dev.ECID = parsedECID
-				dev.SerialNumber = "DFU-" + strings.ToLower(dev.ECID)
-				// log.Printf("DEBUG_USB_DFUMGR: DFU/Recovery device created: SN='%s', Model='%s', ECID='%s'", dev.SerialNumber, dev.Model, dev.ECID)
-			} else {
-				// Не логируем здесь, чтобы не дублировать логи монитора
-			}
-			if dev.ECID != "" && dev.IsValidSerial() { // IsValidSerial из пакета device
-				*devices = append(*devices, dev)
-			}
+	// Проверяем DFU/Recovery по PID
+	if isDFU, state, model := isDFURecoveryByPID_DFUManager(spItem.ProductID); isDFU {
+		dev = &device.Device{
+			Model: model, State: state, IsDFU: true, USBLocation: spItem.LocationID,
+		}
+		parsedECID := extractECIDFromString_DFUManager(spItem.SerialNum)
+		if parsedECID != "" {
+			dev.ECID = parsedECID
+			dev.SerialNumber = "DFU-" + strings.ToLower(dev.ECID)
+		}
+	} else if isDFU, state := isDFURecoveryByName_DFUManager(spItem.Name); isDFU {
+		// Проверяем DFU/Recovery по имени (fallback)
+		dev = &device.Device{
+			Model: spItem.Name, State: state, IsDFU: true, USBLocation: spItem.LocationID,
+		}
+		parsedECID := extractECIDFromString_DFUManager(spItem.SerialNum)
+		if parsedECID != "" {
+			dev.ECID = parsedECID
+			dev.SerialNumber = "DFU-" + strings.ToLower(dev.ECID)
 		}
 	}
+
+	if dev != nil && dev.ECID != "" && dev.IsValidSerial() {
+		*devices = append(*devices, dev)
+	}
+
 	if spItem.SubItems != nil {
 		for i := range spItem.SubItems {
 			m.extractDFUDevicesRecursive(&spItem.SubItems[i], devices)
@@ -208,7 +230,6 @@ func (m *Manager) extractDFUDevicesRecursive(spItem *SPUSBItem_DFUManager, devic
 
 func (m *Manager) GetFirstDFUECID(ctx context.Context) string {
 	if devs := m.GetDFUDevices(ctx); len(devs) > 0 && devs[0].ECID != "" {
-		// Возвращаем ECID как есть (HEX строка без 0x), нормализация будет в provisioner
 		return devs[0].ECID
 	}
 	return ""

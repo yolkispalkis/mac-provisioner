@@ -24,7 +24,7 @@ func New(cfg config.NotificationConfig) *Manager {
 	m := &Manager{
 		config:      cfg,
 		minInterval: 2 * time.Second,
-		speechQueue: make(chan string, 10), // Буфер для 10 сообщений
+		speechQueue: make(chan string, 10),
 	}
 
 	// Запускаем обработчик очереди голосовых сообщений
@@ -33,95 +33,105 @@ func New(cfg config.NotificationConfig) *Manager {
 	return m
 }
 
-func (m *Manager) DeviceDetected(serialNumber, model string) {
+func (m *Manager) DeviceDetected(device interface{}) {
 	if !m.config.Enabled {
 		return
 	}
 
-	message := fmt.Sprintf("Обнаружено новое устройство. %s с серийным номером %s",
-		model, m.formatSerialNumber(serialNumber))
-	m.speak(message)
+	// Ожидаем объект с методом GetFriendlyName()
+	if dev, ok := device.(interface{ GetFriendlyName() string }); ok {
+		message := fmt.Sprintf("Обнаружено новое устройство: %s", dev.GetFriendlyName())
+		m.speak(message)
+	}
 }
 
-func (m *Manager) DeviceConnected(serialNumber, model string) {
+func (m *Manager) DeviceConnected(device interface{}) {
 	if !m.config.Enabled || !m.canNotify() {
 		return
 	}
 
-	message := fmt.Sprintf("Подключено устройство: %s %s",
-		model, m.formatSerialNumber(serialNumber))
-	m.speak(message)
+	if dev, ok := device.(interface{ GetFriendlyName() string }); ok {
+		message := fmt.Sprintf("Подключено устройство: %s", dev.GetFriendlyName())
+		m.speak(message)
+	}
 }
 
-func (m *Manager) DeviceDisconnected(serialNumber, model string) {
+func (m *Manager) DeviceDisconnected(device interface{}) {
 	if !m.config.Enabled || !m.canNotify() {
 		return
 	}
 
-	message := fmt.Sprintf("Отключено устройство: %s %s",
-		model, m.formatSerialNumber(serialNumber))
-	m.speak(message)
+	if dev, ok := device.(interface{ GetFriendlyName() string }); ok {
+		message := fmt.Sprintf("Отключено устройство: %s", dev.GetFriendlyName())
+		m.speak(message)
+	}
 }
 
-func (m *Manager) EnteringDFUMode(serialNumber string) {
+func (m *Manager) EnteringDFUMode(device interface{}) {
 	if !m.config.Enabled {
 		return
 	}
 
-	message := fmt.Sprintf("Переход в режим восстановления для устройства %s",
-		m.formatSerialNumber(serialNumber))
-	m.speak(message)
+	if dev, ok := device.(interface{ GetFriendlyName() string }); ok {
+		message := fmt.Sprintf("Переход в режим восстановления для устройства %s", dev.GetFriendlyName())
+		m.speak(message)
+	}
 }
 
-func (m *Manager) DFUModeEntered(serialNumber string) {
+func (m *Manager) DFUModeEntered(device interface{}) {
 	if !m.config.Enabled {
 		return
 	}
 
-	message := fmt.Sprintf("Устройство %s перешло в режим восстановления. Готово к прошивке.",
-		m.formatSerialNumber(serialNumber))
-	m.speak(message)
+	if dev, ok := device.(interface{ GetFriendlyName() string }); ok {
+		message := fmt.Sprintf("Устройство %s перешло в режим восстановления. Готово к прошивке.", dev.GetFriendlyName())
+		m.speak(message)
+	}
 }
 
-func (m *Manager) StartingRestore(serialNumber string) {
+func (m *Manager) StartingRestore(device interface{}) {
 	if !m.config.Enabled {
 		return
 	}
 
-	message := fmt.Sprintf("Начинается восстановление прошивки для устройства %s. Процесс может занять несколько минут.",
-		m.formatSerialNumber(serialNumber))
-	m.speak(message)
+	if dev, ok := device.(interface{ GetFriendlyName() string }); ok {
+		message := fmt.Sprintf("Начинается восстановление прошивки для устройства %s. Процесс может занять несколько минут.", dev.GetFriendlyName())
+		m.speak(message)
+	}
 }
 
-func (m *Manager) RestoreProgress(serialNumber, status string) {
+func (m *Manager) RestoreProgress(device interface{}, status string) {
 	if !m.config.Enabled || !m.canNotify() {
 		return
 	}
 
-	message := fmt.Sprintf("Устройство %s: %s",
-		m.formatSerialNumber(serialNumber), status)
-	m.speak(message)
+	if dev, ok := device.(interface{ GetFriendlyName() string }); ok {
+		message := fmt.Sprintf("Устройство %s: %s", dev.GetFriendlyName(), status)
+		m.speak(message)
+	}
 }
 
-func (m *Manager) RestoreCompleted(serialNumber string) {
+func (m *Manager) RestoreCompleted(device interface{}) {
 	if !m.config.Enabled {
 		return
 	}
 
-	message := fmt.Sprintf("Отлично! Восстановление успешно завершено для устройства %s. Устройство готово к использованию.",
-		m.formatSerialNumber(serialNumber))
-	m.speak(message)
+	if dev, ok := device.(interface{ GetFriendlyName() string }); ok {
+		message := fmt.Sprintf("Отлично! Восстановление успешно завершено для устройства %s. Устройство готово к использованию.", dev.GetFriendlyName())
+		m.speak(message)
+	}
 }
 
-func (m *Manager) RestoreFailed(serialNumber, error string) {
+func (m *Manager) RestoreFailed(device interface{}, error string) {
 	if !m.config.Enabled {
 		return
 	}
 
 	simplifiedError := m.simplifyError(error)
-	message := fmt.Sprintf("Внимание! Восстановление не удалось для устройства %s. %s",
-		m.formatSerialNumber(serialNumber), simplifiedError)
-	m.speak(message)
+	if dev, ok := device.(interface{ GetFriendlyName() string }); ok {
+		message := fmt.Sprintf("Внимание! Восстановление не удалось для устройства %s. %s", dev.GetFriendlyName(), simplifiedError)
+		m.speak(message)
+	}
 }
 
 func (m *Manager) SystemStarted() {
@@ -139,7 +149,7 @@ func (m *Manager) SystemShutdown() {
 	}
 
 	message := "Мак Провижнер завершает работу. До свидания!"
-	m.speakImmediate(message) // Немедленное воспроизведение для завершения
+	m.speakImmediate(message)
 }
 
 func (m *Manager) Error(errorMsg string) {
@@ -152,34 +162,37 @@ func (m *Manager) Error(errorMsg string) {
 	m.speak(message)
 }
 
-func (m *Manager) ManualDFURequired(serialNumber string) {
+func (m *Manager) ManualDFURequired(device interface{}) {
 	if !m.config.Enabled {
 		return
 	}
 
-	message := fmt.Sprintf("Для устройства %s требуется ручной переход в режим восстановления. Проверьте консоль для получения подробных инструкций.",
-		m.formatSerialNumber(serialNumber))
-	m.speak(message)
+	if dev, ok := device.(interface{ GetFriendlyName() string }); ok {
+		message := fmt.Sprintf("Для устройства %s требуется ручной переход в режим восстановления. Проверьте консоль для получения подробных инструкций.", dev.GetFriendlyName())
+		m.speak(message)
+	}
 }
 
-func (m *Manager) WaitingForDFU(serialNumber string) {
+func (m *Manager) WaitingForDFU(device interface{}) {
 	if !m.config.Enabled {
 		return
 	}
 
-	message := fmt.Sprintf("Ожидание перехода устройства %s в режим восстановления. Следуйте инструкциям на экране.",
-		m.formatSerialNumber(serialNumber))
-	m.speak(message)
+	if dev, ok := device.(interface{ GetFriendlyName() string }); ok {
+		message := fmt.Sprintf("Ожидание перехода устройства %s в режим восстановления. Следуйте инструкциям на экране.", dev.GetFriendlyName())
+		m.speak(message)
+	}
 }
 
-func (m *Manager) DeviceReady(serialNumber, model string) {
+func (m *Manager) DeviceReady(device interface{}) {
 	if !m.config.Enabled || !m.canNotify() {
 		return
 	}
 
-	message := fmt.Sprintf("Устройство %s %s готово к работе",
-		model, m.formatSerialNumber(serialNumber))
-	m.speak(message)
+	if dev, ok := device.(interface{ GetFriendlyName() string }); ok {
+		message := fmt.Sprintf("Устройство %s готово к работе", dev.GetFriendlyName())
+		m.speak(message)
+	}
 }
 
 // Добавляет сообщение в очередь для последовательного воспроизведения
@@ -237,23 +250,6 @@ func (m *Manager) executeSpeech(message string) {
 	if err := cmd.Run(); err != nil {
 		fmt.Printf("⚠️ Ошибка воспроизведения речи: %v\n", err)
 	}
-}
-
-func (m *Manager) formatSerialNumber(serialNumber string) string {
-	// Убираем префикс DFU- если есть
-	serialNumber = strings.TrimPrefix(serialNumber, "DFU-")
-
-	if len(serialNumber) > 6 {
-		var formatted strings.Builder
-		for i, char := range serialNumber {
-			if i > 0 {
-				formatted.WriteString(" ")
-			}
-			formatted.WriteRune(char)
-		}
-		return formatted.String()
-	}
-	return serialNumber
 }
 
 func (m *Manager) simplifyError(error string) string {
@@ -316,7 +312,7 @@ func (m *Manager) PlaySuccess() {
 
 func (m *Manager) TestVoice() {
 	message := "Тест голоса Мак Провижнер. Так будут звучать уведомления с текущими настройками."
-	m.speakImmediate(message) // Немедленное воспроизведение для теста
+	m.speakImmediate(message)
 }
 
 func (m *Manager) GetAvailableVoices() ([]string, error) {
@@ -350,7 +346,6 @@ func (m *Manager) IsPlaying() bool {
 
 // Очищает очередь сообщений
 func (m *Manager) ClearQueue() {
-	// Очищаем канал
 	for {
 		select {
 		case <-m.speechQueue:

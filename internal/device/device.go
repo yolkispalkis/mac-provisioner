@@ -11,6 +11,7 @@ type Device struct {
 	State        string `json:"state"`
 	IsDFU        bool   `json:"is_dfu"`
 	ECID         string `json:"ecid,omitempty"`
+	USBLocation  string `json:"usb_location,omitempty"` // Добавили поле для USB локации
 }
 
 func (d *Device) NeedsProvisioning() bool {
@@ -76,7 +77,86 @@ func (d *Device) IsValidSerial() bool {
 	return true
 }
 
+// Получает читаемое имя устройства для голосовых уведомлений
+func (d *Device) GetFriendlyName() string {
+	modelName := d.GetReadableModel()
+
+	if d.USBLocation != "" {
+		portNumber := d.extractPortNumber()
+		if portNumber != "" {
+			return fmt.Sprintf("%s на порту %s", modelName, portNumber)
+		}
+	}
+
+	return modelName
+}
+
+// Преобразует техническое название модели в читаемое
+func (d *Device) GetReadableModel() string {
+	model := strings.ToLower(d.Model)
+
+	// Преобразуем технические названия в читаемые
+	if strings.Contains(model, "macbookair") {
+		return "МакБук Эйр"
+	}
+	if strings.Contains(model, "macbookpro") {
+		return "МакБук Про"
+	}
+	if strings.Contains(model, "macbook") {
+		return "МакБук"
+	}
+	if strings.Contains(model, "imac") {
+		return "АйМак"
+	}
+	if strings.Contains(model, "macmini") {
+		return "Мак Мини"
+	}
+	if strings.Contains(model, "macstudio") {
+		return "Мак Студио"
+	}
+	if strings.Contains(model, "macpro") {
+		return "Мак Про"
+	}
+
+	// Если не удалось определить, возвращаем оригинальное название
+	return d.Model
+}
+
+// Извлекает номер порта из USB локации
+func (d *Device) extractPortNumber() string {
+	if d.USBLocation == "" {
+		return ""
+	}
+
+	// Ищем паттерны типа "0x14200000", "Location: 0x14200000" и т.д.
+	location := strings.ToLower(d.USBLocation)
+
+	// Убираем префиксы
+	location = strings.TrimPrefix(location, "location:")
+	location = strings.TrimPrefix(location, "0x")
+	location = strings.TrimSpace(location)
+
+	// Если это hex число, преобразуем в простой номер порта
+	if len(location) >= 8 {
+		// Берем последние цифры как номер порта
+		portNum := location[len(location)-1:]
+		if portNum >= "1" && portNum <= "9" {
+			return portNum
+		}
+
+		// Альтернативный способ - берем предпоследнюю цифру
+		if len(location) >= 2 {
+			portNum = location[len(location)-2 : len(location)-1]
+			if portNum >= "1" && portNum <= "9" {
+				return portNum
+			}
+		}
+	}
+
+	return "неизвестный"
+}
+
 func (d *Device) String() string {
-	return fmt.Sprintf("Device{SN: %s, Model: %s, State: %s, DFU: %v}",
-		d.SerialNumber, d.Model, d.State, d.IsDFU)
+	return fmt.Sprintf("Device{SN: %s, Model: %s, State: %s, DFU: %v, USB: %s}",
+		d.SerialNumber, d.Model, d.State, d.IsDFU, d.USBLocation)
 }

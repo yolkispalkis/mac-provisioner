@@ -278,6 +278,16 @@ func (m *Monitor) parseDeviceLine(line string) *Device {
 			device.Model = strings.TrimSpace(parts[1])
 			device.State = strings.TrimSpace(parts[2])
 
+			// Ищем USB локацию в дополнительных полях
+			if len(parts) > 3 {
+				for _, part := range parts[3:] {
+					if strings.Contains(strings.ToLower(part), "location") {
+						device.USBLocation = strings.TrimSpace(part)
+						break
+					}
+				}
+			}
+
 			state := strings.ToLower(device.State)
 			device.IsDFU = strings.Contains(state, "dfu") || strings.Contains(state, "recovery")
 
@@ -294,6 +304,18 @@ func (m *Monitor) parseDeviceLine(line string) *Device {
 		if start := strings.Index(line, "("); start != -1 {
 			if end := strings.Index(line[start:], ")"); end != -1 {
 				device.Model = line[start+1 : start+end]
+			}
+		}
+
+		// Ищем USB локацию
+		if strings.Contains(line, "Location:") {
+			locationIndex := strings.Index(line, "Location:")
+			if locationIndex != -1 {
+				locationPart := line[locationIndex:]
+				locationFields := strings.Fields(locationPart)
+				if len(locationFields) >= 2 {
+					device.USBLocation = locationFields[1]
+				}
 			}
 		}
 
@@ -329,6 +351,8 @@ func (m *Monitor) parseDFULine(line string) *Device {
 			device.ECID = parts[i+1]
 			// Для DFU устройств используем ECID как серийный номер
 			device.SerialNumber = "DFU-" + parts[i+1]
+		} else if part == "Location:" && i+1 < len(parts) {
+			device.USBLocation = parts[i+1]
 		}
 	}
 

@@ -86,12 +86,12 @@ func handleDeviceEvents(ctx context.Context, monitor *device.Monitor, provisione
 			return
 		case event := <-monitor.Events():
 			log.Printf("📨 Получено событие: %s для устройства %s (%s)",
-				event.Type, event.Device.SerialNumber, event.Device.Model)
+				event.Type, event.Device.SerialNumber, event.Device.GetFriendlyName())
 
 			switch event.Type {
 			case device.EventConnected:
 				log.Printf("🔌 Подключено устройство: %s (%s) - состояние: %s, DFU: %v",
-					event.Device.SerialNumber, event.Device.Model, event.Device.State, event.Device.IsDFU)
+					event.Device.SerialNumber, event.Device.GetFriendlyName(), event.Device.State, event.Device.IsDFU)
 
 				// Проверяем, нужна ли прошивка
 				needsProvisioning := event.Device.NeedsProvisioning()
@@ -100,22 +100,21 @@ func handleDeviceEvents(ctx context.Context, monitor *device.Monitor, provisione
 
 				if needsProvisioning {
 					log.Printf("🔧 Запуск процесса прошивки для устройства %s", event.Device.SerialNumber)
-					notifier.DeviceDetected(event.Device.SerialNumber, event.Device.Model)
+					notifier.DeviceDetected(event.Device)
 					go provisioner.ProcessDevice(ctx, event.Device)
 				} else {
 					log.Printf("✅ Устройство %s уже прошито и готово к работе (состояние: %s)",
 						event.Device.SerialNumber, event.Device.State)
-					// Можно добавить уведомление о том, что устройство готово
-					// notifier.DeviceReady(event.Device.SerialNumber, event.Device.Model)
+					notifier.DeviceReady(event.Device)
 				}
 
 			case device.EventDisconnected:
-				log.Printf("🔌 Отключено устройство: %s (%s)", event.Device.SerialNumber, event.Device.Model)
-				notifier.DeviceDisconnected(event.Device.SerialNumber, event.Device.Model)
+				log.Printf("🔌 Отключено устройство: %s (%s)", event.Device.SerialNumber, event.Device.GetFriendlyName())
+				notifier.DeviceDisconnected(event.Device)
 
 			case device.EventStateChanged:
 				log.Printf("🔄 Изменение состояния устройства: %s (%s) - %s",
-					event.Device.SerialNumber, event.Device.Model, event.Device.State)
+					event.Device.SerialNumber, event.Device.GetFriendlyName(), event.Device.State)
 
 				// Если устройство изменило состояние и теперь нуждается в прошивке
 				if event.Device.NeedsProvisioning() {

@@ -52,7 +52,7 @@ func (m *Manager) DeviceDetected(serialNumber, model string) {
 		return
 	}
 
-	message := fmt.Sprintf("Device detected. %s with serial number %s", model, m.formatSerialNumber(serialNumber))
+	message := fmt.Sprintf("Обнаружено устройство. %s с серийным номером %s", model, m.formatSerialNumber(serialNumber))
 	m.speak(message)
 }
 
@@ -61,7 +61,7 @@ func (m *Manager) DeviceConnected(serialNumber, model string) {
 		return
 	}
 
-	message := fmt.Sprintf("New device connected: %s %s", model, m.formatSerialNumber(serialNumber))
+	message := fmt.Sprintf("Подключено новое устройство: %s %s", model, m.formatSerialNumber(serialNumber))
 	m.speak(message)
 }
 
@@ -70,7 +70,7 @@ func (m *Manager) DeviceDisconnected(serialNumber, model string) {
 		return
 	}
 
-	message := fmt.Sprintf("Device disconnected: %s %s", model, m.formatSerialNumber(serialNumber))
+	message := fmt.Sprintf("Устройство отключено: %s %s", model, m.formatSerialNumber(serialNumber))
 	m.speak(message)
 }
 
@@ -79,7 +79,7 @@ func (m *Manager) EnteringDFUMode(serialNumber string) {
 		return
 	}
 
-	message := fmt.Sprintf("Entering D F U mode for device %s", m.formatSerialNumber(serialNumber))
+	message := fmt.Sprintf("Переход в режим Д Ф У для устройства %s", m.formatSerialNumber(serialNumber))
 	m.speak(message)
 }
 
@@ -88,7 +88,7 @@ func (m *Manager) DFUModeEntered(serialNumber string) {
 		return
 	}
 
-	message := fmt.Sprintf("Device %s is now in D F U mode. Ready for restore.", m.formatSerialNumber(serialNumber))
+	message := fmt.Sprintf("Устройство %s теперь в режиме Д Ф У. Готово к восстановлению.", m.formatSerialNumber(serialNumber))
 	m.speak(message)
 }
 
@@ -97,7 +97,7 @@ func (m *Manager) StartingRestore(serialNumber string) {
 		return
 	}
 
-	message := fmt.Sprintf("Starting firmware restore for device %s. This may take several minutes.", m.formatSerialNumber(serialNumber))
+	message := fmt.Sprintf("Начинается восстановление прошивки для устройства %s. Это может занять несколько минут.", m.formatSerialNumber(serialNumber))
 	m.speak(message)
 }
 
@@ -106,7 +106,7 @@ func (m *Manager) RestoreProgress(serialNumber, status string) {
 		return
 	}
 
-	message := fmt.Sprintf("Device %s is %s", m.formatSerialNumber(serialNumber), status)
+	message := fmt.Sprintf("Устройство %s %s", m.formatSerialNumber(serialNumber), status)
 	m.speak(message)
 }
 
@@ -115,7 +115,7 @@ func (m *Manager) RestoreCompleted(serialNumber string) {
 		return
 	}
 
-	message := fmt.Sprintf("Great! Restore completed successfully for device %s. Device is ready for use.", m.formatSerialNumber(serialNumber))
+	message := fmt.Sprintf("Отлично! Восстановление успешно завершено для устройства %s. Устройство готово к использованию.", m.formatSerialNumber(serialNumber))
 	m.speak(message)
 }
 
@@ -125,7 +125,7 @@ func (m *Manager) RestoreFailed(serialNumber, error string) {
 	}
 
 	simplifiedError := m.simplifyError(error)
-	message := fmt.Sprintf("Alert! Restore failed for device %s. %s", m.formatSerialNumber(serialNumber), simplifiedError)
+	message := fmt.Sprintf("Внимание! Восстановление не удалось для устройства %s. %s", m.formatSerialNumber(serialNumber), simplifiedError)
 	m.speak(message)
 }
 
@@ -134,7 +134,7 @@ func (m *Manager) SystemStarted() {
 		return
 	}
 
-	message := "Mac Provisioner has started successfully. Now monitoring for connected devices."
+	message := "Мак Провижнер успешно запущен. Начинается мониторинг подключенных устройств."
 	m.speak(message)
 }
 
@@ -143,7 +143,7 @@ func (m *Manager) SystemShutdown() {
 		return
 	}
 
-	message := "Mac Provisioner is shutting down. Goodbye!"
+	message := "Мак Провижнер завершает работу. До свидания!"
 	m.speak(message)
 }
 
@@ -153,7 +153,7 @@ func (m *Manager) Error(errorMsg string) {
 	}
 
 	simplifiedError := m.simplifyError(errorMsg)
-	message := fmt.Sprintf("System error: %s", simplifiedError)
+	message := fmt.Sprintf("Системная ошибка: %s", simplifiedError)
 	m.speak(message)
 }
 
@@ -162,7 +162,7 @@ func (m *Manager) RealTimeMonitoringStarted() {
 		return
 	}
 
-	message := "Real-time device monitoring activated. Devices will be detected instantly upon connection."
+	message := "Активирован мониторинг устройств в реальном времени. Устройства будут обнаружены мгновенно при подключении."
 	m.speak(message)
 }
 
@@ -203,19 +203,19 @@ func (m *Manager) simplifyError(error string) string {
 	error = strings.ToLower(error)
 
 	if strings.Contains(error, "timeout") {
-		return "Operation timed out"
+		return "Превышено время ожидания"
 	}
 	if strings.Contains(error, "dfu") {
-		return "D F U mode error"
+		return "Ошибка режима Д Ф У"
 	}
 	if strings.Contains(error, "restore") {
-		return "Restore process error"
+		return "Ошибка процесса восстановления"
 	}
 	if strings.Contains(error, "connection") || strings.Contains(error, "connect") {
-		return "Connection error"
+		return "Ошибка подключения"
 	}
 	if strings.Contains(error, "permission") || strings.Contains(error, "access") {
-		return "Permission error"
+		return "Ошибка доступа"
 	}
 
 	words := strings.Fields(error)
@@ -236,7 +236,7 @@ func (m *Manager) canNotify() bool {
 }
 
 func (m *Manager) TestVoice() {
-	message := "Mac Provisioner voice test. This is how notifications will sound with current settings."
+	message := "Тест голоса Мак Провижнер. Так будут звучать уведомления с текущими настройками."
 	m.speak(message)
 }
 

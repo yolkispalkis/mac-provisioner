@@ -258,7 +258,7 @@ func processDevice(dev *device.Device, dfuMgr *dfu.Manager, configMgr *configura
 
 			// Если это инструкции для ручного входа, показываем их пользователю
 			if strings.Contains(err.Error(), "manual DFU mode entry") {
-				notifyMgr.Error("Manual DFU mode required. Check console for instructions.")
+				notifyMgr.Error("Требуется ручной переход в режим Д Ф У. Проверьте консоль для получения инструкций.")
 				log.Printf("\n" + strings.Repeat("=", 80))
 				log.Printf("MANUAL DFU MODE REQUIRED")
 				log.Printf(strings.Repeat("=", 80))
@@ -271,12 +271,12 @@ func processDevice(dev *device.Device, dfuMgr *dfu.Manager, configMgr *configura
 
 				// Проверяем, вошло ли устройство в DFU режим
 				if !dfuMgr.IsInDFUMode(dev.SerialNumber) {
-					notifyMgr.RestoreFailed(dev.SerialNumber, "Device not in DFU mode")
+					notifyMgr.RestoreFailed(dev.SerialNumber, "Устройство не в режиме Д Ф У")
 					stats.DeviceCompleted(false, time.Since(startTime))
 					return
 				}
 			} else {
-				notifyMgr.RestoreFailed(dev.SerialNumber, "Failed to enter DFU mode")
+				notifyMgr.RestoreFailed(dev.SerialNumber, "Не удалось войти в режим Д Ф У")
 				notifyMgr.PlayAlert()
 				stats.DeviceCompleted(false, time.Since(startTime))
 				return

@@ -152,14 +152,10 @@ func (m *Manager) isInDFUMode(serialNumber string) bool {
 	}
 
 	// Дополнительно проверяем через system_profiler для DFU устройств
-	// Используем первый вариант если нужна точная проверка по серийному номеру:
 	return m.checkDFUInSystemProfiler(serialNumber)
-
-	// Или второй вариант если достаточно проверить наличие любых DFU устройств:
-	// return m.checkDFUInSystemProfiler()
 }
 
-func (m *Manager) checkDFUInSystemProfiler() bool {
+func (m *Manager) checkDFUInSystemProfiler(serialNumber string) bool {
 	cmd := exec.Command("system_profiler", "SPUSBDataType")
 	output, err := cmd.Output()
 	if err != nil {
@@ -167,19 +163,44 @@ func (m *Manager) checkDFUInSystemProfiler() bool {
 	}
 
 	outputStr := strings.ToLower(string(output))
+	lines := strings.Split(string(output), "\n")
 
 	// Ищем DFU устройства
-	if strings.Contains(outputStr, "dfu") || strings.Contains(outputStr, "recovery") {
-		lines := strings.Split(string(output), "\n")
-		for _, line := range lines {
-			if strings.Contains(strings.ToLower(line), "dfu") || strings.Contains(strings.ToLower(line), "recovery") {
-				fmt.Printf("🔍 Found DFU device in system_profiler: %s\n", strings.TrimSpace(line))
-				return true
+	var currentDevice string
+	var foundSerial bool
+
+	for _, line := range lines {
+		lineLower := strings.ToLower(line)
+
+		// Ищем устройства в DFU режиме
+		if strings.Contains(lineLower, "dfu") || strings.Contains(lineLower, "recovery") {
+			currentDevice = strings.TrimSpace(line)
+			fmt.Printf("🔍 Found DFU device in system_profiler: %s\n", currentDevice)
+		}
+
+		// Ищем серийный номер для текущего устройства
+		if currentDevice != "" && strings.Contains(line, "Serial Number:") {
+			parts := strings.Split(line, ":")
+			if len(parts) > 1 {
+				serial := strings.TrimSpace(parts[1])
+				if serial == serialNumber {
+					foundSerial = true
+					fmt.Printf("🔍 Found matching serial number %s for DFU device\n", serialNumber)
+					break
+				}
 			}
+			currentDevice = "" // Сбрасываем, если серийный номер не совпал
 		}
 	}
 
-	return false
+	// Если нашли конкретное устройство по серийному номеру
+	if foundSerial {
+		return true
+	}
+
+	// Если не нашли конкретное устройство, но есть DFU устройства, возвращаем true
+	// (это может быть полезно, если серийный номер недоступен в DFU режиме)
+	return strings.Contains(outputStr, "dfu") || strings.Contains(outputStr, "recovery")
 }
 
 func (m *Manager) IsInDFUMode(serialNumber string) bool {

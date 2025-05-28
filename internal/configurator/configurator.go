@@ -86,22 +86,22 @@ func (m *Manager) getReadableStatus(status string) string {
 	status = strings.ToLower(status)
 
 	if strings.Contains(status, "dfu") {
-		return "in D F U mode"
+		return "в режиме Д Ф У"
 	}
 	if strings.Contains(status, "recovery") {
-		return "in recovery mode"
+		return "в режиме восстановления"
 	}
 	if strings.Contains(status, "restoring") {
-		return "restoring firmware"
+		return "восстанавливает прошивку"
 	}
 	if strings.Contains(status, "available") {
-		return "available"
+		return "доступно"
 	}
 	if strings.Contains(status, "paired") {
-		return "paired and ready"
+		return "сопряжено и готово"
 	}
 
-	return "unknown status"
+	return "неизвестный статус"
 }
 
 func (m *Manager) isRestoreComplete(status string) bool {

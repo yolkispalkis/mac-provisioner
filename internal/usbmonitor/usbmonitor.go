@@ -33,8 +33,8 @@ int setupUSBNotifications(NotificationData *data, void *refCon) {
     kern_return_t kr;
     CFMutableDictionaryRef matchingDict;
 
-    // Создаем notification port
-    data->notificationPort = IONotificationPortCreate(kIOMasterPortDefault);
+    // Используем MACH_PORT_NULL для совместимости с разными версиями macOS
+    data->notificationPort = IONotificationPortCreate(MACH_PORT_NULL);
     if (!data->notificationPort) {
         return -1;
     }
@@ -51,7 +51,8 @@ int setupUSBNotifications(NotificationData *data, void *refCon) {
     }
 
     // Добавляем Vendor ID для Apple
-    CFNumberRef vendorID = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &(int){0x05AC});
+    int vendorIDValue = 0x05AC;
+    CFNumberRef vendorID = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &vendorIDValue);
     CFDictionarySetValue(matchingDict, CFSTR(kUSBVendorID), vendorID);
     CFRelease(vendorID);
 
@@ -74,7 +75,7 @@ int setupUSBNotifications(NotificationData *data, void *refCon) {
 
     // Создаем новый matching dictionary для отключения
     matchingDict = IOServiceMatching(kIOUSBDeviceClassName);
-    vendorID = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &(int){0x05AC});
+    vendorID = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &vendorIDValue);
     CFDictionarySetValue(matchingDict, CFSTR(kUSBVendorID), vendorID);
     CFRelease(vendorID);
 

@@ -45,11 +45,13 @@ func NewMonitor(cfg config.MonitoringConfig) *Monitor {
 	}
 }
 
+// Обновленные константы для Vendor ID
 const (
-	appleVendorID     = "0x05ac"
-	dfuModePIDAS      = "0x1281"
-	recoveryModePIDAS = "0x1280"
-	dfuModePIDIntelT2 = "0x1227"
+	appleVendorIDHex    = "0x05ac"
+	appleVendorIDString = "apple_vendor_id"
+	dfuModePIDAS        = "0x1281"
+	recoveryModePIDAS   = "0x1280"
+	dfuModePIDIntelT2   = "0x1227"
 )
 
 type SPUSBItem struct {
@@ -65,6 +67,21 @@ type SPUSBDataType struct {
 	Items []SPUSBItem `json:"SPUSBDataType"`
 }
 
+// Вспомогательная функция для извлечения ECID
+func extractECIDFromString(s string) string {
+	marker := "ECID:"
+	index := strings.Index(s, marker)
+	if index == -1 {
+		return ""
+	}
+	sub := s[index+len(marker):]
+	endIndex := strings.Index(sub, " ")
+	if endIndex == -1 {
+		return strings.TrimSpace(sub)
+	}
+	return strings.TrimSpace(sub[:endIndex])
+}
+
 func (m *Monitor) Start(ctx context.Context) error {
 	if m.running {
 		return fmt.Errorf("монитор уже запущен")
@@ -76,8 +93,6 @@ func (m *Monitor) Start(ctx context.Context) error {
 
 	if err := m.checkCfgutilStillNeeded(); err != nil {
 		log.Printf("⚠️ %v (cfgutil все еще нужен для операций восстановления)", err)
-		// Можно решить, что это фатальная ошибка, если cfgutil критичен
-		// return fmt.Errorf("cfgutil недоступен: %w", err)
 	}
 
 	if err := m.initialScan(); err != nil {
@@ -85,7 +100,7 @@ func (m *Monitor) Start(ctx context.Context) error {
 	}
 
 	go m.monitorLoop()
-	go m.cleanupLoop() // Renamed from cleanupStaleDevices for clarity
+	go m.cleanupLoop()
 
 	log.Println("✅ Мониторинг USB устройств (system_profiler) запущен")
 	return nil
@@ -100,12 +115,6 @@ func (m *Monitor) Stop() {
 	if m.cancel != nil {
 		m.cancel()
 	}
-	// Закрытие eventChan лучше делать здесь, если уверены, что все писатели остановлены.
-	// Но так как main.go читает из него, и он завершается по ctx.Done(),
-	// явное закрытие может быть излишним или привести к панике при записи в закрытый канал,
-	// если Stop() вызывается до завершения всех писателей.
-	// Если Stop() гарантированно вызывается после завершения ctx, то можно закрыть.
-	// Оставим без close(m.eventChan) пока, полагаясь на завершение читателей по ctx.Done().
 }
 
 func (m *Monitor) Events() <-chan Event { return m.eventChan }
@@ -158,10 +167,11 @@ func (m *Monitor) checkDevices() {
 
 	currentDeviceMap := make(map[string]*Device, len(currentSPDevices))
 	for _, dev := range currentSPDevices {
-		if dev.SerialNumber != "" {
+		if dev.SerialNumber != "" { // SerialNumber теперь "DFU-<ECID>"
 			currentDeviceMap[dev.SerialNumber] = dev
 		} else {
-			log.Printf("Предупреждение: Обнаружено устройство без серийного номера/ECID: %s", dev.Model)
+			// Этого не должно происходить, если extractDevicesRecursively отфильтровывает устройства без ECID
+			log.Printf("Предупреждение: Обнаружено обработанное устройство без серийного номера: %s", dev.Model)
 		}
 	}
 
@@ -181,7 +191,7 @@ func (m *Monitor) checkDevices() {
 			m.devices[sn] = currentDev
 			m.sendEvent(Event{Type: EventConnected, Device: currentDev})
 		} else {
-			if oldDev.State != currentDev.State || oldDev.IsDFU != currentDev.IsDFU || oldDev.USBLocation != currentDev.USBLocation {
+			if oldDev.State != currentDev.State || oldDev.IsDFU != currentDev.IsDFU || oldDev.USBLocation != currentDev.USBLocation || oldDev.ECID != currentDev.ECID {
 				m.devices[sn] = currentDev
 				m.sendEvent(Event{Type: EventStateChanged, Device: currentDev})
 			}
@@ -219,19 +229,26 @@ func (m *Monitor) fetchCurrentUSBDevices() []*Device {
 	}
 
 	var detectedDevices []*Device
-	for _, usbControllerInfo := range data.Items {
+	for _, usbControllerInfo := range data.Items { // SPUSBDataType это массив контроллеров/хабов верхнего уровня
 		m.extractDevicesRecursively(&usbControllerInfo, &detectedDevices)
 	}
 	return detectedDevices
 }
 
 func (m *Monitor) extractDevicesRecursively(spItem *SPUSBItem, devices *[]*Device) {
-	if strings.EqualFold(spItem.VendorID, appleVendorID) {
+	// Расширенное логирование для отладки
+	// log.Printf("DEBUG_USB_MONITOR: Checking item: Name='%s', VID='%s', PID='%s', SN_Raw='%s'", spItem.Name, spItem.VendorID, spItem.ProductID, spItem.SerialNum)
+
+	isApple := strings.EqualFold(spItem.VendorID, appleVendorIDHex) || strings.EqualFold(spItem.VendorID, appleVendorIDString)
+
+	if isApple {
+		// log.Printf("DEBUG_USB_MONITOR: Apple VID ('%s') matched. Name='%s', PID='%s'", spItem.VendorID, spItem.Name, spItem.ProductID)
 		pidLower := strings.ToLower(spItem.ProductID)
 		isDFUMode := false
 		deviceState := "Unknown"
-		deviceModel := spItem.Name
+		deviceModel := spItem.Name // Имя USB устройства, не обязательно модель Mac
 
+		// matchedPID был здесь, но удален, так как не используется
 		switch pidLower {
 		case dfuModePIDAS:
 			isDFUMode = true
@@ -247,6 +264,12 @@ func (m *Monitor) extractDevicesRecursively(spItem *SPUSBItem, devices *[]*Devic
 			deviceModel = "Intel T2 (DFU Mode)"
 		}
 
+		// Логирование случая, когда PID не подошел, можно оставить или убрать,
+		// если оно больше не нужно для отладки.
+		// if !isDFUMode && isApple { // Проверяем, что isDFUMode все еще false
+		// 	log.Printf("DEBUG_USB_MONITOR: Apple device, but PID '%s' for '%s' did not match DFU/Recovery PIDs.", pidLower, spItem.Name)
+		// }
+
 		if isDFUMode {
 			dev := &Device{
 				Model:       deviceModel,
@@ -254,15 +277,20 @@ func (m *Monitor) extractDevicesRecursively(spItem *SPUSBItem, devices *[]*Devic
 				IsDFU:       true,
 				USBLocation: spItem.LocationID,
 			}
-			if spItem.SerialNum != "" {
-				dev.ECID = spItem.SerialNum
-				dev.SerialNumber = "DFU-" + strings.TrimPrefix(strings.ToLower(dev.ECID), "0x")
+
+			parsedECID := extractECIDFromString(spItem.SerialNum)
+			if parsedECID != "" {
+				dev.ECID = parsedECID
+				dev.SerialNumber = "DFU-" + strings.ToLower(dev.ECID)
+				// log.Printf("DEBUG_USB_MONITOR: DFU/Recovery device created: SN='%s', Model='%s', ECID='%s'", dev.SerialNumber, dev.Model, dev.ECID)
 			} else {
-				log.Printf("⚠️ Обнаружено DFU-устройство (%s) без serial_num (ECID) в system_profiler: %s. Оно будет проигнорировано.", deviceModel, spItem.Name)
+				log.Printf("⚠️ DFU/Recovery device (%s) - ECID not found in serial_num: '%s'. Device will be ignored.", deviceModel, spItem.SerialNum)
 			}
 
-			if dev.ECID != "" {
+			if dev.ECID != "" && dev.IsValidSerial() {
 				*devices = append(*devices, dev)
+			} else if dev.ECID != "" {
+				log.Printf("⚠️ DFU/Recovery device (ECID: %s) has invalid SerialNumber ('%s') after ECID parsing. Device will be ignored.", dev.ECID, dev.SerialNumber)
 			}
 		}
 	}
@@ -274,17 +302,12 @@ func (m *Monitor) extractDevicesRecursively(spItem *SPUSBItem, devices *[]*Devic
 	}
 }
 
-// removeDuplicates был удален, так как не использовался.
-
 func (m *Monitor) sendEvent(e Event) {
-	// Делаем неблокирующую отправку с таймаутом, чтобы не зависнуть, если канал переполнен
-	// и контекст еще не отменен.
-	sendTimeout := time.NewTimer(100 * time.Millisecond) // Короткий таймаут
+	sendTimeout := time.NewTimer(100 * time.Millisecond)
 	defer sendTimeout.Stop()
 
 	select {
 	case m.eventChan <- e:
-		// log.Printf("📤 Событие отправлено: %s для %s", e.Type, e.Device.SerialNumber)
 	case <-m.ctx.Done():
 		log.Println("ℹ️ Канал событий не принимает (контекст завершен), событие пропущено.")
 	case <-sendTimeout.C:
@@ -294,14 +317,15 @@ func (m *Monitor) sendEvent(e Event) {
 
 func (m *Monitor) initialScan() error {
 	log.Println("🔍 Начальное сканирование USB-устройств (system_profiler)...")
-	devices := m.fetchCurrentUSBDevices() // Эта функция уже использует m.ctx
+	devices := m.fetchCurrentUSBDevices()
 
-	m.devicesMutex.Lock() // Блокируем для безопасной записи логов о найденных
+	m.devicesMutex.Lock()
 	defer m.devicesMutex.Unlock()
 
 	count := 0
 	for _, dev := range devices {
-		if dev.IsDFU && dev.SerialNumber != "" {
+		// Проверяем, что это DFU устройство с валидным SerialNumber (на основе ECID)
+		if dev.IsDFU && dev.SerialNumber != "" { // IsValidSerial уже учтено в extractDevicesRecursively
 			log.Printf("📱 Найдено при запуске (DFU/Recovery): %s (%s) - %s, ECID: %s",
 				dev.SerialNumber, dev.Model, dev.State, dev.ECID)
 			count++

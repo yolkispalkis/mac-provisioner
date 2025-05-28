@@ -184,9 +184,7 @@ func (m *Manager) speak(message string) {
 
 func (m *Manager) formatSerialNumber(serialNumber string) string {
 	// Убираем префикс DFU- если есть
-	if strings.HasPrefix(serialNumber, "DFU-") {
-		serialNumber = strings.TrimPrefix(serialNumber, "DFU-")
-	}
+	serialNumber = strings.TrimPrefix(serialNumber, "DFU-") // Исправлено: убрали if statement
 
 	if len(serialNumber) > 6 {
 		var formatted strings.Builder
@@ -284,4 +282,14 @@ func (m *Manager) GetAvailableVoices() ([]string, error) {
 	}
 
 	return voices, nil
+}
+
+func (m *Manager) DeviceReady(serialNumber, model string) {
+	if !m.config.Enabled || !m.canNotify() {
+		return
+	}
+
+	message := fmt.Sprintf("Устройство %s %s готово к работе",
+		model, m.formatSerialNumber(serialNumber))
+	m.speak(message)
 }

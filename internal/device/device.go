@@ -21,19 +21,25 @@ func (d *Device) NeedsProvisioning() bool {
 
 	state := strings.ToLower(d.State)
 
-	// Устройство нуждается в прошивке, если оно не сопряжено и не доступно
-	needsProvisioning := !(state == "paired" || state == "available")
+	// Для обычных Mac устройств проверяем состояние
+	// Если состояние "Unknown" или пустое, считаем что нужна прошивка
+	if state == "unknown" || state == "" || state == "n/a" {
+		return true
+	}
+
+	// Если устройство не сопряжено и не доступно, нужна прошивка
+	if !(state == "paired" || state == "available") {
+		return true
+	}
 
 	// Также проверяем на состояния, которые указывают на необходимость прошивки
 	if strings.Contains(state, "recovery") ||
 		strings.Contains(state, "restore") ||
-		strings.Contains(state, "dfu") ||
-		state == "unknown" ||
-		state == "" {
-		needsProvisioning = true
+		strings.Contains(state, "dfu") {
+		return true
 	}
 
-	return needsProvisioning
+	return false
 }
 
 func (d *Device) IsProvisioned() bool {

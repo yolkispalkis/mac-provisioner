@@ -93,13 +93,20 @@ func handleDeviceEvents(ctx context.Context, monitor *device.Monitor, provisione
 				log.Printf("🔌 Подключено устройство: %s (%s) - состояние: %s, DFU: %v",
 					event.Device.SerialNumber, event.Device.Model, event.Device.State, event.Device.IsDFU)
 
-				if event.Device.NeedsProvisioning() {
-					log.Printf("🔧 Устройство %s нуждается в прошивке", event.Device.SerialNumber)
+				// Проверяем, нужна ли прошивка
+				needsProvisioning := event.Device.NeedsProvisioning()
+				log.Printf("🔍 Устройство %s нуждается в прошивке: %v (состояние: %s)",
+					event.Device.SerialNumber, needsProvisioning, event.Device.State)
+
+				if needsProvisioning {
+					log.Printf("🔧 Запуск процесса прошивки для устройства %s", event.Device.SerialNumber)
 					notifier.DeviceDetected(event.Device.SerialNumber, event.Device.Model)
 					go provisioner.ProcessDevice(ctx, event.Device)
 				} else {
-					log.Printf("✅ Устройство %s уже прошито (состояние: %s)",
+					log.Printf("✅ Устройство %s уже прошито и готово к работе (состояние: %s)",
 						event.Device.SerialNumber, event.Device.State)
+					// Можно добавить уведомление о том, что устройство готово
+					// notifier.DeviceReady(event.Device.SerialNumber, event.Device.Model)
 				}
 
 			case device.EventDisconnected:
@@ -109,6 +116,12 @@ func handleDeviceEvents(ctx context.Context, monitor *device.Monitor, provisione
 			case device.EventStateChanged:
 				log.Printf("🔄 Изменение состояния устройства: %s (%s) - %s",
 					event.Device.SerialNumber, event.Device.Model, event.Device.State)
+
+				// Если устройство изменило состояние и теперь нуждается в прошивке
+				if event.Device.NeedsProvisioning() {
+					log.Printf("🔧 Устройство %s теперь нуждается в прошивке", event.Device.SerialNumber)
+					go provisioner.ProcessDevice(ctx, event.Device)
+				}
 			}
 		}
 	}

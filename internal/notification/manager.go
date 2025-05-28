@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"mac-provisioner/internal/config"
@@ -14,13 +15,22 @@ type Manager struct {
 	config           config.NotificationConfig
 	lastNotification time.Time
 	minInterval      time.Duration
+	speechQueue      chan string
+	speechMutex      sync.Mutex
+	isPlaying        bool
 }
 
 func New(cfg config.NotificationConfig) *Manager {
-	return &Manager{
+	m := &Manager{
 		config:      cfg,
 		minInterval: 2 * time.Second,
+		speechQueue: make(chan string, 10), // Буфер для 10 сообщений
 	}
+
+	// Запускаем обработчик очереди голосовых сообщений
+	go m.processSpeechQueue()
+
+	return m
 }
 
 func (m *Manager) DeviceDetected(serialNumber, model string) {
@@ -129,7 +139,7 @@ func (m *Manager) SystemShutdown() {
 	}
 
 	message := "Мак Провижнер завершает работу. До свидания!"
-	m.speak(message)
+	m.speakImmediate(message) // Немедленное воспроизведение для завершения
 }
 
 func (m *Manager) Error(errorMsg string) {
@@ -162,29 +172,76 @@ func (m *Manager) WaitingForDFU(serialNumber string) {
 	m.speak(message)
 }
 
+func (m *Manager) DeviceReady(serialNumber, model string) {
+	if !m.config.Enabled || !m.canNotify() {
+		return
+	}
+
+	message := fmt.Sprintf("Устройство %s %s готово к работе",
+		model, m.formatSerialNumber(serialNumber))
+	m.speak(message)
+}
+
+// Добавляет сообщение в очередь для последовательного воспроизведения
 func (m *Manager) speak(message string) {
-	go func() {
-		args := []string{
-			"-v", m.config.Voice,
-			"-r", strconv.Itoa(m.config.Rate),
-		}
+	select {
+	case m.speechQueue <- message:
+		// Сообщение добавлено в очередь
+	default:
+		// Очередь переполнена, пропускаем сообщение
+		fmt.Printf("⚠️ Очередь голосовых сообщений переполнена, сообщение пропущено: %s\n", message)
+	}
+}
 
-		// Устанавливаем громкость
-		if m.config.Volume != 1.0 {
-			volumeCmd := exec.Command("osascript", "-e",
-				fmt.Sprintf("set volume output volume %d", int(m.config.Volume*100)))
-			volumeCmd.Run()
-		}
+// Немедленное воспроизведение (для критических сообщений)
+func (m *Manager) speakImmediate(message string) {
+	m.speechMutex.Lock()
+	defer m.speechMutex.Unlock()
 
-		args = append(args, message)
-		cmd := exec.Command("say", args...)
-		cmd.Run()
-	}()
+	m.executeSpeech(message)
+}
+
+// Обработчик очереди голосовых сообщений
+func (m *Manager) processSpeechQueue() {
+	for message := range m.speechQueue {
+		m.speechMutex.Lock()
+		m.isPlaying = true
+
+		m.executeSpeech(message)
+
+		m.isPlaying = false
+		m.speechMutex.Unlock()
+
+		// Небольшая пауза между сообщениями
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// Выполняет фактическое воспроизведение речи
+func (m *Manager) executeSpeech(message string) {
+	// Устанавливаем громкость
+	if m.config.Volume != 1.0 {
+		volumeCmd := exec.Command("osascript", "-e",
+			fmt.Sprintf("set volume output volume %d", int(m.config.Volume*100)))
+		volumeCmd.Run()
+	}
+
+	// Воспроизводим сообщение
+	args := []string{
+		"-v", m.config.Voice,
+		"-r", strconv.Itoa(m.config.Rate),
+		message,
+	}
+
+	cmd := exec.Command("say", args...)
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("⚠️ Ошибка воспроизведения речи: %v\n", err)
+	}
 }
 
 func (m *Manager) formatSerialNumber(serialNumber string) string {
 	// Убираем префикс DFU- если есть
-	serialNumber = strings.TrimPrefix(serialNumber, "DFU-") // Исправлено: убрали if statement
+	serialNumber = strings.TrimPrefix(serialNumber, "DFU-")
 
 	if len(serialNumber) > 6 {
 		var formatted strings.Builder
@@ -259,7 +316,7 @@ func (m *Manager) PlaySuccess() {
 
 func (m *Manager) TestVoice() {
 	message := "Тест голоса Мак Провижнер. Так будут звучать уведомления с текущими настройками."
-	m.speak(message)
+	m.speakImmediate(message) // Немедленное воспроизведение для теста
 }
 
 func (m *Manager) GetAvailableVoices() ([]string, error) {
@@ -284,12 +341,31 @@ func (m *Manager) GetAvailableVoices() ([]string, error) {
 	return voices, nil
 }
 
-func (m *Manager) DeviceReady(serialNumber, model string) {
-	if !m.config.Enabled || !m.canNotify() {
-		return
-	}
+// Проверяет, воспроизводится ли сейчас сообщение
+func (m *Manager) IsPlaying() bool {
+	m.speechMutex.Lock()
+	defer m.speechMutex.Unlock()
+	return m.isPlaying
+}
 
-	message := fmt.Sprintf("Устройство %s %s готово к работе",
-		model, m.formatSerialNumber(serialNumber))
-	m.speak(message)
+// Очищает очередь сообщений
+func (m *Manager) ClearQueue() {
+	// Очищаем канал
+	for {
+		select {
+		case <-m.speechQueue:
+			// Удаляем сообщение из очереди
+		default:
+			return // Очередь пуста
+		}
+	}
+}
+
+// Останавливает все голосовые уведомления
+func (m *Manager) StopAll() {
+	// Останавливаем текущее воспроизведение
+	exec.Command("killall", "say").Run()
+
+	// Очищаем очередь
+	m.ClearQueue()
 }

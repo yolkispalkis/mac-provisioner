@@ -245,29 +245,53 @@ func processDevice(dev *device.Device, dfuMgr *dfu.Manager, configMgr *configura
 
 	defer onComplete()
 
-	log.Printf("Processing device %s", dev.SerialNumber)
+	log.Printf("🔄 Processing device %s (%s)", dev.SerialNumber, dev.Model)
 	startTime := time.Now()
 	stats.DeviceStarted()
 
 	if !dev.IsDFU {
 		notifyMgr.EnteringDFUMode(dev.SerialNumber)
+		log.Printf("📱 Attempting to enter DFU mode for device %s", dev.SerialNumber)
 
 		if err := dfuMgr.EnterDFUMode(dev.SerialNumber); err != nil {
-			log.Printf("Failed to enter DFU mode for %s: %v", dev.SerialNumber, err)
-			notifyMgr.RestoreFailed(dev.SerialNumber, "Failed to enter DFU mode")
-			notifyMgr.PlayAlert()
-			stats.DeviceCompleted(false, time.Since(startTime))
-			return
+			log.Printf("❌ Failed to enter DFU mode for %s: %v", dev.SerialNumber, err)
+
+			// Если это инструкции для ручного входа, показываем их пользователю
+			if strings.Contains(err.Error(), "manual DFU mode entry") {
+				notifyMgr.Error("Manual DFU mode required. Check console for instructions.")
+				log.Printf("\n" + strings.Repeat("=", 80))
+				log.Printf("MANUAL DFU MODE REQUIRED")
+				log.Printf(strings.Repeat("=", 80))
+				log.Printf("%v", err)
+				log.Printf(strings.Repeat("=", 80) + "\n")
+
+				// Ждем некоторое время, чтобы пользователь мог выполнить инструкции
+				log.Printf("⏳ Waiting 60 seconds for manual DFU mode entry...")
+				time.Sleep(60 * time.Second)
+
+				// Проверяем, вошло ли устройство в DFU режим
+				if !dfuMgr.IsInDFUMode(dev.SerialNumber) {
+					notifyMgr.RestoreFailed(dev.SerialNumber, "Device not in DFU mode")
+					stats.DeviceCompleted(false, time.Since(startTime))
+					return
+				}
+			} else {
+				notifyMgr.RestoreFailed(dev.SerialNumber, "Failed to enter DFU mode")
+				notifyMgr.PlayAlert()
+				stats.DeviceCompleted(false, time.Since(startTime))
+				return
+			}
 		}
 
 		notifyMgr.DFUModeEntered(dev.SerialNumber)
-		time.Sleep(15 * time.Second)
+		time.Sleep(15 * time.Second) // Даем время для стабилизации DFU режима
 	}
 
 	notifyMgr.StartingRestore(dev.SerialNumber)
+	log.Printf("🔧 Starting restore for device %s", dev.SerialNumber)
 
 	if err := configMgr.RestoreDevice(dev.SerialNumber, notifyMgr); err != nil {
-		log.Printf("Failed to restore device %s: %v", dev.SerialNumber, err)
+		log.Printf("❌ Failed to restore device %s: %v", dev.SerialNumber, err)
 		notifyMgr.RestoreFailed(dev.SerialNumber, err.Error())
 		notifyMgr.PlayAlert()
 		stats.DeviceCompleted(false, time.Since(startTime))
@@ -277,5 +301,5 @@ func processDevice(dev *device.Device, dfuMgr *dfu.Manager, configMgr *configura
 	notifyMgr.RestoreCompleted(dev.SerialNumber)
 	notifyMgr.PlaySuccess()
 	stats.DeviceCompleted(true, time.Since(startTime))
-	log.Printf("Successfully restored device %s", dev.SerialNumber)
+	log.Printf("✅ Successfully restored device %s in %v", dev.SerialNumber, time.Since(startTime).Round(time.Second))
 }

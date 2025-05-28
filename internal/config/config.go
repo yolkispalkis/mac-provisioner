@@ -71,7 +71,7 @@ func defaultConfig() *Config {
 		Notifications: NotificationConfig{
 			Enabled: true,
 			Voice:   "Milena", // Русский голос
-			Volume:  0.7,
+			Volume:  0.8,
 			Rate:    180,
 		},
 		DFU: DFUConfig{

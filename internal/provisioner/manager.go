@@ -147,9 +147,10 @@ func (m *Manager) restoreDevice(
 	// 2. Формируем команду cfgutil
 	var cmd *exec.Cmd
 	if useECID {
-		cmd = exec.Command("cfgutil", "restore", "--ecid", id, "--erase")
+		//  ⚠️  опция --ecid ставится ПЕРЕД restore
+		cmd = exec.Command("cfgutil", "--ecid", id, "restore", "--erase")
 	} else {
-		cmd = exec.Command("cfgutil", "restore", "-s", id, "--erase")
+		cmd = exec.Command("cfgutil", "-s", id, "restore", "--erase")
 	}
 
 	out, err := cmd.CombinedOutput()

@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -181,6 +182,12 @@ func handleUSBEvent(event usbmonitor.USBEvent, dfuMgr *dfu.Manager, configMgr *c
 	case "connected":
 		log.Printf("Device connected: %s (%s)", event.Device.SerialNumber, event.Device.Model)
 
+		// Проверяем, что серийный номер валидный (не содержит ECID или другие артефакты)
+		if !isValidSerialNumber(event.Device.SerialNumber) {
+			log.Printf("Skipping device with invalid serial number: %s", event.Device.SerialNumber)
+			return
+		}
+
 		// Проверяем, нужно ли прошивать устройство
 		if !event.Device.IsProvisioned() && !processedDevices[event.Device.SerialNumber] {
 			notifyMgr.DeviceDetected(event.Device.SerialNumber, event.Device.Model)
@@ -203,6 +210,18 @@ func handleUSBEvent(event usbmonitor.USBEvent, dfuMgr *dfu.Manager, configMgr *c
 			log.Printf("Device %s appears to be provisioned", event.Device.SerialNumber)
 		}
 	}
+}
+
+func isValidSerialNumber(serial string) bool {
+	// Проверяем, что серийный номер не содержит артефакты
+	if strings.Contains(serial, "ECID") ||
+		strings.Contains(serial, "0x") ||
+		strings.Contains(serial, "Type:") ||
+		len(serial) < 8 ||
+		len(serial) > 20 {
+		return false
+	}
+	return true
 }
 
 func cleanupProcessedDevices(processedDevices map[string]bool, usbMonitor *usbmonitor.Monitor) {

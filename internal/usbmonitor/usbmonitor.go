@@ -215,12 +215,13 @@ func (m *Monitor) parseSystemProfilerOutput(output string) []*device.Device {
 			}
 		}
 
-		// Ищем серийный номер
+		// Ищем серийный номер (игнорируем ECID)
 		if currentDevice != nil && strings.Contains(line, "Serial Number:") {
 			parts := strings.Split(line, ":")
 			if len(parts) > 1 {
 				serial := strings.TrimSpace(parts[1])
-				if serial != "" && serial != "N/A" {
+				// Проверяем, что это не ECID и не пустое значение
+				if serial != "" && serial != "N/A" && !strings.Contains(serial, "0x") && !strings.Contains(serial, "ECID") {
 					currentDevice.SerialNumber = serial
 				}
 			}
@@ -247,6 +248,11 @@ func (m *Monitor) isAppleDeviceLine(line string) bool {
 		if strings.Contains(line, keyword) {
 			return true
 		}
+	}
+
+	// Исключаем строки с ECID
+	if strings.Contains(line, "ecid") || strings.Contains(line, "0x") {
+		return false
 	}
 
 	return false

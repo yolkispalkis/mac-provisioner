@@ -19,145 +19,156 @@ import (
 func main() {
 	log.Println("🚀 Запуск Mac Provisioner...")
 
-	// Загружаем конфигурацию
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("❌ Ошибка загрузки конфигурации: %v", err)
 	}
-
 	log.Printf("⚙️ Конфигурация загружена: интервал проверки %v, голос %s",
 		cfg.Monitoring.CheckInterval, cfg.Notifications.Voice)
 
-	// Создаем контекст для graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// defer cancel() // Отменяем в конце main
 
-	// Обработка сигналов завершения
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Инициализируем компоненты
 	notifier := notification.New(cfg.Notifications)
-	stats := stats.New()
+	statsMgr := stats.New() // Изменено имя переменной для избежания конфликта с пакетом
 	dfuManager := dfu.New()
+	// Передаем cfg.Monitoring в NewMonitor
 	deviceMonitor := device.NewMonitor(cfg.Monitoring)
-	provisionerManager := provisioner.New(dfuManager, notifier, stats)
+	provisionerManager := provisioner.New(dfuManager, notifier, statsMgr)
 
 	log.Println("🔧 Компоненты инициализированы")
-
-	// Уведомление о запуске
 	notifier.SystemStarted()
 
-	// Запускаем мониторинг устройств
 	if err := deviceMonitor.Start(ctx); err != nil {
 		log.Fatalf("❌ Ошибка запуска мониторинга устройств: %v", err)
 	}
-	defer deviceMonitor.Stop()
+	// defer deviceMonitor.Stop() // Stop вызывается перед выходом из main
 
-	// Обрабатываем события устройств
 	go handleDeviceEvents(ctx, deviceMonitor, provisionerManager, notifier)
-
-	// Периодический вывод статистики
-	go printStats(ctx, stats)
-
-	// Периодический вывод подключенных устройств для отладки
-	go debugConnectedDevices(ctx, deviceMonitor)
+	go printStats(ctx, statsMgr, 10*time.Minute) // Передаем statsMgr
+	go debugConnectedDevices(ctx, deviceMonitor, 30*time.Second)
 
 	log.Println("✅ Mac Provisioner запущен. Нажмите Ctrl+C для остановки.")
-	log.Println("🔍 Подключите Mac через USB-C для автоматической прошивки...")
+	log.Println("🔌 Подключите Mac в DFU/Recovery режиме через USB-C для автоматической прошивки...")
 
-	// Ожидаем сигнал завершения
-	<-sigChan
-	log.Println("🛑 Завершение работы...")
-	notifier.SystemShutdown()
-	cancel()
+	<-sigChan // Ожидаем сигнал завершения
+	log.Println("🛑 Завершение работы Mac Provisioner...")
+	notifier.SystemShutdown() // Уведомление о завершении
 
-	// Даем время для воспроизведения последнего сообщения
+	cancel() // Отменяем контекст, чтобы все горутины завершились
+
+	deviceMonitor.Stop() // Останавливаем монитор явно
+
+	// Даем время для завершения уведомлений и других фоновых задач
+	log.Println("⏳ Ожидание завершения фоновых задач...")
 	time.Sleep(3 * time.Second)
+	log.Println("👋 Mac Provisioner остановлен.")
 }
 
-func handleDeviceEvents(ctx context.Context, monitor *device.Monitor, provisioner *provisioner.Manager, notifier *notification.Manager) {
-	log.Println("🎧 Запуск обработчика событий устройств...")
+func handleDeviceEvents(ctx context.Context, monitor *device.Monitor, provManager *provisioner.Manager, notifier *notification.Manager) {
+	log.Println("🎧 Запуск обработчика событий устройств (DFU/Recovery)...")
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("🛑 Обработчик событий остановлен")
+			log.Println("🛑 Обработчик событий устройств остановлен (контекст завершен).")
 			return
-		case event := <-monitor.Events():
-			log.Printf("📨 Получено событие: %s для устройства %s (%s)",
-				event.Type, event.Device.SerialNumber, event.Device.GetFriendlyName())
+		case event, ok := <-monitor.Events():
+			if !ok {
+				log.Println("🛑 Канал событий устройств закрыт, обработчик останавливается.")
+				return
+			}
+
+			log.Printf("📨 Получено событие: %s для устройства %s (Модель: %s, ECID: %s, DFU: %v)",
+				event.Type, event.Device.SerialNumber, event.Device.Model, event.Device.ECID, event.Device.IsDFU)
 
 			switch event.Type {
 			case device.EventConnected:
+				// С новым монитором, мы в основном будем видеть только DFU/Recovery устройства.
 				log.Printf("🔌 Подключено устройство: %s (%s) - состояние: %s, DFU: %v",
 					event.Device.SerialNumber, event.Device.GetFriendlyName(), event.Device.State, event.Device.IsDFU)
 
-				// Проверяем, нужна ли прошивка
-				needsProvisioning := event.Device.NeedsProvisioning()
-				log.Printf("🔍 Устройство %s нуждается в прошивке: %v (состояние: %s)",
-					event.Device.SerialNumber, needsProvisioning, event.Device.State)
-
-				if needsProvisioning {
-					log.Printf("🔧 Запуск процесса прошивки для устройства %s", event.Device.SerialNumber)
-					notifier.DeviceDetected(event.Device)
-					go provisioner.ProcessDevice(ctx, event.Device)
+				// NeedsProvisioning теперь просто проверяет IsDFU (и валидность ECID)
+				if event.Device.NeedsProvisioning() {
+					log.Printf("🔧 Устройство %s (ECID: %s) нуждается в прошивке.",
+						event.Device.GetFriendlyName(), event.Device.ECID)
+					notifier.DeviceDetected(event.Device) // Уведомление о DFU устройстве
+					go provManager.ProcessDevice(ctx, event.Device)
 				} else {
-					log.Printf("✅ Устройство %s уже прошито и готово к работе (состояние: %s)",
-						event.Device.SerialNumber, event.Device.State)
-					notifier.DeviceReady(event.Device)
+					// Этот блок маловероятен, если NeedsProvisioning = IsDFU
+					log.Printf("❓ Устройство %s (%s) подключено, но не требует прошивки (IsDFU: %v, ECID: '%s'). Это неожиданно.",
+						event.Device.GetFriendlyName(), event.Device.State, event.Device.IsDFU, event.Device.ECID)
+					// notifier.DeviceReady(event.Device) // DeviceReady для DFU устройств не имеет смысла
 				}
 
 			case device.EventDisconnected:
-				log.Printf("🔌 Отключено устройство: %s (%s)", event.Device.SerialNumber, event.Device.GetFriendlyName())
+				log.Printf("🔌 Отключено устройство: %s (%s)",
+					event.Device.SerialNumber, event.Device.GetFriendlyName())
 				notifier.DeviceDisconnected(event.Device)
 
 			case device.EventStateChanged:
-				log.Printf("🔄 Изменение состояния устройства: %s (%s) - %s",
-					event.Device.SerialNumber, event.Device.GetFriendlyName(), event.Device.State)
+				// Изменение состояния для DFU устройств маловероятно, кроме как при отключении.
+				// Если оно перешло из DFU в не-DFU, оно исчезнет из system_profiler (и будет Disconnected).
+				log.Printf("🔄 Изменение состояния устройства: %s (%s) - %s. DFU: %v",
+					event.Device.SerialNumber, event.Device.GetFriendlyName(), event.Device.State, event.Device.IsDFU)
 
-				// Если устройство изменило состояние и теперь нуждается в прошивке
+				// Если оно как-то изменилось, но все еще DFU и требует прошивки
 				if event.Device.NeedsProvisioning() {
-					log.Printf("🔧 Устройство %s теперь нуждается в прошивке", event.Device.SerialNumber)
-					go provisioner.ProcessDevice(ctx, event.Device)
+					log.Printf("🔧 Устройство %s (%s) изменило состояние, но все еще нуждается в прошивке.",
+						event.Device.GetFriendlyName(), event.Device.State)
+					go provManager.ProcessDevice(ctx, event.Device)
 				}
 			}
 		}
 	}
 }
 
-func printStats(ctx context.Context, stats *stats.Manager) {
-	ticker := time.NewTicker(10 * time.Minute)
+// printStats и debugConnectedDevices с небольшими изменениями для имен переменных и интервалов
+func printStats(ctx context.Context, statsMgr *stats.Manager, interval time.Duration) {
+	if interval == 0 {
+		interval = 10 * time.Minute // Значение по умолчанию
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	log.Printf("📊 Статистика будет выводиться каждые %v", interval)
 	for {
 		select {
 		case <-ctx.Done():
+			log.Println("📊 Вывод статистики остановлен.")
 			return
 		case <-ticker.C:
-			log.Printf("📊 Статистика: %s", stats.Summary())
+			log.Printf("📊 Статистика: %s", statsMgr.Summary())
 		}
 	}
 }
 
-func debugConnectedDevices(ctx context.Context, monitor *device.Monitor) {
-	ticker := time.NewTicker(30 * time.Second)
+func debugConnectedDevices(ctx context.Context, monitor *device.Monitor, interval time.Duration) {
+	if interval == 0 {
+		interval = 30 * time.Second // Значение по умолчанию
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	log.Printf("🔍 Отладка подключенных устройств будет выводиться каждые %v", interval)
 	for {
 		select {
 		case <-ctx.Done():
+			log.Println("🔍 Отладка подключенных устройств остановлена.")
 			return
 		case <-ticker.C:
-			devices := monitor.GetConnectedDevices()
-			if len(devices) > 0 {
-				log.Printf("🔍 Отладка: подключено устройств: %d", len(devices))
-				for i, dev := range devices {
-					log.Printf("  %d. %s (%s) - %s [DFU: %v, NeedsProvisioning: %v]",
-						i+1, dev.SerialNumber, dev.Model, dev.State, dev.IsDFU, dev.NeedsProvisioning())
+			devicesList := monitor.GetConnectedDevices() // Имя переменной изменено
+			if len(devicesList) > 0 {
+				log.Printf("🔍 Отладка: Подключено DFU/Recovery устройств: %d", len(devicesList))
+				for i, dev := range devicesList {
+					log.Printf("  %d. SN: %s (Модель: %s, Состояние: %s, ECID: %s, DFU: %v, NeedsProv: %v)",
+						i+1, dev.SerialNumber, dev.Model, dev.State, dev.ECID, dev.IsDFU, dev.NeedsProvisioning())
 				}
 			} else {
-				log.Println("🔍 Отладка: подключенных устройств не обнаружено")
+				log.Println("🔍 Отладка: Подключенных DFU/Recovery устройств не обнаружено (system_profiler).")
 			}
 		}
 	}

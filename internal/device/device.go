@@ -14,35 +14,18 @@ type Device struct {
 	USBLocation  string `json:"usb_location,omitempty"`
 }
 
-/* ============================================================
-   НУЖНО ЛИ ПРОШИВАТЬ?
-   ------------------------------------------------------------
-   Новая логика: прошивать ВСЕХ, кроме тех, кто УЖЕ в DFU-процессе
-   и у кого явно проставлен "IsProvisioned".
-   ============================================================ */
-
 func (d *Device) NeedsProvisioning() bool {
-	// 1. Если уже DFU  → да, естественно, нужна прошивка
-	if d.IsDFU {
-		return true
+	if !d.IsDFU {
+		return false
 	}
-
-	// 2. Состояние «paired | available» считаем ГОДНЫМ
-	state := strings.ToLower(strings.TrimSpace(d.State))
-	if state == "paired" || state == "available" {
-		return false // Mac считается готовым, перепрошивка не нужна
+	if d.ECID == "" {
+		return false
 	}
-
-	// 3. Любое другое состояние → прошиваем
 	return true
 }
 
 func (d *Device) IsProvisioned() bool {
-	if d.IsDFU {
-		return false
-	}
-	state := strings.ToLower(strings.TrimSpace(d.State))
-	return state == "paired" || state == "available"
+	return !d.IsDFU
 }
 
 func (d *Device) IsValidSerial() bool {
@@ -52,11 +35,12 @@ func (d *Device) IsValidSerial() bool {
 	if strings.HasPrefix(d.SerialNumber, "DFU-") {
 		return len(d.SerialNumber) > 4
 	}
+	// Логика для обычных SN (сейчас не используется)
 	if len(d.SerialNumber) < 8 || len(d.SerialNumber) > 20 {
 		return false
 	}
-	invalid := []string{"ECID", "0x", "Type:", "N/A", "Unknown", "Name"}
-	for _, inv := range invalid {
+	invalidSubstrings := []string{"ECID", "0x", "Type:", "N/A", "Unknown", "Name"}
+	for _, inv := range invalidSubstrings {
 		if strings.Contains(d.SerialNumber, inv) {
 			return false
 		}
@@ -64,65 +48,35 @@ func (d *Device) IsValidSerial() bool {
 	return true
 }
 
-/* ============================================================
-   ДРУЖЕСКОЕ ИМЯ
-   ============================================================ */
-
 func (d *Device) GetFriendlyName() string {
-	model := d.GetReadableModel()
-	if port := d.extractPortNumber(); port != "" {
-		return fmt.Sprintf("%s на порту %s", model, port)
+	if d.ECID != "" {
+		cleanECID := strings.TrimPrefix(strings.ToLower(d.ECID), "0x")
+		return fmt.Sprintf("%s (ECID: ...%s)", d.Model, getLastNChars(cleanECID, 6))
 	}
-	return model
+	return d.Model
+}
+
+func getLastNChars(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }
 
 func (d *Device) GetReadableModel() string {
-	m := strings.ToLower(d.Model)
-	switch {
-	case strings.Contains(m, "macbookair"):
-		return "МакБук Эйр"
-	case strings.Contains(m, "macbookpro"):
-		return "МакБук Про"
-	case strings.Contains(m, "macbook"):
-		return "МакБук"
-	case strings.Contains(m, "imac"):
-		return "АйМак"
-	case strings.Contains(m, "macmini"):
-		return "Мак Мини"
-	case strings.Contains(m, "macstudio"):
-		return "Мак Студио"
-	case strings.Contains(m, "macpro"):
-		return "Мак Про"
-	default:
-		return d.Model
+	modelLower := strings.ToLower(d.Model)
+	if strings.Contains(modelLower, "dfu mode") {
+		return "устройство в режиме ДФУ"
 	}
+	if strings.Contains(modelLower, "recovery mode") {
+		return "устройство в режиме восстановления"
+	}
+	return d.Model
 }
 
-func (d *Device) extractPortNumber() string {
-	if d.USBLocation == "" {
-		return ""
-	}
-	loc := strings.ToLower(d.USBLocation)
-	loc = strings.TrimPrefix(loc, "location:")
-	loc = strings.TrimPrefix(loc, "0x")
-	loc = strings.TrimSpace(loc)
-
-	if len(loc) >= 8 {
-		last := loc[len(loc)-1:]
-		if last >= "1" && last <= "9" {
-			return last
-		}
-		if len(loc) >= 2 {
-			prev := loc[len(loc)-2 : len(loc)-1]
-			if prev >= "1" && prev <= "9" {
-				return prev
-			}
-		}
-	}
-	return ""
-}
+// extractPortNumber был удален, так как не использовался.
 
 func (d *Device) String() string {
-	return fmt.Sprintf("Device{SN:%s, Model:%s, State:%s, DFU:%v, USB:%s}",
-		d.SerialNumber, d.Model, d.State, d.IsDFU, d.USBLocation)
+	return fmt.Sprintf("Device{SN:%s, Model:%s, State:%s, DFU:%v, ECID:%s, USBLoc:%s}",
+		d.SerialNumber, d.Model, d.State, d.IsDFU, d.ECID, d.USBLocation)
 }

@@ -1,7 +1,11 @@
 package dfu
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
+	"log"
 	"os/exec"
 	"strings"
 	"time"
@@ -9,200 +13,226 @@ import (
 	"mac-provisioner/internal/device"
 )
 
+// Константы VID/PID (дублируются из monitor.go, лучше вынести в общий пакет)
+const (
+	appleVendorID_DFUManager     = "0x05ac"
+	dfuModePIDAS_DFUManager      = "0x1281"
+	recoveryModePIDAS_DFUManager = "0x1280"
+	dfuModePIDIntelT2_DFUManager = "0x1227"
+)
+
+// Структуры для парсинга JSON (дублируются)
+type SPUSBItem_DFUManager struct {
+	Name       string                 `json:"_name"`
+	ProductID  string                 `json:"product_id,omitempty"`
+	VendorID   string                 `json:"vendor_id,omitempty"`
+	SerialNum  string                 `json:"serial_num,omitempty"`
+	LocationID string                 `json:"location_id,omitempty"`
+	SubItems   []SPUSBItem_DFUManager `json:"_items,omitempty"`
+}
+
+type SPUSBDataType_DFUManager struct {
+	Items []SPUSBItem_DFUManager `json:"SPUSBDataType"`
+}
+
 type Manager struct{}
 
 func New() *Manager { return &Manager{} }
 
 /* ============================================================
-   ВХОД В DFU
+   ВХОД В DFU (логика macvdmtool/cfgutil reboot остается)
    ============================================================ */
 
-func (m *Manager) EnterDFUMode(serialNumber string) error {
-	// 1. Пытаемся через macvdmtool
+func (m *Manager) EnterDFUMode(ctx context.Context, serialNumber string) error {
 	if m.hasMacvdmtool() {
-		return m.enterDFUWithMacvdmtool(serialNumber)
+		return m.enterDFUWithMacvdmtool(ctx, serialNumber)
 	}
-
-	// 2. Fallback → cfgutil reboot
-	return m.enterDFUWithCfgutil(serialNumber)
+	return m.enterDFUWithCfgutilRebootThenManual(ctx, serialNumber)
 }
-
-/* -------------------- macvdmtool -------------------- */
 
 func (m *Manager) hasMacvdmtool() bool {
 	_, err := exec.LookPath("macvdmtool")
 	return err == nil
 }
 
-func (m *Manager) enterDFUWithMacvdmtool(serialNumber string) error {
-	fmt.Printf("Использование macvdmtool для входа в DFU режим устройства %s\n", serialNumber)
+func (m *Manager) enterDFUWithMacvdmtool(ctx context.Context, originalSerial string) error {
+	log.Printf("ℹ️ Попытка входа в DFU для %s с помощью macvdmtool...", originalSerial)
 
-	// Сначала пробуем без sudo
-	cmd := exec.Command("macvdmtool", "dfu")
+	cmd := exec.CommandContext(ctx, "macvdmtool", "dfu")
 	if err := cmd.Run(); err != nil {
-		// Попытка с sudo (понадобится NOPASSWD или открытый парольный кеш)
-		fmt.Printf("macvdmtool без sudo не удался: %v, пробуем sudo…\n", err)
-		cmd = exec.Command("sudo", "-n", "macvdmtool", "dfu")
-		if err2 := cmd.Run(); err2 != nil {
-			return fmt.Errorf("ошибка выполнения macvdmtool dfu: %w", err2)
+		log.Printf("⚠️ macvdmtool dfu без sudo не удался: %v. Пробуем с sudo -n...", err)
+		cmdSudo := exec.CommandContext(ctx, "sudo", "-n", "macvdmtool", "dfu")
+		if errSudo := cmdSudo.Run(); errSudo != nil {
+			log.Printf("❌ Ошибка выполнения 'sudo -n macvdmtool dfu': %v", errSudo)
+			log.Println("ℹ️ macvdmtool не сработал. Переход к ручному методу DFU.")
+			// Возвращаем ошибку, чтобы вызывающий код мог предложить ручной DFU
+			return fmt.Errorf("macvdmtool failed: %w, then sudo macvdmtool failed: %w", err, errSudo)
 		}
 	}
 
-	fmt.Println("Команда macvdmtool dfu выполнена успешно, ждём 15 с…")
-	time.Sleep(15 * time.Second)
-
-	return m.waitForDFUMode(serialNumber)
+	log.Println("ℹ️ Команда macvdmtool dfu отправлена. Ожидание появления устройства в DFU режиме...")
+	return m.WaitForDFUMode(ctx, originalSerial, 2*time.Minute)
 }
 
-/* -------------------- cfgutil fallback -------------------- */
+func (m *Manager) enterDFUWithCfgutilRebootThenManual(ctx context.Context, serialNumber string) error {
+	log.Printf("ℹ️ macvdmtool недоступен или не сработал. Попытка 'cfgutil reboot' для %s, затем ручной DFU.", serialNumber)
 
-func (m *Manager) enterDFUWithCfgutil(serialNumber string) error {
-	fmt.Printf("macvdmtool недоступен — используем cfgutil reboot для %s\n", serialNumber)
-
-	cmd := exec.Command("cfgutil", "reboot", "-s", serialNumber)
+	cmd := exec.CommandContext(ctx, "cfgutil", "reboot", "-s", serialNumber)
 	if err := cmd.Run(); err != nil {
-		fmt.Printf("Ошибка reboot через cfgutil: %v\n", err)
+		log.Printf("⚠️ Ошибка 'cfgutil reboot -s %s': %v. Возможно, устройство уже не в подходящем состоянии.", serialNumber, err)
 	} else {
-		fmt.Println("Устройство перезагружено. Через 5 с покажем инструкции DFU…")
-		time.Sleep(5 * time.Second)
+		log.Println("✅ Команда 'cfgutil reboot' отправлена. Устройство должно перезагрузиться.")
+		select {
+		case <-time.After(5 * time.Second):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-
-	// Падение в ручной режим
-	return m.enterDFUManually(serialNumber)
+	// Возвращаем специальную ошибку или nil, чтобы указать на необходимость ручного DFU
+	// m.OfferManualDFU(serialNumber) будет вызван в provisioner.Manager
+	return fmt.Errorf("требуется ручной вход в DFU после попытки cfgutil reboot (или macvdmtool не сработал)")
 }
 
-/* ============================================================
-   MANUAL DFU (инструкции пользователю)
-   ============================================================ */
-
-func (m *Manager) enterDFUManually(serialNumber string) error {
-	info := m.getDeviceInfo(serialNumber)
-
-	if m.isAppleSilicon(info) {
-		return fmt.Errorf(`устройство %s требует ручного входа в DFU режим.
+// OfferManualDFU выводит инструкции для ручного входа в DFU.
+func (m *Manager) OfferManualDFU(serialOrHint string) {
+	log.Printf(`ТРЕБУЕТСЯ РУЧНОЙ ВХОД В DFU для устройства (связанного с %s).
+Пожалуйста, следуйте инструкциям для вашего типа Mac:
 
 Для Mac на Apple Silicon:
- 1. Полностью выключите Mac
- 2. Подключите его к этому компьютеру кабелем USB-C
+ 1. Полностью выключите Mac.
+ 2. Подключите его к этому компьютеру кабелем USB-C.
  3. Нажмите и удерживайте кнопку питания — удерживайте пока не появится «Загрузка вариантов запуска…»
- 4. Отпустите кнопку питания — Mac должен появиться в DFU режиме
+ 4. Отпустите кнопку питания — Mac должен появиться в DFU режиме.
 
-Альтернативно:
- 1. Выключите Mac
- 2. Удерживайте: Правый Shift + Левый Option + Левый Control + Питание (10 с)
- 3. Отпустите клавиши, затем снова нажмите Питание`, serialNumber)
-	}
+Для Intel Mac (особенно с чипом T2):
+ 1. Полностью выключите Mac.
+ 2. Подключите через USB-C/Thunderbolt к этому компьютеру.
+ 3. Убедитесь, что Mac выключен. Нажмите и удерживайте кнопку питания.
+ 4. После ~10 секунд, продолжая удерживать кнопку питания, нажмите и удерживайте левую клавишу Shift + левую клавишу Option + левую клавишу Control в течение ~7-10 секунд.
+ 5. Отпустите все три клавиши (Shift, Option, Control), но продолжайте удерживать кнопку питания, пока Mac не появится в DFU.
 
-	return fmt.Errorf(`устройство %s требует ручного входа в DFU режим.
-
-Для Intel-Mac:
- 1. Полностью выключите Mac
- 2. Подключите через USB-C/Thunderbolt
- 3. Нажмите и удерживайте кнопку питания 10 с
- 4. Затем нажмите и удерживайте кнопку питания 3 с
- 5. Не отпуская питание, нажмите и держите кнопку уменьшения громкости (10 с)
- 6. Отпустите питание, громкость держите ещё 5 с
- 7. Mac должен войти в DFU`, serialNumber)
-}
-
-/* -------------------- вспомогательные -------------------- */
-
-func (m *Manager) getDeviceInfo(serialNumber string) string {
-	out, err := exec.Command("cfgutil", "list").Output()
-	if err != nil {
-		return "Unknown"
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if strings.Contains(line, serialNumber) {
-			return line
-		}
-	}
-	return "Unknown"
-}
-
-func (m *Manager) isAppleSilicon(info string) bool {
-	inf := strings.ToLower(info)
-	return strings.Contains(inf, "apple silicon") ||
-		strings.Contains(inf, "m1") ||
-		strings.Contains(inf, "m2") ||
-		strings.Contains(inf, "m3") ||
-		strings.Contains(inf, "m4")
+После выполнения этих шагов, система попытается автоматически обнаружить устройство в DFU режиме в течение следующих нескольких минут.
+`, serialOrHint)
 }
 
 /* ============================================================
-   WAIT HELPERS
+   WAIT HELPERS (используют system_profiler)
    ============================================================ */
 
-func (m *Manager) waitForDFUMode(serialNumber string) error {
-	const maxAttempts = 60
-	fmt.Printf("Ожидание появления устройства %s в DFU (до 2 мин)…\n", serialNumber)
+// WaitForDFUMode ожидает появления *любого* устройства в DFU/Recovery.
+func (m *Manager) WaitForDFUMode(ctx context.Context, purposeHint string, timeout time.Duration) error {
+	log.Printf("⏳ Ожидание появления устройства в DFU/Recovery режиме (для %s), таймаут %v (проверка через system_profiler)...", purposeHint, timeout)
 
-	for i := 0; i < maxAttempts; i++ {
-		if m.isInDFUMode() {
-			fmt.Printf("✅ Устройство %s в DFU режиме\n", serialNumber)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	deadline := time.NewTimer(timeout) // Используем NewTimer для возможности Stop
+	defer deadline.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("ℹ️ Ожидание DFU отменено через контекст.")
+			return ctx.Err()
+		case <-deadline.C:
+			log.Printf("❌ Таймаут ожидания DFU/Recovery для %s.", purposeHint)
+			return fmt.Errorf("устройство (для %s) не вошло в DFU/Recovery режим в течение %v", purposeHint, timeout)
+		case <-ticker.C:
+			if m.isInDFUMode(ctx) {
+				log.Printf("✅ Обнаружено DFU/Recovery устройство (system_profiler). Предполагаем, что это целевое для %s.", purposeHint)
+				return nil
+			}
+			log.Printf("⌛ ...все еще ожидаем DFU/Recovery для %s...", purposeHint)
+		}
+	}
+}
+
+func (m *Manager) isInDFUMode(ctx context.Context) bool {
+	devices := m.GetDFUDevices(ctx)
+	return len(devices) > 0
+}
+
+/* ============================================================
+   ЧТЕНИЕ DFU-УСТРОЙСТВ (через system_profiler)
+   ============================================================ */
+
+func (m *Manager) GetDFUDevices(ctx context.Context) []*device.Device {
+	cmd := exec.CommandContext(ctx, "system_profiler", "SPUSBDataType", "-json")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+
+	err := cmd.Run()
+	if err != nil {
+		if ctx.Err() == context.Canceled {
 			return nil
 		}
-		if i%10 == 0 {
-			fmt.Printf("⏳ %d / %d попыток…\n", i+1, maxAttempts)
-		}
-		time.Sleep(2 * time.Second)
-	}
-	return fmt.Errorf("устройство %s не вошло в DFU за 2 мин", serialNumber)
-}
-
-func (m *Manager) isInDFUMode() bool {
-	return len(m.GetDFUDevices()) > 0
-}
-
-/* ============================================================
-   ЧТЕНИЕ DFU-УСТРОЙСТВ
-   ============================================================ */
-
-func (m *Manager) GetDFUDevices() []*device.Device {
-	var list []*device.Device
-
-	out, err := exec.Command("cfgutil", "list").Output()
-	if err != nil {
-		return list
+		return nil
 	}
 
-	for _, line := range strings.Split(string(out), "\n") {
-		l := strings.TrimSpace(line)
-		if l == "" || strings.HasPrefix(l, "Name") {
-			continue
+	var data SPUSBDataType_DFUManager
+	if err := json.Unmarshal(out.Bytes(), &data); err != nil {
+		return nil
+	}
+
+	var dfuDevices []*device.Device
+	for _, usbControllerInfo := range data.Items {
+		m.extractDFUDevicesRecursive(&usbControllerInfo, &dfuDevices)
+	}
+	return dfuDevices
+}
+
+func (m *Manager) extractDFUDevicesRecursive(spItem *SPUSBItem_DFUManager, devices *[]*device.Device) {
+	if strings.EqualFold(spItem.VendorID, appleVendorID_DFUManager) {
+		pidLower := strings.ToLower(spItem.ProductID)
+		isDFUMode := false
+		deviceState := "Unknown"
+		deviceModel := spItem.Name
+
+		switch pidLower {
+		case dfuModePIDAS_DFUManager:
+			isDFUMode = true
+			deviceState = "DFU"
+			deviceModel = "Apple Silicon (DFU Mode)"
+		case recoveryModePIDAS_DFUManager:
+			isDFUMode = true
+			deviceState = "Recovery"
+			deviceModel = "Apple Silicon (Recovery Mode)"
+		case dfuModePIDIntelT2_DFUManager:
+			isDFUMode = true
+			deviceState = "DFU"
+			deviceModel = "Intel T2 (DFU Mode)"
 		}
-		if strings.Contains(l, "Type:") && strings.Contains(l, "ECID:") {
-			if d := m.parseDFULine(l); d != nil && d.ECID != "" {
-				list = append(list, d)
+
+		if isDFUMode {
+			dev := &device.Device{
+				Model:       deviceModel,
+				State:       deviceState,
+				IsDFU:       true,
+				USBLocation: spItem.LocationID,
+			}
+			if spItem.SerialNum != "" {
+				dev.ECID = spItem.SerialNum
+				dev.SerialNumber = "DFU-" + strings.TrimPrefix(strings.ToLower(dev.ECID), "0x")
+			}
+			if dev.ECID != "" {
+				*devices = append(*devices, dev)
 			}
 		}
 	}
-	return list
-}
 
-func (m *Manager) parseDFULine(line string) *device.Device {
-	d := &device.Device{IsDFU: true, State: "DFU"}
-
-	fields := strings.Fields(line)
-	for i, f := range fields {
-		switch f {
-		case "Type:":
-			if i+1 < len(fields) {
-				d.Model = fields[i+1]
-			}
-		case "ECID:":
-			if i+1 < len(fields) {
-				d.ECID = fields[i+1]
-				d.SerialNumber = "DFU-" + fields[i+1]
-			}
+	if spItem.SubItems != nil {
+		for i := range spItem.SubItems {
+			m.extractDFUDevicesRecursive(&spItem.SubItems[i], devices)
 		}
 	}
-	return d
 }
 
-func (m *Manager) GetFirstDFUECID() string {
-	if devs := m.GetDFUDevices(); len(devs) > 0 {
-		return devs[0].ECID
+func (m *Manager) GetFirstDFUECID(ctx context.Context) string {
+	if devs := m.GetDFUDevices(ctx); len(devs) > 0 && devs[0].ECID != "" {
+		ecid := devs[0].ECID
+		ecid = strings.ToLower(ecid)
+		ecid = strings.TrimPrefix(ecid, "0x")
+		return ecid
 	}
 	return ""
 }

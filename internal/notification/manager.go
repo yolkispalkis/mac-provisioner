@@ -6,131 +6,116 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"mac-provisioner/internal/config"
 )
 
 type Manager struct {
-	enabled          bool
-	voice            string
-	volume           float64
-	rate             int
+	config           config.NotificationConfig
 	lastNotification time.Time
 	minInterval      time.Duration
 }
 
-func NewManager() *Manager {
+func New(cfg config.NotificationConfig) *Manager {
 	return &Manager{
-		enabled:     true,
-		voice:       "Alex",
-		volume:      0.7,
-		rate:        200,
+		config:      cfg,
 		minInterval: 2 * time.Second,
 	}
 }
 
-func (m *Manager) SetEnabled(enabled bool) {
-	m.enabled = enabled
-}
-
-func (m *Manager) SetVoice(voice string) {
-	m.voice = voice
-}
-
-func (m *Manager) SetVolume(volume float64) {
-	if volume >= 0.0 && volume <= 1.0 {
-		m.volume = volume
-	}
-}
-
-func (m *Manager) SetRate(rate int) {
-	if rate > 0 {
-		m.rate = rate
-	}
-}
-
 func (m *Manager) DeviceDetected(serialNumber, model string) {
-	if !m.enabled {
+	if !m.config.Enabled {
 		return
 	}
 
-	message := fmt.Sprintf("Обнаружено устройство. %s с серийным номером %s", model, m.formatSerialNumber(serialNumber))
+	message := fmt.Sprintf("Обнаружено новое устройство. %s с серийным номером %s",
+		model, m.formatSerialNumber(serialNumber))
 	m.speak(message)
 }
 
 func (m *Manager) DeviceConnected(serialNumber, model string) {
-	if !m.enabled || !m.canNotify() {
+	if !m.config.Enabled || !m.canNotify() {
 		return
 	}
 
-	message := fmt.Sprintf("Подключено новое устройство: %s %s", model, m.formatSerialNumber(serialNumber))
+	message := fmt.Sprintf("Подключено устройство: %s %s",
+		model, m.formatSerialNumber(serialNumber))
 	m.speak(message)
 }
 
 func (m *Manager) DeviceDisconnected(serialNumber, model string) {
-	if !m.enabled || !m.canNotify() {
+	if !m.config.Enabled || !m.canNotify() {
 		return
 	}
 
-	message := fmt.Sprintf("Устройство отключено: %s %s", model, m.formatSerialNumber(serialNumber))
+	message := fmt.Sprintf("Отключено устройство: %s %s",
+		model, m.formatSerialNumber(serialNumber))
 	m.speak(message)
 }
 
 func (m *Manager) EnteringDFUMode(serialNumber string) {
-	if !m.enabled {
+	if !m.config.Enabled {
 		return
 	}
 
-	message := fmt.Sprintf("Переход в режим Д Ф У для устройства %s", m.formatSerialNumber(serialNumber))
+	message := fmt.Sprintf("Переход в режим восстановления для устройства %s",
+		m.formatSerialNumber(serialNumber))
 	m.speak(message)
 }
 
 func (m *Manager) DFUModeEntered(serialNumber string) {
-	if !m.enabled {
+	if !m.config.Enabled {
 		return
 	}
 
-	message := fmt.Sprintf("Устройство %s теперь в режиме Д Ф У. Готово к восстановлению.", m.formatSerialNumber(serialNumber))
+	message := fmt.Sprintf("Устройство %s перешло в режим восстановления. Готово к прошивке.",
+		m.formatSerialNumber(serialNumber))
 	m.speak(message)
 }
 
 func (m *Manager) StartingRestore(serialNumber string) {
-	if !m.enabled {
+	if !m.config.Enabled {
 		return
 	}
 
-	message := fmt.Sprintf("Начинается восстановление прошивки для устройства %s. Это может занять несколько минут.", m.formatSerialNumber(serialNumber))
+	message := fmt.Sprintf("Начинается восстановление прошивки для устройства %s. Процесс может занять несколько минут.",
+		m.formatSerialNumber(serialNumber))
 	m.speak(message)
 }
 
 func (m *Manager) RestoreProgress(serialNumber, status string) {
-	if !m.enabled || !m.canNotify() {
+	if !m.config.Enabled || !m.canNotify() {
 		return
 	}
 
-	message := fmt.Sprintf("Устройство %s %s", m.formatSerialNumber(serialNumber), status)
+	message := fmt.Sprintf("Устройство %s: %s",
+		m.formatSerialNumber(serialNumber), status)
 	m.speak(message)
 }
 
 func (m *Manager) RestoreCompleted(serialNumber string) {
-	if !m.enabled {
+	if !m.config.Enabled {
 		return
 	}
 
-	message := fmt.Sprintf("Отлично! Восстановление успешно завершено для устройства %s. Устройство готово к использованию.", m.formatSerialNumber(serialNumber))
+	message := fmt.Sprintf("Отлично! Восстановление успешно завершено для устройства %s. Устройство готово к использованию.",
+		m.formatSerialNumber(serialNumber))
 	m.speak(message)
 }
 
 func (m *Manager) RestoreFailed(serialNumber, error string) {
-	if !m.enabled {
+	if !m.config.Enabled {
 		return
 	}
 
 	simplifiedError := m.simplifyError(error)
-	message := fmt.Sprintf("Внимание! Восстановление не удалось для устройства %s. %s", m.formatSerialNumber(serialNumber), simplifiedError)
+	message := fmt.Sprintf("Внимание! Восстановление не удалось для устройства %s. %s",
+		m.formatSerialNumber(serialNumber), simplifiedError)
 	m.speak(message)
 }
 
 func (m *Manager) SystemStarted() {
-	if !m.enabled {
+	if !m.config.Enabled {
 		return
 	}
 
@@ -139,7 +124,7 @@ func (m *Manager) SystemStarted() {
 }
 
 func (m *Manager) SystemShutdown() {
-	if !m.enabled {
+	if !m.config.Enabled {
 		return
 	}
 
@@ -148,7 +133,7 @@ func (m *Manager) SystemShutdown() {
 }
 
 func (m *Manager) Error(errorMsg string) {
-	if !m.enabled {
+	if !m.config.Enabled {
 		return
 	}
 
@@ -157,25 +142,37 @@ func (m *Manager) Error(errorMsg string) {
 	m.speak(message)
 }
 
-func (m *Manager) RealTimeMonitoringStarted() {
-	if !m.enabled {
+func (m *Manager) ManualDFURequired(serialNumber string) {
+	if !m.config.Enabled {
 		return
 	}
 
-	message := "Активирован мониторинг устройств в реальном времени. Устройства будут обнаружены мгновенно при подключении."
+	message := fmt.Sprintf("Для устройства %s требуется ручной переход в режим восстановления. Проверьте консоль для получения подробных инструкций.",
+		m.formatSerialNumber(serialNumber))
+	m.speak(message)
+}
+
+func (m *Manager) WaitingForDFU(serialNumber string) {
+	if !m.config.Enabled {
+		return
+	}
+
+	message := fmt.Sprintf("Ожидание перехода устройства %s в режим восстановления. Следуйте инструкциям на экране.",
+		m.formatSerialNumber(serialNumber))
 	m.speak(message)
 }
 
 func (m *Manager) speak(message string) {
 	go func() {
 		args := []string{
-			"-v", m.voice,
-			"-r", strconv.Itoa(m.rate),
+			"-v", m.config.Voice,
+			"-r", strconv.Itoa(m.config.Rate),
 		}
 
-		if m.volume != 1.0 {
+		// Устанавливаем громкость
+		if m.config.Volume != 1.0 {
 			volumeCmd := exec.Command("osascript", "-e",
-				fmt.Sprintf("set volume output volume %d", int(m.volume*100)))
+				fmt.Sprintf("set volume output volume %d", int(m.config.Volume*100)))
 			volumeCmd.Run()
 		}
 
@@ -186,6 +183,11 @@ func (m *Manager) speak(message string) {
 }
 
 func (m *Manager) formatSerialNumber(serialNumber string) string {
+	// Убираем префикс DFU- если есть
+	if strings.HasPrefix(serialNumber, "DFU-") {
+		serialNumber = strings.TrimPrefix(serialNumber, "DFU-")
+	}
+
 	if len(serialNumber) > 6 {
 		var formatted strings.Builder
 		for i, char := range serialNumber {
@@ -206,7 +208,7 @@ func (m *Manager) simplifyError(error string) string {
 		return "Превышено время ожидания"
 	}
 	if strings.Contains(error, "dfu") {
-		return "Ошибка режима Д Ф У"
+		return "Ошибка режима восстановления"
 	}
 	if strings.Contains(error, "restore") {
 		return "Ошибка процесса восстановления"
@@ -235,6 +237,28 @@ func (m *Manager) canNotify() bool {
 	return true
 }
 
+func (m *Manager) PlayAlert() {
+	if !m.config.Enabled {
+		return
+	}
+
+	go func() {
+		cmd := exec.Command("afplay", "/System/Library/Sounds/Sosumi.aiff")
+		cmd.Run()
+	}()
+}
+
+func (m *Manager) PlaySuccess() {
+	if !m.config.Enabled {
+		return
+	}
+
+	go func() {
+		cmd := exec.Command("afplay", "/System/Library/Sounds/Glass.aiff")
+		cmd.Run()
+	}()
+}
+
 func (m *Manager) TestVoice() {
 	message := "Тест голоса Мак Провижнер. Так будут звучать уведомления с текущими настройками."
 	m.speak(message)
@@ -260,26 +284,4 @@ func (m *Manager) GetAvailableVoices() ([]string, error) {
 	}
 
 	return voices, nil
-}
-
-func (m *Manager) PlayAlert() {
-	if !m.enabled {
-		return
-	}
-
-	go func() {
-		cmd := exec.Command("afplay", "/System/Library/Sounds/Sosumi.aiff")
-		cmd.Run()
-	}()
-}
-
-func (m *Manager) PlaySuccess() {
-	if !m.enabled {
-		return
-	}
-
-	go func() {
-		cmd := exec.Command("afplay", "/System/Library/Sounds/Glass.aiff")
-		cmd.Run()
-	}()
 }

@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-type Statistics struct {
+type Manager struct {
 	mu               sync.RWMutex
 	devicesStarted   int
 	devicesCompleted int
@@ -15,19 +15,19 @@ type Statistics struct {
 	startTime        time.Time
 }
 
-func NewStatistics() *Statistics {
-	return &Statistics{
+func New() *Manager {
+	return &Manager{
 		startTime: time.Now(),
 	}
 }
 
-func (s *Statistics) DeviceStarted() {
+func (s *Manager) DeviceStarted() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.devicesStarted++
 }
 
-func (s *Statistics) DeviceCompleted(success bool, processTime time.Duration) {
+func (s *Manager) DeviceCompleted(success bool, processTime time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -40,7 +40,7 @@ func (s *Statistics) DeviceCompleted(success bool, processTime time.Duration) {
 	s.totalProcessTime += processTime
 }
 
-func (s *Statistics) GetSummary() string {
+func (s *Manager) Summary() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -51,12 +51,23 @@ func (s *Statistics) GetSummary() string {
 		avgProcessTime = s.totalProcessTime / time.Duration(s.devicesCompleted+s.devicesFailed)
 	}
 
-	return fmt.Sprintf("Uptime: %v, Started: %d, Completed: %d, Failed: %d, Avg Process Time: %v",
+	return fmt.Sprintf("Время работы: %v, Начато: %d, Завершено: %d, Ошибок: %d, Среднее время: %v",
 		uptime.Round(time.Second), s.devicesStarted, s.devicesCompleted, s.devicesFailed, avgProcessTime.Round(time.Second))
 }
 
-func (s *Statistics) GetStats() (int, int, int, time.Duration) {
+func (s *Manager) GetStats() (int, int, int, time.Duration) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.devicesStarted, s.devicesCompleted, s.devicesFailed, time.Since(s.startTime)
+}
+
+func (s *Manager) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.devicesStarted = 0
+	s.devicesCompleted = 0
+	s.devicesFailed = 0
+	s.totalProcessTime = 0
+	s.startTime = time.Now()
 }

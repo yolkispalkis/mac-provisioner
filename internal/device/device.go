@@ -14,36 +14,34 @@ type Device struct {
 	USBLocation  string `json:"usb_location,omitempty"`
 }
 
-/* ====================== ЛОГИКА СОСТОЯНИЙ ====================== */
+/* ============================================================
+   НУЖНО ЛИ ПРОШИВАТЬ?
+   ------------------------------------------------------------
+   Новая логика: прошивать ВСЕХ, кроме тех, кто УЖЕ в DFU-процессе
+   и у кого явно проставлен "IsProvisioned".
+   ============================================================ */
 
 func (d *Device) NeedsProvisioning() bool {
+	// 1. Если уже DFU  → да, естественно, нужна прошивка
 	if d.IsDFU {
 		return true
 	}
 
-	state := strings.ToLower(d.State)
-
-	if state == "unknown" || state == "" || state == "n/a" {
-		return true
-	}
-	if !(state == "paired" || state == "available") {
-		return true
-	}
-	if strings.Contains(state, "recovery") ||
-		strings.Contains(state, "restore") ||
-		strings.Contains(state, "dfu") {
-		return true
+	// 2. Состояние «paired | available» считаем ГОДНЫМ
+	state := strings.ToLower(strings.TrimSpace(d.State))
+	if state == "paired" || state == "available" {
+		return false // Mac считается готовым, перепрошивка не нужна
 	}
 
-	return false
+	// 3. Любое другое состояние → прошиваем
+	return true
 }
 
 func (d *Device) IsProvisioned() bool {
 	if d.IsDFU {
 		return false
 	}
-
-	state := strings.ToLower(d.State)
+	state := strings.ToLower(strings.TrimSpace(d.State))
 	return state == "paired" || state == "available"
 }
 
@@ -66,64 +64,58 @@ func (d *Device) IsValidSerial() bool {
 	return true
 }
 
-/* ====================== «ЧИТАЕМОЕ» ИМЯ ====================== */
+/* ============================================================
+   ДРУЖЕСКОЕ ИМЯ
+   ============================================================ */
 
-// Получает читаемое имя устройства для голосовых уведомлений
 func (d *Device) GetFriendlyName() string {
-	modelName := d.GetReadableModel()
-
+	model := d.GetReadableModel()
 	if port := d.extractPortNumber(); port != "" {
-		return fmt.Sprintf("%s на порту %s", modelName, port)
+		return fmt.Sprintf("%s на порту %s", model, port)
 	}
-	return modelName
+	return model
 }
 
-// Преобразует техническое название модели в читаемое
 func (d *Device) GetReadableModel() string {
-	model := strings.ToLower(d.Model)
-
+	m := strings.ToLower(d.Model)
 	switch {
-	case strings.Contains(model, "macbookair"):
+	case strings.Contains(m, "macbookair"):
 		return "МакБук Эйр"
-	case strings.Contains(model, "macbookpro"):
+	case strings.Contains(m, "macbookpro"):
 		return "МакБук Про"
-	case strings.Contains(model, "macbook"):
+	case strings.Contains(m, "macbook"):
 		return "МакБук"
-	case strings.Contains(model, "imac"):
+	case strings.Contains(m, "imac"):
 		return "АйМак"
-	case strings.Contains(model, "macmini"):
+	case strings.Contains(m, "macmini"):
 		return "Мак Мини"
-	case strings.Contains(model, "macstudio"):
+	case strings.Contains(m, "macstudio"):
 		return "Мак Студио"
-	case strings.Contains(model, "macpro"):
+	case strings.Contains(m, "macpro"):
 		return "Мак Про"
 	default:
 		return d.Model
 	}
 }
 
-// Извлекает номер порта из USB-location. Если не получилось — возвращает ""
 func (d *Device) extractPortNumber() string {
 	if d.USBLocation == "" {
 		return ""
 	}
+	loc := strings.ToLower(d.USBLocation)
+	loc = strings.TrimPrefix(loc, "location:")
+	loc = strings.TrimPrefix(loc, "0x")
+	loc = strings.TrimSpace(loc)
 
-	location := strings.ToLower(d.USBLocation)
-	location = strings.TrimPrefix(location, "location:")
-	location = strings.TrimPrefix(location, "0x")
-	location = strings.TrimSpace(location)
-
-	if len(location) >= 8 {
-		// Последний символ
-		portNum := location[len(location)-1:]
-		if portNum >= "1" && portNum <= "9" {
-			return portNum
+	if len(loc) >= 8 {
+		last := loc[len(loc)-1:]
+		if last >= "1" && last <= "9" {
+			return last
 		}
-		// Предпоследний символ
-		if len(location) >= 2 {
-			portNum = location[len(location)-2 : len(location)-1]
-			if portNum >= "1" && portNum <= "9" {
-				return portNum
+		if len(loc) >= 2 {
+			prev := loc[len(loc)-2 : len(loc)-1]
+			if prev >= "1" && prev <= "9" {
+				return prev
 			}
 		}
 	}

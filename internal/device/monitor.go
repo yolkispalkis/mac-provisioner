@@ -14,10 +14,11 @@ import (
 	"mac-provisioner/internal/config"
 )
 
-/* ============================================================
-   СОБЫТИЯ
-   ============================================================ */
-
+/*
+----------------------------------------------------------------------
+|  СОБЫТИЯ
+----------------------------------------------------------------------
+*/
 const (
 	EventConnected    = "connected"
 	EventDisconnected = "disconnected"
@@ -29,10 +30,11 @@ type Event struct {
 	Device *Device `json:"device"`
 }
 
-/* ============================================================
-   MONITOR
-   ============================================================ */
-
+/*
+----------------------------------------------------------------------
+|  MONITOR STRUCT
+----------------------------------------------------------------------
+*/
 type Monitor struct {
 	config       config.MonitoringConfig
 	eventChan    chan Event
@@ -53,29 +55,28 @@ func NewMonitor(cfg config.MonitoringConfig) *Monitor {
 	}
 }
 
-/* -------------------- START / STOP -------------------- */
-
+/*
+----------------------------------------------------------------------
+|  START / STOP
+----------------------------------------------------------------------
+*/
 func (m *Monitor) Start(ctx context.Context) error {
 	if m.running {
 		return fmt.Errorf("монитор уже запущен")
 	}
-
 	m.running = true
 	m.ctx, m.cancel = context.WithCancel(ctx)
 
 	log.Println("🔍 Запуск мониторинга USB устройств...")
 
-	// Проверяем наличие cfgutil (и при необходимости добавляем в PATH)
 	if err := m.checkCfgutilAvailable(); err != nil {
-		log.Printf("⚠️ Предупреждение: %v", err)
+		log.Printf("⚠️ %v", err)
 	}
 
-	// Первое сканирование
 	if err := m.initialScan(); err != nil {
-		log.Printf("⚠️ Предупреждение: ошибка начального сканирования: %v", err)
+		log.Printf("⚠️ начальное сканирование: %v", err)
 	}
 
-	// Фоновые циклы
 	go m.monitorLoop()
 	go m.cleanupLoop()
 
@@ -97,115 +98,116 @@ func (m *Monitor) Stop() {
 
 func (m *Monitor) Events() <-chan Event { return m.eventChan }
 
-/* -------------------- cfgutil helper -------------------- */
-
+/*
+----------------------------------------------------------------------
+|  cfgutil PATH helper
+----------------------------------------------------------------------
+*/
 func (m *Monitor) checkCfgutilAvailable() error {
-	// Есть ли в PATH?
 	if _, err := exec.LookPath("cfgutil"); err == nil {
 		log.Println("✅ cfgutil доступен (найден в $PATH)")
 		return nil
 	}
-
-	// Штатный путь от Apple Configurator
-	defPath := "/Applications/Apple Configurator.app/Contents/MacOS/cfgutil"
-	if _, err := os.Stat(defPath); err == nil {
-		dir := filepath.Dir(defPath)
+	def := "/Applications/Apple Configurator.app/Contents/MacOS/cfgutil"
+	if _, err := os.Stat(def); err == nil {
+		dir := filepath.Dir(def)
 		if !strings.Contains(os.Getenv("PATH"), dir) {
 			_ = os.Setenv("PATH", os.Getenv("PATH")+":"+dir)
 		}
-		log.Printf("ℹ️  cfgutil найден по пути %s — директория добавлена в $PATH", defPath)
+		log.Printf("ℹ️  cfgutil найден по пути %s — директория добавлена в $PATH", def)
 		return nil
 	}
-
 	return fmt.Errorf("cfgutil недоступен. Установите Apple Configurator 2")
 }
 
-/* ============================================================
-   ЦИКЛЫ
-   ============================================================ */
-
+/*
+----------------------------------------------------------------------
+|  MAIN LOOPS
+----------------------------------------------------------------------
+*/
 func (m *Monitor) monitorLoop() {
-	ticker := time.NewTicker(m.config.CheckInterval)
-	defer ticker.Stop()
-
-	log.Printf("🔄 Запуск цикла мониторинга с интервалом %v", m.config.CheckInterval)
+	t := time.NewTicker(m.config.CheckInterval)
+	defer t.Stop()
+	log.Printf("🔄 Цикл мониторинга %v", m.config.CheckInterval)
 
 	for {
 		select {
 		case <-m.ctx.Done():
 			log.Println("🛑 Цикл мониторинга остановлен")
 			return
-		case <-ticker.C:
+		case <-t.C:
 			m.checkDevices()
 		}
 	}
 }
 
 func (m *Monitor) cleanupLoop() {
-	ticker := time.NewTicker(m.config.CleanupInterval)
-	defer ticker.Stop()
+	t := time.NewTicker(m.config.CleanupInterval)
+	defer t.Stop()
 
 	for {
 		select {
 		case <-m.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-t.C:
 			m.cleanup()
 		}
 	}
 }
 
-/* ============================================================
-   ОБРАБОТКА УСТРОЙСТВ
-   ============================================================ */
-
+/*
+----------------------------------------------------------------------
+|  CHECK DEVICES
+----------------------------------------------------------------------
+*/
 func (m *Monitor) checkDevices() {
-	currentDevices := m.getCurrentDevices()
+	current := m.getCurrentDevices()
 
 	m.devicesMutex.Lock()
 	defer m.devicesMutex.Unlock()
 
-	/* --- формируем map текущих --- */
-	currentMap := make(map[string]*Device)
-	for _, dev := range currentDevices {
-		if dev.IsValidSerial() {
-			currentMap[dev.SerialNumber] = dev
+	currMap := make(map[string]*Device, len(current))
+	for _, d := range current {
+		if d.IsValidSerial() {
+			currMap[d.SerialNumber] = d
 		}
 	}
 
-	/* --- первое сканирование --- */
 	if m.firstScan {
-		log.Println("🔍 Первое сканирование — генерируем события для всех обнаруженных устройств")
-		for sn, dev := range currentMap {
-			m.devices[sn] = dev
-			m.sendEvent(Event{Type: EventConnected, Device: dev})
+		log.Println("🔍 Первое сканирование — генерируем события")
+		for sn, d := range currMap {
+			m.devices[sn] = d
+			m.sendEvent(Event{Type: EventConnected, Device: d})
 		}
 		m.firstScan = false
 		return
 	}
 
-	/* --- новые устройства --- */
-	for sn, dev := range currentMap {
+	/* новые / изменённые */
+	for sn, d := range currMap {
 		if old, ok := m.devices[sn]; !ok {
-			m.devices[sn] = dev
-			m.sendEvent(Event{Type: EventConnected, Device: dev})
-		} else if old.State != dev.State || old.IsDFU != dev.IsDFU {
-			m.devices[sn] = dev
-			m.sendEvent(Event{Type: EventStateChanged, Device: dev})
+			m.devices[sn] = d
+			m.sendEvent(Event{Type: EventConnected, Device: d})
+		} else if old.State != d.State || old.IsDFU != d.IsDFU {
+			m.devices[sn] = d
+			m.sendEvent(Event{Type: EventStateChanged, Device: d})
 		}
 	}
 
-	/* --- отключённые устройства --- */
-	for sn, dev := range m.devices {
-		if _, ok := currentMap[sn]; !ok {
+	/* отключённые */
+	for sn, d := range m.devices {
+		if _, ok := currMap[sn]; !ok {
 			delete(m.devices, sn)
-			m.sendEvent(Event{Type: EventDisconnected, Device: dev})
+			m.sendEvent(Event{Type: EventDisconnected, Device: d})
 		}
 	}
 }
 
-/* -------------------- Получаем список устройств -------------------- */
-
+/*
+----------------------------------------------------------------------
+|  COLLECT DEVICES
+----------------------------------------------------------------------
+*/
 func (m *Monitor) getCurrentDevices() []*Device {
 	var res []*Device
 	res = append(res, m.getCfgutilDevices()...)
@@ -217,8 +219,7 @@ func (m *Monitor) cfgutilCmd(args ...string) *exec.Cmd {
 	return exec.Command("cfgutil", args...)
 }
 
-/* --- обычные устройства --- */
-
+/*------------------- обычные устройства -------------------*/
 func (m *Monitor) getCfgutilDevices() []*Device {
 	out, err := m.cfgutilCmd("list").Output()
 	if err != nil {
@@ -228,60 +229,72 @@ func (m *Monitor) getCfgutilDevices() []*Device {
 	return m.parseCfgutilOutput(string(out))
 }
 
-/* --- DFU устройства (строки с Type:/ECID:) --- */
-
+/*------------------- DFU / Recovery / Restore -------------*/
 func (m *Monitor) getDFUDevices() []*Device {
 	out, err := m.cfgutilCmd("list").Output()
 	if err != nil {
 		return nil
 	}
-	return m.parseDFUOutput(string(out))
+	return m.parseDFULines(string(out))
 }
 
-/* -------------------- парсинг вывода cfgutil -------------------- */
-
+/*
+----------------------------------------------------------------------
+|  PARSERS
+----------------------------------------------------------------------
+*/
 func (m *Monitor) parseCfgutilOutput(out string) []*Device {
-	var devs []*Device
+	var list []*Device
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" ||
-			strings.HasPrefix(line, "ECID") ||
 			strings.HasPrefix(line, "Name") ||
+			strings.HasPrefix(line, "ECID") ||
 			(strings.HasPrefix(line, "Type:") && strings.Contains(line, "ECID:")) {
 			continue
 		}
 		if d := m.parseDeviceLine(line); d != nil && !d.IsDFU {
-			devs = append(devs, d)
+			list = append(list, d)
 		}
 	}
-	return devs
+	return list
 }
 
-func (m *Monitor) parseDFUOutput(out string) []*Device {
-	var devs []*Device
+func (m *Monitor) parseDFULines(out string) []*Device {
+	var list []*Device
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.Contains(line, "Type:") && strings.Contains(line, "ECID:") {
-			if d := m.parseDFULine(line); d != nil {
-				devs = append(devs, d)
-			}
+		if line == "" {
+			continue
+		}
+
+		lc := strings.ToLower(line)
+		if !(strings.Contains(lc, "dfu") || strings.Contains(lc, "recovery") ||
+			strings.Contains(lc, "restore")) {
+			continue // строка про «живой» Mac, пропускаем
+		}
+		if !strings.Contains(line, "Type:") || !strings.Contains(line, "ECID:") {
+			continue // нет ключевых полей
+		}
+		if d := m.parseDFULine(line); d != nil {
+			list = append(list, d)
 		}
 	}
-	return devs
+	return list
 }
 
-/* --- парсер строк (оба формата) --- */
-
+/*--- device line (оба формата) ---*/
 func (m *Monitor) parseDeviceLine(line string) *Device {
 	d := &Device{}
 
-	/* новый формат (с табами) */
+	/*----- новый формат (табами) -----*/
 	if strings.Contains(line, "\t") {
 		p := strings.Split(line, "\t")
 		if len(p) >= 3 {
 			d.SerialNumber = strings.TrimSpace(p[0])
 			d.Model = strings.TrimSpace(p[1])
 			d.State = strings.TrimSpace(p[2])
+
 			if len(p) > 3 {
 				for _, x := range p[3:] {
 					if strings.Contains(strings.ToLower(x), "location") {
@@ -290,45 +303,53 @@ func (m *Monitor) parseDeviceLine(line string) *Device {
 					}
 				}
 			}
-			s := strings.ToLower(d.State)
-			d.IsDFU = strings.Contains(s, "dfu") || strings.Contains(s, "recovery")
-			return d
 		}
-	}
-
-	/* старый формат */
-	fields := strings.Fields(line)
-	if len(fields) < 1 {
-		return nil
-	}
-	d.SerialNumber = fields[0]
-
-	if start := strings.Index(line, "("); start != -1 {
-		if end := strings.Index(line[start:], ")"); end != -1 {
-			d.Model = line[start+1 : start+end]
-		}
-	}
-
-	if idx := strings.Index(line, "Location:"); idx != -1 {
-		locFields := strings.Fields(line[idx:])
-		if len(locFields) >= 2 {
-			d.USBLocation = locFields[1]
-		}
-	}
-
-	if dash := strings.LastIndex(line, " - "); dash != -1 {
-		d.State = strings.TrimSpace(line[dash+3:])
 	} else {
-		d.State = "Unknown"
+		/*----- старый формат -----*/
+		fields := strings.Fields(line)
+		if len(fields) < 1 {
+			return nil
+		}
+		d.SerialNumber = fields[0]
+
+		if s := strings.Index(line, "("); s != -1 {
+			if e := strings.Index(line[s:], ")"); e != -1 {
+				d.Model = line[s+1 : s+e]
+			}
+		}
+
+		if idx := strings.Index(line, "Location:"); idx != -1 {
+			parts := strings.Fields(line[idx:])
+			if len(parts) >= 2 {
+				d.USBLocation = parts[1]
+			}
+		}
+
+		if dash := strings.LastIndex(line, " - "); dash != -1 {
+			d.State = strings.TrimSpace(line[dash+3:])
+		} else {
+			d.State = "Unknown"
+		}
 	}
-	s := strings.ToLower(d.State)
-	d.IsDFU = strings.Contains(s, "dfu") || strings.Contains(s, "recovery")
+
+	// определяем DFU-подобное состояние
+	stateLower := strings.ToLower(d.State)
+	d.IsDFU = strings.Contains(stateLower, "dfu") ||
+		strings.Contains(stateLower, "recovery") ||
+		strings.Contains(stateLower, "restore")
+
 	return d
 }
 
+/*--- DFU line ---*/
 func (m *Monitor) parseDFULine(line string) *Device {
-	d := &Device{IsDFU: true, State: "DFU"}
+	lc := strings.ToLower(line)
+	if !(strings.Contains(lc, "dfu") || strings.Contains(lc, "recovery") ||
+		strings.Contains(lc, "restore")) {
+		return nil
+	}
 
+	d := &Device{IsDFU: true, State: "DFU"}
 	parts := strings.Fields(line)
 	for i, p := range parts {
 		switch p {
@@ -350,33 +371,39 @@ func (m *Monitor) parseDFULine(line string) *Device {
 	return d
 }
 
-/* -------------------- утилиты -------------------- */
-
+/*
+----------------------------------------------------------------------
+|  HELPERS
+----------------------------------------------------------------------
+*/
 func (m *Monitor) removeDuplicates(list []*Device) []*Device {
 	seen := map[string]bool{}
-	var res []*Device
+	var out []*Device
 	for _, d := range list {
 		if d.SerialNumber != "" && !seen[d.SerialNumber] {
 			seen[d.SerialNumber] = true
-			res = append(res, d)
+			out = append(out, d)
 		}
 	}
-	return res
+	return out
 }
 
 func (m *Monitor) sendEvent(e Event) {
 	select {
 	case m.eventChan <- e:
-		log.Printf("📤 Отправлено событие: %s для устройства %s", e.Type, e.Device.SerialNumber)
+		log.Printf("📤 Событие: %s -> %s", e.Type, e.Device.SerialNumber)
 	default:
-		log.Println("⚠️ Буфер событий переполнен, событие пропущено")
+		log.Println("⚠️ Буфер событий переполнен — событие пропущено")
 	}
 }
 
-/* -------------------- сервисные -------------------- */
-
+/*
+----------------------------------------------------------------------
+|  SERVICE ROUTINES
+----------------------------------------------------------------------
+*/
 func (m *Monitor) initialScan() error {
-	log.Println("🔍 Выполнение начального сканирования…")
+	log.Println("🔍 Начальное сканирование…")
 	devs := m.getCurrentDevices()
 
 	m.devicesMutex.Lock()
@@ -384,11 +411,10 @@ func (m *Monitor) initialScan() error {
 
 	for _, d := range devs {
 		if d.IsValidSerial() {
-			log.Printf("📱 Найдено при начальном сканировании: %s (%s) - %s",
-				d.SerialNumber, d.Model, d.State)
+			log.Printf("📱 Найдено при запуске: %s (%s) - %s", d.SerialNumber, d.Model, d.State)
 		}
 	}
-	log.Printf("✅ Начальное сканирование завершено: найдено %d устройств", len(devs))
+	log.Printf("✅ Начальное сканирование: %d устройств", len(devs))
 	return nil
 }
 
@@ -397,8 +423,6 @@ func (m *Monitor) cleanup() {
 	defer m.devicesMutex.Unlock()
 	log.Printf("🧹 Очистка: отслеживается %d устройств", len(m.devices))
 }
-
-/* -------------------- API для отладки -------------------- */
 
 func (m *Monitor) GetConnectedDevices() []*Device {
 	m.devicesMutex.RLock()

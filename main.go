@@ -249,6 +249,8 @@ func processDevice(dev *device.Device, dfuMgr *dfu.Manager, configMgr *configura
 	startTime := time.Now()
 	stats.DeviceStarted()
 
+	var targetIdentifier string = dev.SerialNumber
+
 	if !dev.IsDFU {
 		notifyMgr.EnteringDFUMode(dev.SerialNumber)
 		log.Printf("📱 Attempting to enter DFU mode for device %s", dev.SerialNumber)
@@ -256,7 +258,6 @@ func processDevice(dev *device.Device, dfuMgr *dfu.Manager, configMgr *configura
 		if err := dfuMgr.EnterDFUMode(dev.SerialNumber); err != nil {
 			log.Printf("❌ Failed to enter DFU mode for %s: %v", dev.SerialNumber, err)
 
-			// Если это инструкции для ручного входа, показываем их пользователю
 			if strings.Contains(err.Error(), "manual DFU mode entry") {
 				notifyMgr.Error("Требуется ручной переход в режим Д Ф У. Проверьте консоль для получения инструкций.")
 				log.Printf("\n" + strings.Repeat("=", 80))
@@ -265,15 +266,35 @@ func processDevice(dev *device.Device, dfuMgr *dfu.Manager, configMgr *configura
 				log.Printf("%v", err)
 				log.Printf(strings.Repeat("=", 80) + "\n")
 
-				// Ждем некоторое время, чтобы пользователь мог выполнить инструкции
 				log.Printf("⏳ Waiting 60 seconds for manual DFU mode entry...")
-				time.Sleep(60 * time.Second)
 
-				// Проверяем, вошло ли устройство в DFU режим
-				if !dfuMgr.IsInDFUMode(dev.SerialNumber) {
+				// Ждем и периодически проверяем DFU устройства
+				for i := 0; i < 30; i++ { // 60 секунд с проверкой каждые 2 секунды
+					time.Sleep(2 * time.Second)
+
+					// Проверяем, есть ли DFU устройства
+					dfuDevices := dfuMgr.GetDFUDevices()
+					if len(dfuDevices) > 0 {
+						log.Printf("✅ Found DFU device(s): %+v", dfuDevices)
+						targetIdentifier = dfuDevices[0].ECID // Используем ECID первого найденного DFU устройства
+						log.Printf("🔄 Using ECID for restore: %s", targetIdentifier)
+						break
+					}
+
+					if i%5 == 0 {
+						log.Printf("⏳ Still waiting for DFU mode... (%d/60 seconds)", i*2)
+					}
+				}
+
+				// Финальная проверка
+				ecid := dfuMgr.GetFirstDFUECID()
+				if ecid == "" {
 					notifyMgr.RestoreFailed(dev.SerialNumber, "Устройство не в режиме Д Ф У")
 					stats.DeviceCompleted(false, time.Since(startTime))
 					return
+				} else {
+					targetIdentifier = ecid
+					log.Printf("🔄 Using ECID for restore: %s", targetIdentifier)
 				}
 			} else {
 				notifyMgr.RestoreFailed(dev.SerialNumber, "Не удалось войти в режим Д Ф У")
@@ -284,14 +305,28 @@ func processDevice(dev *device.Device, dfuMgr *dfu.Manager, configMgr *configura
 		}
 
 		notifyMgr.DFUModeEntered(dev.SerialNumber)
-		time.Sleep(15 * time.Second) // Даем время для стабилизации DFU режима
+		time.Sleep(5 * time.Second) // Даем время для стабилизации DFU режима
+
+		// После входа в DFU режим получаем ECID
+		ecid := dfuMgr.GetFirstDFUECID()
+		if ecid != "" {
+			targetIdentifier = ecid
+			log.Printf("🔄 Device entered DFU mode, using ECID: %s", targetIdentifier)
+		}
+	} else {
+		// Устройство уже в DFU режиме, получаем его ECID
+		ecid := dfuMgr.GetFirstDFUECID()
+		if ecid != "" {
+			targetIdentifier = ecid
+			log.Printf("🔄 Device already in DFU mode, using ECID: %s", targetIdentifier)
+		}
 	}
 
 	notifyMgr.StartingRestore(dev.SerialNumber)
-	log.Printf("🔧 Starting restore for device %s", dev.SerialNumber)
+	log.Printf("🔧 Starting restore for device %s (using identifier: %s)", dev.SerialNumber, targetIdentifier)
 
-	if err := configMgr.RestoreDevice(dev.SerialNumber, notifyMgr); err != nil {
-		log.Printf("❌ Failed to restore device %s: %v", dev.SerialNumber, err)
+	if err := configMgr.RestoreDevice(targetIdentifier, notifyMgr); err != nil {
+		log.Printf("❌ Failed to restore device %s: %v", targetIdentifier, err)
 		notifyMgr.RestoreFailed(dev.SerialNumber, err.Error())
 		notifyMgr.PlayAlert()
 		stats.DeviceCompleted(false, time.Since(startTime))

@@ -15,22 +15,34 @@ func NewManager() *Manager {
 	return &Manager{}
 }
 
-func (m *Manager) RestoreDevice(serialNumber string, notifyMgr *notification.Manager) error {
-	fmt.Printf("Starting restore for device %s...\n", serialNumber)
+func (m *Manager) RestoreDevice(identifier string, notifyMgr *notification.Manager) error {
+	fmt.Printf("Starting restore for device %s...\n", identifier)
 
-	cmd := exec.Command("cfgutil", "restore",
-		"-s", serialNumber,
-		"--erase")
+	// Определяем, это ECID или серийный номер
+	var cmd *exec.Cmd
+	if strings.HasPrefix(identifier, "0x") {
+		// Это ECID, используем его для восстановления
+		fmt.Printf("Using ECID for restore: %s\n", identifier)
+		cmd = exec.Command("cfgutil", "restore",
+			"-e", identifier,
+			"--erase")
+	} else {
+		// Это серийный номер
+		fmt.Printf("Using serial number for restore: %s\n", identifier)
+		cmd = exec.Command("cfgutil", "restore",
+			"-s", identifier,
+			"--erase")
+	}
 
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("cfgutil restore failed: %w", err)
 	}
 
-	return m.waitForRestoreCompletion(serialNumber, notifyMgr)
+	return m.waitForRestoreCompletion(identifier, notifyMgr)
 }
 
-func (m *Manager) waitForRestoreCompletion(serialNumber string, notifyMgr *notification.Manager) error {
-	fmt.Printf("Waiting for restore completion for device %s...\n", serialNumber)
+func (m *Manager) waitForRestoreCompletion(identifier string, notifyMgr *notification.Manager) error {
+	fmt.Printf("Waiting for restore completion for device %s...\n", identifier)
 
 	maxWaitTime := 30 * time.Minute
 	checkInterval := 30 * time.Second
@@ -43,29 +55,29 @@ func (m *Manager) waitForRestoreCompletion(serialNumber string, notifyMgr *notif
 	for {
 		select {
 		case <-timeout:
-			return fmt.Errorf("restore timeout for device %s", serialNumber)
+			return fmt.Errorf("restore timeout for device %s", identifier)
 		case <-ticker.C:
-			status, err := m.getDeviceStatus(serialNumber)
+			status, err := m.getDeviceStatus(identifier)
 			if err != nil {
 				continue
 			}
 
-			fmt.Printf("Device %s status: %s\n", serialNumber, status)
+			fmt.Printf("Device %s status: %s\n", identifier, status)
 
 			if status != lastStatus && status != "Device not found" {
-				notifyMgr.RestoreProgress(serialNumber, m.getReadableStatus(status))
+				notifyMgr.RestoreProgress(identifier, m.getReadableStatus(status))
 				lastStatus = status
 			}
 
 			if m.isRestoreComplete(status) {
-				fmt.Printf("Restore completed for device %s\n", serialNumber)
+				fmt.Printf("Restore completed for device %s\n", identifier)
 				return nil
 			}
 		}
 	}
 }
 
-func (m *Manager) getDeviceStatus(serialNumber string) (string, error) {
+func (m *Manager) getDeviceStatus(identifier string) (string, error) {
 	cmd := exec.Command("cfgutil", "list")
 	output, err := cmd.Output()
 	if err != nil {
@@ -74,7 +86,8 @@ func (m *Manager) getDeviceStatus(serialNumber string) (string, error) {
 
 	lines := strings.Split(string(output), "\n")
 	for _, line := range lines {
-		if strings.Contains(line, serialNumber) {
+		// Ищем по ECID или серийному номеру
+		if strings.Contains(line, identifier) {
 			return line, nil
 		}
 	}

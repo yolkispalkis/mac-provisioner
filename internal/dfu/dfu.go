@@ -29,24 +29,21 @@ func (m *Manager) hasMacvdmtool() bool {
 }
 
 func (m *Manager) enterDFUWithMacvdmtool(serialNumber string) error {
-	// macvdmtool работает с подключенным устройством через USB
 	fmt.Printf("Using macvdmtool to enter DFU mode for device %s\n", serialNumber)
 
 	cmd := exec.Command("macvdmtool", "dfu")
-
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to execute macvdmtool dfu: %w", err)
 	}
 
 	fmt.Printf("macvdmtool dfu command executed successfully\n")
-	time.Sleep(15 * time.Second) // Даем больше времени для перехода в DFU
+	time.Sleep(15 * time.Second)
 	return m.waitForDFUMode(serialNumber)
 }
 
 func (m *Manager) enterDFUWithCfgutil(serialNumber string) error {
 	fmt.Printf("macvdmtool not available, using cfgutil for device %s\n", serialNumber)
 
-	// Сначала пробуем перезагрузить устройство
 	cmd := exec.Command("cfgutil", "reboot", "-s", serialNumber)
 	if err := cmd.Run(); err != nil {
 		fmt.Printf("Failed to reboot device with cfgutil: %v\n", err)
@@ -55,12 +52,10 @@ func (m *Manager) enterDFUWithCfgutil(serialNumber string) error {
 		time.Sleep(5 * time.Second)
 	}
 
-	// Возвращаем инструкции для ручного входа в DFU
 	return m.enterDFUManually(serialNumber)
 }
 
 func (m *Manager) enterDFUManually(serialNumber string) error {
-	// Определяем тип Mac по серийному номеру или модели
 	deviceInfo := m.getDeviceInfo(serialNumber)
 
 	if strings.Contains(deviceInfo, "Apple Silicon") || strings.Contains(deviceInfo, "M1") || strings.Contains(deviceInfo, "M2") || strings.Contains(deviceInfo, "M3") {
@@ -92,7 +87,6 @@ func (m *Manager) enterDFUManually(serialNumber string) error {
 }
 
 func (m *Manager) getDeviceInfo(serialNumber string) string {
-	// Пробуем получить информацию об устройстве через cfgutil
 	cmd := exec.Command("cfgutil", "list")
 	output, err := cmd.Output()
 	if err != nil {
@@ -110,7 +104,7 @@ func (m *Manager) getDeviceInfo(serialNumber string) string {
 }
 
 func (m *Manager) waitForDFUMode(serialNumber string) error {
-	maxAttempts := 60 // Увеличиваем время ожидания до 2 минут
+	maxAttempts := 60
 	fmt.Printf("Waiting for device %s to enter DFU mode...\n", serialNumber)
 
 	for i := 0; i < maxAttempts; i++ {
@@ -119,7 +113,7 @@ func (m *Manager) waitForDFUMode(serialNumber string) error {
 			return nil
 		}
 
-		if i%10 == 0 { // Выводим сообщение каждые 20 секунд
+		if i%10 == 0 {
 			fmt.Printf("⏳ Attempt %d/%d: Waiting for device to enter DFU mode...\n", i+1, maxAttempts)
 		}
 
@@ -130,79 +124,75 @@ func (m *Manager) waitForDFUMode(serialNumber string) error {
 }
 
 func (m *Manager) isInDFUMode(serialNumber string) bool {
-	// Проверяем через cfgutil
-	cmd := exec.Command("cfgutil", "list")
-	output, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-
-	outputStr := string(output)
-	lines := strings.Split(outputStr, "\n")
-
-	for _, line := range lines {
-		if strings.Contains(line, serialNumber) {
-			state := strings.ToLower(line)
-			isDFU := strings.Contains(state, "dfu") || strings.Contains(state, "recovery")
-			if isDFU {
-				fmt.Printf("🔍 Device %s found in DFU/Recovery mode: %s\n", serialNumber, strings.TrimSpace(line))
-			}
-			return isDFU
-		}
-	}
-
-	// Дополнительно проверяем через system_profiler для DFU устройств
-	return m.checkDFUInSystemProfiler(serialNumber)
-}
-
-func (m *Manager) checkDFUInSystemProfiler(serialNumber string) bool {
-	cmd := exec.Command("system_profiler", "SPUSBDataType")
-	output, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-
-	outputStr := strings.ToLower(string(output))
-	lines := strings.Split(string(output), "\n")
-
-	// Ищем DFU устройства
-	var currentDevice string
-	var foundSerial bool
-
-	for _, line := range lines {
-		lineLower := strings.ToLower(line)
-
-		// Ищем устройства в DFU режиме
-		if strings.Contains(lineLower, "dfu") || strings.Contains(lineLower, "recovery") {
-			currentDevice = strings.TrimSpace(line)
-			fmt.Printf("🔍 Found DFU device in system_profiler: %s\n", currentDevice)
-		}
-
-		// Ищем серийный номер для текущего устройства
-		if currentDevice != "" && strings.Contains(line, "Serial Number:") {
-			parts := strings.Split(line, ":")
-			if len(parts) > 1 {
-				serial := strings.TrimSpace(parts[1])
-				if serial == serialNumber {
-					foundSerial = true
-					fmt.Printf("🔍 Found matching serial number %s for DFU device\n", serialNumber)
-					break
-				}
-			}
-			currentDevice = "" // Сбрасываем, если серийный номер не совпал
-		}
-	}
-
-	// Если нашли конкретное устройство по серийному номеру
-	if foundSerial {
-		return true
-	}
-
-	// Если не нашли конкретное устройство, но есть DFU устройства, возвращаем true
-	// (это может быть полезно, если серийный номер недоступен в DFU режиме)
-	return strings.Contains(outputStr, "dfu") || strings.Contains(outputStr, "recovery")
+	// Проверяем, есть ли DFU устройства
+	dfuDevices := m.GetDFUDevices()
+	return len(dfuDevices) > 0
 }
 
 func (m *Manager) IsInDFUMode(serialNumber string) bool {
 	return m.isInDFUMode(serialNumber)
+}
+
+// Получаем список DFU устройств с их ECID
+func (m *Manager) GetDFUDevices() []DFUDevice {
+	var dfuDevices []DFUDevice
+
+	cmd := exec.Command("cfgutil", "list")
+	output, err := cmd.Output()
+	if err != nil {
+		return dfuDevices
+	}
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "Name") {
+			continue
+		}
+
+		// Парсим строку типа: "Type: MacBookAir10,1	ECID: 0xC599E36BB001E	UDID: N/A Location: 0x100000 Name: N/A"
+		if strings.Contains(line, "Type:") && strings.Contains(line, "ECID:") {
+			device := m.parseDFULine(line)
+			if device.ECID != "" {
+				dfuDevices = append(dfuDevices, device)
+				fmt.Printf("🔍 Found DFU device: Type=%s, ECID=%s\n", device.Type, device.ECID)
+			}
+		}
+	}
+
+	return dfuDevices
+}
+
+type DFUDevice struct {
+	Type string
+	ECID string
+	UDID string
+}
+
+func (m *Manager) parseDFULine(line string) DFUDevice {
+	device := DFUDevice{}
+
+	// Разбираем строку по табуляции или пробелам
+	parts := strings.Fields(line)
+
+	for i, part := range parts {
+		if part == "Type:" && i+1 < len(parts) {
+			device.Type = parts[i+1]
+		} else if part == "ECID:" && i+1 < len(parts) {
+			device.ECID = parts[i+1]
+		} else if part == "UDID:" && i+1 < len(parts) {
+			device.UDID = parts[i+1]
+		}
+	}
+
+	return device
+}
+
+// Получаем первый доступный ECID для восстановления
+func (m *Manager) GetFirstDFUECID() string {
+	devices := m.GetDFUDevices()
+	if len(devices) > 0 {
+		return devices[0].ECID
+	}
+	return ""
 }

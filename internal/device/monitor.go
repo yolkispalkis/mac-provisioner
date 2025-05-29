@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -519,19 +520,42 @@ type cfgutilList struct {
 	} `json:"Output"`
 }
 
+func normalizeECIDKey(s string) string {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	s = strings.TrimPrefix(s, "0X")
+
+	// HEX-или-DEC?
+	if strings.IndexFunc(s, func(r rune) bool { return r >= 'A' && r <= 'F' }) != -1 {
+		// уже HEX – убираем ведущие нули
+		s = strings.TrimLeft(s, "0")
+		if s == "" {
+			s = "0"
+		}
+		return s
+	}
+
+	// decimal → hex
+	if dec, err := strconv.ParseUint(s, 10, 64); err == nil {
+		return strings.ToUpper(strings.TrimLeft(strconv.FormatUint(dec, 16), "0"))
+	}
+
+	return s // fallback
+}
+
 func lookupModelWithCfgutil(ctx context.Context, ecid string) (string, error) {
 	out, err := exec.CommandContext(ctx, "cfgutil", "--format", "JSON", "-v", "list").Output()
 	if err != nil {
 		return "", err
 	}
+
 	var data cfgutilList
 	if err := json.Unmarshal(out, &data); err != nil {
 		return "", err
 	}
-	key1 := strings.ToLower(ecid)
-	key2 := "0x" + strings.ToUpper(strings.TrimPrefix(ecid, "0x"))
+
+	want := normalizeECIDKey(ecid)
 	for k, v := range data.Output {
-		if strings.EqualFold(k, key1) || strings.EqualFold(k, key2) {
+		if normalizeECIDKey(k) == want {
 			if v.Name != nil && *v.Name != "" {
 				return *v.Name, nil
 			}

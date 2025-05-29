@@ -1,10 +1,13 @@
 package provisioner
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,11 +20,11 @@ import (
 )
 
 /*
-   ──────────────────────────────────────────────────────────
-   STRUCT
-   ──────────────────────────────────────────────────────────
-*/
+──────────────────────────────────────────────────────────
 
+	STRUCT
+	──────────────────────────────────────────────────────────
+*/
 type Manager struct {
 	dfuManager   *dfu.Manager
 	notifier     *notification.Manager
@@ -40,19 +43,19 @@ func New(dfuMgr *dfu.Manager, notifier *notification.Manager, stats *stats.Manag
 }
 
 /*
-   ──────────────────────────────────────────────────────────
-   PUBLIC  –  ОСНОВНАЯ ОБРАБОТКА
-   ──────────────────────────────────────────────────────────
-*/
+──────────────────────────────────────────────────────────
 
+	PUBLIC
+	──────────────────────────────────────────────────────────
+*/
 func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	uid := dev.UniqueID()
 
-	// ► Не допускаем параллельной обработки одного и того же устройства
+	// блокируем повтор
 	m.processingMu.Lock()
 	if m.processing[uid] {
 		m.processingMu.Unlock()
-		log.Printf("ℹ️ Процесс прошивки для %s уже запущен, пропускаем.", dev.GetFriendlyName())
+		log.Printf("ℹ️ Уже обрабатывается: %s", dev.GetFriendlyName())
 		return
 	}
 	m.processing[uid] = true
@@ -64,74 +67,127 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 		m.processingMu.Unlock()
 	}()
 
-	log.Printf("🚀 Старт прошивки: %s (ECID: %s, USB: %s)",
-		dev.GetFriendlyName(), dev.ECID, dev.USBLocation)
-
+	log.Printf("🚀 Старт прошивки: %s (ECID:%s)", dev.GetFriendlyName(), dev.ECID)
 	start := time.Now()
 	m.stats.DeviceStarted()
 
-	// ── Проверки ──────────────────────────────────────────
-	if !dev.IsDFU {
-		log.Printf("❌ Внутренняя ошибка: %s не в DFU.", dev.GetFriendlyName())
-		m.notifier.RestoreFailed(dev, "устройство не в DFU")
+	if !dev.IsDFU || dev.ECID == "" {
+		errMsg := "устройство не готово к прошивке (нет DFU или ECID)"
+		log.Printf("❌ %s: %s", dev.GetFriendlyName(), errMsg)
+		m.notifier.RestoreFailed(dev, errMsg)
 		m.stats.DeviceCompleted(false, time.Since(start))
 		return
 	}
-	if dev.ECID == "" {
-		log.Printf("❌ DFU устройство %s без ECID – прошивка невозможна.", dev.GetFriendlyName())
-		m.notifier.RestoreFailed(dev, "ECID отсутствует")
-		m.stats.DeviceCompleted(false, time.Since(start))
-		return
-	}
-	targetECID := dev.ECID
 
-	// ── Запуск cfgutil restore ───────────────────────────
-	log.Printf("⚙️ cfgutil restore → %s", targetECID)
-	m.notifier.StartingRestore(dev)
-
-	decimalECID, err := normalizeECIDForCfgutil(targetECID)
+	decECID, err := normalizeECIDForCfgutil(dev.ECID)
 	if err != nil {
-		log.Printf("❌ normalise ECID: %v", err)
 		m.notifier.RestoreFailed(dev, "неверный формат ECID")
 		m.stats.DeviceCompleted(false, time.Since(start))
 		return
 	}
 
+	m.notifier.StartingRestore(dev)
+
+	// ──────────────────────────────────────────────────
+	// cfgutil restore  (онлайн-парсинг вывода)
+	// ──────────────────────────────────────────────────
 	restoreCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(restoreCtx, "cfgutil", "--ecid", decimalECID, "restore")
-	out, execErr := cmd.CombinedOutput()
+	cmd := exec.CommandContext(restoreCtx, "cfgutil", "--ecid", decECID, "restore")
+	stdOut, _ := cmd.StdoutPipe()
+	stdErr, _ := cmd.StderrPipe()
 
-	if execErr != nil {
-		if restoreCtx.Err() == context.DeadlineExceeded {
-			m.notifier.RestoreFailed(dev, "cfgutil restore: таймаут")
-		} else {
-			msg := fmt.Sprintf("cfgutil restore: %v. %s",
-				execErr, trim(out, 120))
-			m.notifier.RestoreFailed(dev, msg)
-		}
-		log.Printf("❌ cfgutil restore error: %v\n%s", execErr, out)
+	if err := cmd.Start(); err != nil {
+		log.Printf("❌ Не удалось запустить cfgutil: %v", err)
+		m.notifier.RestoreFailed(dev, "не удалось запустить cfgutil")
 		m.stats.DeviceCompleted(false, time.Since(start))
 		return
 	}
-	log.Printf("✅ cfgutil restore завершился без ошибок для ECID %s", decimalECID)
 
-	// ── Ждём выхода из DFU ───────────────────────────────
-	waitCtx, waitCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer waitCancel()
+	// читаем вывод
+	progressRx := regexp.MustCompile(`(?i)(progress|percent)[:\s]+(\d{1,3})%?`)
+	go m.streamCfgutilOutput(dev, stdOut, progressRx)
+	go m.streamCfgutilOutput(dev, stdErr, progressRx) // stderr иногда содержит то же самое
 
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
+	// ждём завершения
+	waitErr := cmd.Wait()
+	if waitErr != nil {
+		if restoreCtx.Err() == context.DeadlineExceeded {
+			m.notifier.RestoreFailed(dev, "таймаут cfgutil restore")
+		} else {
+			m.notifier.RestoreFailed(dev, waitErr.Error())
+		}
+		m.stats.DeviceCompleted(false, time.Since(start))
+		return
+	}
+	log.Printf("✅ cfgutil завершился для %s", dev.GetFriendlyName())
 
-	for exited := false; !exited; {
+	// ──────────────────────────────────────────────────
+	// ждём выхода из DFU
+	// ──────────────────────────────────────────────────
+	if !m.waitExitDFU(ctx, decECID, 30*time.Second) {
+		m.notifier.RestoreFailed(dev, "устройство осталось в DFU после restore")
+		m.stats.DeviceCompleted(false, time.Since(start))
+		return
+	}
+
+	log.Printf("🎉 Прошивка завершена: %s", dev.GetFriendlyName())
+	m.notifier.RestoreCompleted(dev)
+	m.stats.DeviceCompleted(true, time.Since(start))
+}
+
+/*──────────────────────────────────────────────────────────
+  Helpers
+  ──────────────────────────────────────────────────────────*/
+
+// читает вывод cfgutil построчно, даёт голосовые уведомления о прогрессе
+func (m *Manager) streamCfgutilOutput(dev *device.Device, r io.Reader, rx *regexp.Regexp) {
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		line := sc.Text()
+		if m.parseProgressLine(dev, line, rx) {
+			continue // прогресс уже обработан
+		}
+
+		// можно добавить дополнительные статусы
+		lc := strings.ToLower(line)
+		switch {
+		case strings.Contains(lc, "preparing"):
+			m.notifier.RestoreProgress(dev, "подготовка")
+		case strings.Contains(lc, "downloading"):
+			m.notifier.RestoreProgress(dev, "загрузка прошивки")
+		}
+	}
+}
+
+// возвращает true, если строка содержала percent
+func (m *Manager) parseProgressLine(dev *device.Device, line string, rx *regexp.Regexp) bool {
+	if !rx.MatchString(line) {
+		return false
+	}
+	matches := rx.FindStringSubmatch(line)
+	if len(matches) < 3 {
+		return false
+	}
+	percent := matches[2]
+	m.notifier.RestoreProgress(dev, percent+" %")
+	return true
+}
+
+// ждём, пока устройство выйдет из DFU
+func (m *Manager) waitExitDFU(ctx context.Context, decimalECID string, max time.Duration) bool {
+	waitCtx, cancel := context.WithTimeout(ctx, max)
+	defer cancel()
+
+	tick := time.NewTicker(3 * time.Second)
+	defer tick.Stop()
+
+	for {
 		select {
 		case <-waitCtx.Done():
-			log.Printf("⚠️ Устройство %s осталось в DFU после restore.", dev.GetFriendlyName())
-			m.notifier.RestoreFailed(dev, "устройство осталось в DFU после restore")
-			m.stats.DeviceCompleted(false, time.Since(start))
-			return
-		case <-ticker.C:
+			return false
+		case <-tick.C:
 			inDFU := false
 			for _, d := range m.dfuManager.GetDFUDevices(waitCtx) {
 				dec, _ := normalizeECIDForCfgutil(d.ECID)
@@ -141,23 +197,18 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 				}
 			}
 			if !inDFU {
-				exited = true
+				return true
 			}
 		}
 	}
-
-	// ── Успех ────────────────────────────────────────────
-	log.Printf("🎉 Восстановление завершено: %s", dev.GetFriendlyName())
-	m.notifier.RestoreCompleted(dev)
-	m.stats.DeviceCompleted(true, time.Since(start))
 }
 
 /*
-   ──────────────────────────────────────────────────────────
-   UTILITIES (без изменений по логике)
-   ──────────────────────────────────────────────────────────
-*/
+──────────────────────────────────────────────────────────
 
+	UTILITIES (без изменений)
+	──────────────────────────────────────────────────────────
+*/
 func hexToDec(hexStr string) (string, error) {
 	clean := strings.TrimPrefix(strings.ToLower(hexStr), "0x")
 	val, err := strconv.ParseUint(clean, 16, 64)
@@ -190,13 +241,4 @@ func normalizeECIDForCfgutil(ecid string) (string, error) {
 		return hexToDec(ecid)
 	}
 	return "", fmt.Errorf("неизвестный формат ECID: %s", ecid)
-}
-
-func trim(b []byte, n int) string {
-	s := strings.ReplaceAll(string(b), "\n", " ")
-	s = strings.ReplaceAll(s, "\r", " ")
-	if len(s) > n {
-		return s[:n] + "…"
-	}
-	return s
 }

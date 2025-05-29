@@ -346,51 +346,61 @@ func (m *Monitor) extractDevicesRecursively(sp *SPUSBItem, acc *[]*Device) {
 		return
 	}
 
-	var dev *Device
-
-	// DFU / Recovery
-	if isDFU, state, model := isDFURecoveryByPID(sp.ProductID); isDFU {
-		dev = &Device{
-			Model:       model,
-			State:       state,
+	//---------------------------------------------
+	// 1) Сначала смотрим на _name: DFU / Recovery
+	//---------------------------------------------
+	if isDFU, state := isDFURecoveryByName(sp.Name); isDFU {
+		dev := &Device{
+			Model:       sp.Name,
+			State:       state, // «DFU» или «Recovery»
 			IsDFU:       true,
 			USBLocation: sp.LocationID,
 		}
 		if ecid := extractECIDFromString(sp.SerialNum); ecid != "" {
 			dev.ECID = ecid
+			m.appendIfValid(dev, acc)
 		} else {
-			debugLog("⚠️  DFU без ECID (%s) – игнор.", model)
-			dev = nil
+			debugLog("⚠️  %s без ECID – игнор.", sp.Name)
 		}
-	} else if isDFU, state := isDFURecoveryByName(sp.Name); isDFU {
-		dev = &Device{
-			Model:       sp.Name,
-			State:       state,
-			IsDFU:       true,
-			USBLocation: sp.LocationID,
+		// даже если по PID то же самое, повторно ничего не добавляем
+	} else {
+		//---------------------------------------------
+		// 2) Нет ключевых слов → смотрим ProductID
+		//---------------------------------------------
+		if isDFU, state, model := isDFURecoveryByPID(sp.ProductID); isDFU {
+			dev := &Device{
+				Model:       model,
+				State:       state,
+				IsDFU:       true,
+				USBLocation: sp.LocationID,
+			}
+			if ecid := extractECIDFromString(sp.SerialNum); ecid != "" {
+				dev.ECID = ecid
+				m.appendIfValid(dev, acc)
+			} else {
+				debugLog("⚠️  DFU без ECID (%s) – игнор.", model)
+			}
+		} else if isNormalMacDevice(sp) {
+			dev := &Device{
+				Model:       sp.Name,
+				State:       "Normal",
+				IsDFU:       false,
+				USBLocation: sp.LocationID,
+			}
+			m.appendIfValid(dev, acc)
 		}
-		if ecid := extractECIDFromString(sp.SerialNum); ecid != "" {
-			dev.ECID = ecid
-		} else {
-			debugLog("⚠️  DFU без ECID (%s) – игнор.", sp.Name)
-			dev = nil
-		}
-	} else if isNormalMacDevice(sp) {
-		dev = &Device{
-			Model:       sp.Name,
-			State:       "Normal",
-			IsDFU:       false,
-			USBLocation: sp.LocationID,
-		}
-	}
-
-	if dev != nil && dev.UniqueID() != "" {
-		*acc = append(*acc, dev)
-		debugLog("🔍 Обнаружено: %s, UID=%s", dev.GetFriendlyName(), dev.UniqueID())
 	}
 
 	for i := range sp.SubItems {
 		m.extractDevicesRecursively(&sp.SubItems[i], acc)
+	}
+}
+
+// маленький хелпер, чтобы не дублировать проверки
+func (m *Monitor) appendIfValid(dev *Device, acc *[]*Device) {
+	if dev != nil && dev.UniqueID() != "" {
+		*acc = append(*acc, dev)
+		debugLog("🔍 Обнаружено: %s, UID=%s", dev.GetFriendlyName(), dev.UniqueID())
 	}
 }
 

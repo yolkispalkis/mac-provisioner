@@ -38,6 +38,12 @@ type Manager struct {
 	processingMu sync.RWMutex
 }
 
+/* кеш, чтобы не слать прогресс каждую секунду */
+var (
+	progressMu    sync.Mutex
+	progressCache = map[string]int{} // UID → последний % уже озвученный
+)
+
 func New(dfuMgr *dfu.Manager, notifier *notification.Manager, stats *stats.Manager) *Manager {
 	return &Manager{
 		dfuManager:    dfuMgr,
@@ -138,7 +144,8 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 		return
 	}
 
-	progressRx := regexp.MustCompile(`(?i)(progress|percent)[:\s]+(\d{1,3})%?`)
+	// НОВЫЙ универсальный регэксп: любое NN%
+	progressRx := regexp.MustCompile(`(?i)(\d{1,3})\s*%`)
 	go m.streamCfgutilOutput(dev, stdOut, progressRx)
 	go m.streamCfgutilOutput(dev, stdErr, progressRx)
 
@@ -202,16 +209,44 @@ func (m *Manager) streamCfgutilOutput(dev *device.Device, r io.Reader, rx *regex
 }
 
 func (m *Manager) parseProgressLine(dev *device.Device, line string, rx *regexp.Regexp) bool {
-	if !rx.MatchString(line) {
-		return false
-	}
 	matches := rx.FindStringSubmatch(line)
-	if len(matches) < 3 {
+	if len(matches) < 2 {
 		return false
 	}
-	percent := matches[2]
-	m.notifier.RestoreProgress(dev, percent+" %")
+	percentStr := matches[1]
+	percent, _ := strconv.Atoi(percentStr)
+
+	uid := dev.UniqueID()
+
+	// отправляем, если:
+	//   • 0%   • 100%   • изменилась «десятка» (10,20,30…) или прирост >= 10 %
+	if shouldAnnounce(uid, percent) {
+		m.notifier.RestoreProgress(dev, percentStr+" %")
+	}
 	return true
+}
+
+/* правила дебаунса прогресса */
+func shouldAnnounce(uid string, p int) bool {
+	progressMu.Lock()
+	defer progressMu.Unlock()
+
+	last := progressCache[uid]
+	notify := false
+
+	switch {
+	case p == 0 || p == 100:
+		notify = true
+	case p/10 != last/10: // другая «десятка»
+		notify = true
+	case p-last >= 10: // или скачок ≥10 %
+		notify = true
+	}
+
+	if notify {
+		progressCache[uid] = p
+	}
+	return notify
 }
 
 func (m *Manager) waitExitDFU(ctx context.Context, decimalECID string, max time.Duration) bool {

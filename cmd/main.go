@@ -18,6 +18,15 @@ import (
 	"mac-provisioner/internal/stats"
 )
 
+/*
+──────────────────────────────────────────────────────────
+
+	Debug-флаг для периодического списка устройств
+
+──────────────────────────────────────────────────────────
+*/
+var showDeviceList = os.Getenv("MAC_PROV_DEBUG") == "1"
+
 func main() {
 	log.Println("🚀 Запуск Mac Provisioner...")
 
@@ -48,7 +57,11 @@ func main() {
 	}
 
 	go handleDeviceEvents(ctx, devMon, provMgr, notifier, dfuMgr)
-	go debugConnectedDevices(ctx, devMon, 30*time.Second)
+
+	// Периодический вывод устройств теперь только при MAC_PROV_DEBUG=1
+	if showDeviceList {
+		go debugConnectedDevices(ctx, devMon, 30*time.Second)
+	}
 
 	log.Println("✅ Mac Provisioner запущен. Нажмите Ctrl+C для выхода.")
 	log.Println("🔌 Подключите Mac через USB-C для автоматической прошивки...")
@@ -87,6 +100,7 @@ func handleDeviceEvents(
 				return
 			}
 
+			// подавляем события от порта, где уже идёт прошивка
 			if prov.IsProcessingUSB(ev.Device.USBLocation) {
 				continue
 			}
@@ -119,7 +133,6 @@ func onConnected(
 	}
 
 	if dev.IsNormalMac() {
-		// USB-порт не занят (доп. проверка в случае прямого вызова)
 		if prov.IsProcessingUSB(dev.USBLocation) {
 			return
 		}

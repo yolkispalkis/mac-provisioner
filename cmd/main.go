@@ -25,101 +25,99 @@ func main() {
 	if err != nil {
 		log.Fatalf("❌ Ошибка загрузки конфигурации: %v", err)
 	}
-	log.Printf("⚙️ Конфигурация: интервал проверки %v, голос %s",
+	log.Printf("⚙️  Интервал проверки устройств: %v  |  Голос уведомлений: %s",
 		cfg.Monitoring.CheckInterval, cfg.Notifications.Voice)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Ctrl-C / kill
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+	// Core components
 	notifier := notification.New(cfg.Notifications)
 	statsMgr := stats.New()
 	dfuManager := dfu.New()
 	deviceMonitor := device.NewMonitor(cfg.Monitoring)
 	provManager := provisioner.New(dfuManager, notifier, statsMgr)
 
-	log.Println("🔧 Компоненты инициализированы")
 	notifier.SystemStarted()
 
 	if err := deviceMonitor.Start(ctx); err != nil {
-		log.Fatalf("❌ Ошибка запуска мониторинга устройств: %v", err)
+		log.Fatalf("❌ Не удалось запустить монитор устройств: %v", err)
 	}
 
 	go handleDeviceEvents(ctx, deviceMonitor, provManager, notifier, dfuManager)
-	go printStats(ctx, statsMgr, 10*time.Minute)
 	go debugConnectedDevices(ctx, deviceMonitor, 30*time.Second)
 
-	log.Println("✅ Mac Provisioner запущен. Нажмите Ctrl+C для остановки.")
+	log.Println("✅ Mac Provisioner запущен. Нажмите Ctrl+C для выхода.")
 	log.Println("🔌 Подключите Mac через USB-C для автоматической прошивки...")
 
 	<-sigChan
-	log.Println("🛑 Завершение работы Mac Provisioner...")
-	notifier.SystemShutdown()
 
+	// graceful-shutdown
+	log.Println("🛑 Завершение работы...")
+	notifier.SystemShutdown()
 	cancel()
 	deviceMonitor.Stop()
-
-	log.Println("⏳ Ожидание завершения фоновых задач...")
-	time.Sleep(3 * time.Second)
-	log.Println("👋 Mac Provisioner остановлен.")
+	time.Sleep(2 * time.Second)
+	log.Println("👋 Готово.")
 }
 
-// ──────────────────────────────────────────────────────────
-// Обработчик событий устройств
-// ──────────────────────────────────────────────────────────
-func handleDeviceEvents(ctx context.Context, monitor *device.Monitor, provManager *provisioner.Manager,
-	notifier *notification.Manager, dfuManager *dfu.Manager) {
+/*
+──────────────────────────────────────────────────────────
 
-	log.Println("🎧 Запуск обработчика событий устройств...")
-
+	Обработчик событий устройств
+	──────────────────────────────────────────────────────────
+*/
+func handleDeviceEvents(
+	ctx context.Context,
+	monitor *device.Monitor,
+	provManager *provisioner.Manager,
+	notifier *notification.Manager,
+	dfuManager *dfu.Manager,
+) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("🛑 Обработчик событий остановлен (контекст завершён).")
 			return
-
-		case event, ok := <-monitor.Events():
+		case ev, ok := <-monitor.Events():
 			if !ok {
-				log.Println("🛑 Канал событий закрыт, обработчик останавливается.")
 				return
 			}
+			log.Printf("📨 %s: %s", strings.ToUpper(ev.Type), ev.Device.GetFriendlyName())
 
-			log.Printf("📨 %s: %s", strings.ToUpper(event.Type), event.Device.GetFriendlyName())
-
-			switch event.Type {
+			switch ev.Type {
 			case device.EventConnected:
-				handleConnected(ctx, event.Device, provManager, notifier, dfuManager)
-
+				onConnected(ctx, ev.Device, provManager, notifier, dfuManager)
 			case device.EventDisconnected:
-				log.Printf("🔌 Отключено устройство: %s", event.Device.GetFriendlyName())
-				notifier.DeviceDisconnected(event.Device)
-
+				notifier.DeviceDisconnected(ev.Device)
 			case device.EventStateChanged:
-				handleStateChanged(ctx, event.Device, provManager, notifier)
+				onStateChanged(ctx, ev.Device, provManager, notifier)
 			}
 		}
 	}
 }
 
-func handleConnected(ctx context.Context, dev *device.Device, prov *provisioner.Manager,
-	notifier *notification.Manager, dfuMgr *dfu.Manager) {
-
+func onConnected(
+	ctx context.Context,
+	dev *device.Device,
+	prov *provisioner.Manager,
+	notifier *notification.Manager,
+	dfuMgr *dfu.Manager,
+) {
 	if dev.IsDFU && dev.ECID != "" {
-		// Уже в DFU — прошиваем.
-		log.Printf("🔧 DFU устройство %s готово к прошивке.", dev.GetFriendlyName())
 		notifier.DeviceDetected(dev)
 		go prov.ProcessDevice(ctx, dev)
+		return
+	}
 
-	} else if dev.IsNormalMac() {
-		// Normal Mac — переводим в DFU.
-		log.Printf("💻 Обнаружен обычный Mac %s. Перевод в DFU...", dev.GetFriendlyName())
+	if dev.IsNormalMac() {
 		notifier.DeviceConnected(dev)
 		notifier.EnteringDFUMode(dev)
 
 		go func(d *device.Device) {
 			if err := dfuMgr.EnterDFUMode(ctx, d.USBLocation); err != nil {
-				log.Printf("❌ Не удалось перевести %s в DFU: %v", d.GetFriendlyName(), err)
 				if err.Error() == "macvdmtool недоступен, автоматический вход в DFU невозможен" {
 					notifier.ManualDFURequired(d)
 					dfuMgr.OfferManualDFU(d.USBLocation)
@@ -127,65 +125,42 @@ func handleConnected(ctx context.Context, dev *device.Device, prov *provisioner.
 					notifier.Error(fmt.Sprintf("Ошибка входа в DFU: %v", err))
 				}
 			} else {
-				log.Printf("✅ Устройство %s переведено в DFU", d.GetFriendlyName())
 				notifier.DFUModeEntered(d)
 			}
 		}(dev)
-	} else {
-		log.Printf("❓ Неизвестное устройство: %s (DFU: %v, ECID: '%s')",
-			dev.GetFriendlyName(), dev.IsDFU, dev.ECID)
 	}
 }
 
-func handleStateChanged(ctx context.Context, dev *device.Device,
-	prov *provisioner.Manager, notifier *notification.Manager) {
-
-	log.Printf("🔄 Состояние изменилось: %s – %s, DFU:%v", dev.GetFriendlyName(), dev.State, dev.IsDFU)
-
+func onStateChanged(
+	ctx context.Context,
+	dev *device.Device,
+	prov *provisioner.Manager,
+	notifier *notification.Manager,
+) {
 	if dev.IsDFU && dev.ECID != "" {
-		log.Printf("🔧 %s перешло в DFU и готово к прошивке.", dev.GetFriendlyName())
 		notifier.DFUModeEntered(dev)
 		go prov.ProcessDevice(ctx, dev)
-
 	} else if dev.IsNormalMac() {
-		log.Printf("✅ %s вернулось в нормальный режим.", dev.GetFriendlyName())
 		notifier.DeviceReady(dev)
 	}
 }
 
-// ──────────────────────────────────────────────────────────
+/*
+──────────────────────────────────────────────────────────
 
-func printStats(ctx context.Context, statsMgr *stats.Manager, interval time.Duration) {
-	if interval == 0 {
-		interval = 10 * time.Minute
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	log.Printf("📊 Статистика каждые %v", interval)
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("📊 Вывод статистики остановлен.")
-			return
-		case <-ticker.C:
-			log.Printf("📊 %s", statsMgr.Summary())
-		}
-	}
-}
-
+	Периодический список подключённых устройств (debug)
+	──────────────────────────────────────────────────────────
+*/
 func debugConnectedDevices(ctx context.Context, monitor *device.Monitor, interval time.Duration) {
-	if interval == 0 {
+	if interval <= 0 {
 		interval = 30 * time.Second
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	log.Printf("🔍 Отладка списка устройств каждые %v", interval)
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("🔍 Отладка остановлена.")
 			return
 		case <-ticker.C:
 			list := monitor.GetConnectedDevices()
@@ -193,23 +168,24 @@ func debugConnectedDevices(ctx context.Context, monitor *device.Monitor, interva
 				log.Println("🔍 Устройств не обнаружено.")
 				continue
 			}
-
-			dfu, normal := 0, 0
+			dfuCount, normalCount := 0, 0
 			for _, d := range list {
 				if d.IsDFU {
-					dfu++
+					dfuCount++
 				} else {
-					normal++
+					normalCount++
 				}
 			}
-			log.Printf("🔍 Подключено: %d DFU + %d Normal", dfu, normal)
+			log.Printf("🔍 Подключено: %d DFU + %d Normal", dfuCount, normalCount)
+
 			for i, d := range list {
 				if d.IsDFU {
-					log.Printf("  %d. DFU: %s (ECID:%s, State:%s, NeedsProv:%v)",
-						i+1, d.GetFriendlyName(), d.ECID, d.State, d.NeedsProvisioning())
+					log.Printf("  %d. DFU: %s (State:%s)", i+1, d.GetFriendlyName(), d.State)
 				} else {
-					log.Printf("  %d. MAC: %s (USB:%s, State:%s, NeedsProv:%v)",
-						i+1, d.GetFriendlyName(), d.USBLocation, d.State, d.NeedsProvisioning())
+					log.Printf("  %d. MAC: %s (USB:%s, State:%s)",
+						i+1, d.GetFriendlyName(),
+						strings.TrimPrefix(d.USBLocation, "0x"),
+						d.State)
 				}
 			}
 		}

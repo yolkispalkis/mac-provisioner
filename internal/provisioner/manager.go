@@ -24,7 +24,8 @@ import (
 ──────────────────────────────────────────────────────────
 
 	STRUCT
-	──────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────
 */
 type Manager struct {
 	dfuManager   *dfu.Manager
@@ -47,7 +48,8 @@ func New(dfuMgr *dfu.Manager, notifier *notification.Manager, stats *stats.Manag
 ──────────────────────────────────────────────────────────
 
 	PUBLIC
-	──────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────
 */
 func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	uid := dev.UniqueID()
@@ -90,7 +92,7 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	m.notifier.StartingRestore(dev)
 
 	// ──────────────────────────────────────────────────
-	// cfgutil restore  (онлайн-парсинг вывода)
+	// cfgutil restore (стриминг + буферы)
 	// ──────────────────────────────────────────────────
 	restoreCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
@@ -118,7 +120,7 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	// читаем вывод
 	progressRx := regexp.MustCompile(`(?i)(progress|percent)[:\s]+(\d{1,3})%?`)
 	go m.streamCfgutilOutput(dev, stdOut, progressRx)
-	go m.streamCfgutilOutput(dev, stdErr, progressRx) // stderr иногда содержит то же самое
+	go m.streamCfgutilOutput(dev, stdErr, progressRx) // stderr может дублировать прогресс
 
 	// ждём завершения
 	waitErr := cmd.Wait()
@@ -135,11 +137,12 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 ───────────────────────────────────────────────────────────`,
 			fullCmd, waitErr, stdoutBuf.String(), stderrBuf.String())
 
+		// Человеко-читаемая ошибка для TTS
+		humanErr := extractRestoreError(stderrBuf.String(), waitErr)
 		if restoreCtx.Err() == context.DeadlineExceeded {
-			m.notifier.RestoreFailed(dev, "таймаут cfgutil restore")
-		} else {
-			m.notifier.RestoreFailed(dev, waitErr.Error())
+			humanErr = "таймаут cfgutil restore"
 		}
+		m.notifier.RestoreFailed(dev, humanErr)
 		m.stats.DeviceCompleted(false, time.Since(start))
 		return
 	}
@@ -161,7 +164,7 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 
 /*──────────────────────────────────────────────────────────
   Helpers
-  ──────────────────────────────────────────────────────────*/
+──────────────────────────────────────────────────────────*/
 
 // читает вывод cfgutil построчно, даёт голосовые уведомления о прогрессе
 func (m *Manager) streamCfgutilOutput(dev *device.Device, r io.Reader, rx *regexp.Regexp) {
@@ -172,7 +175,7 @@ func (m *Manager) streamCfgutilOutput(dev *device.Device, r io.Reader, rx *regex
 			continue // прогресс уже обработан
 		}
 
-		// можно добавить дополнительные статусы
+		// дополнительные статусы
 		lc := strings.ToLower(line)
 		switch {
 		case strings.Contains(lc, "preparing"):
@@ -228,8 +231,51 @@ func (m *Manager) waitExitDFU(ctx context.Context, decimalECID string, max time.
 /*
 ──────────────────────────────────────────────────────────
 
+	Ошибка cfgutil → короткое пояснение
+
+──────────────────────────────────────────────────────────
+*/
+func extractRestoreError(stderr string, waitErr error) string {
+	// libusbrestore error:XX
+	reUSB := regexp.MustCompile(`libusbrestore\s+error[:\s]*(\d+)`)
+	// Code: XX
+	reCode := regexp.MustCompile(`Code[:\s]*(\d+)`)
+
+	if m := reUSB.FindStringSubmatch(stderr); len(m) == 2 {
+		return mapRestoreErrorCode(m[1])
+	}
+	if m := reCode.FindStringSubmatch(stderr); len(m) == 2 {
+		return mapRestoreErrorCode(m[1])
+	}
+	if strings.Contains(stderr, "Failed to restore device in recovery mode") {
+		return "ошибка восстановления (recovery mode)"
+	}
+
+	// fallback
+	return waitErr.Error()
+}
+
+func mapRestoreErrorCode(codeStr string) string {
+	switch codeStr {
+	case "21":
+		return "ошибка восстановления (код 21)"
+	case "9":
+		return "устройство неожиданно отключилось (код 9)"
+	case "40":
+		return "не удалось прошить (код 40)"
+	case "14":
+		return "архив прошивки повреждён (код 14)"
+	default:
+		return fmt.Sprintf("ошибка восстановления (код %s)", codeStr)
+	}
+}
+
+/*
+──────────────────────────────────────────────────────────
+
 	UTILITIES (без изменений)
-	──────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────
 */
 func hexToDec(hexStr string) (string, error) {
 	clean := strings.TrimPrefix(strings.ToLower(hexStr), "0x")

@@ -2,6 +2,7 @@ package provisioner
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -95,11 +96,20 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	defer cancel()
 
 	cmd := exec.CommandContext(restoreCtx, "cfgutil", "--ecid", decECID, "restore")
-	stdOut, _ := cmd.StdoutPipe()
-	stdErr, _ := cmd.StderrPipe()
+
+	stdOutPipe, _ := cmd.StdoutPipe()
+	stdErrPipe, _ := cmd.StderrPipe()
+
+	// буферы для накопления полного вывода
+	var stdoutBuf, stderrBuf bytes.Buffer
+
+	// TeeReader → и в буфер, и в парсер прогресса
+	stdOut := io.TeeReader(stdOutPipe, &stdoutBuf)
+	stdErr := io.TeeReader(stdErrPipe, &stderrBuf)
 
 	if err := cmd.Start(); err != nil {
-		log.Printf("❌ Не удалось запустить cfgutil: %v", err)
+		log.Printf("❌ Не удалось запустить cfgutil (%s): %v",
+			strings.Join(cmd.Args, " "), err)
 		m.notifier.RestoreFailed(dev, "не удалось запустить cfgutil")
 		m.stats.DeviceCompleted(false, time.Since(start))
 		return
@@ -113,6 +123,18 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	// ждём завершения
 	waitErr := cmd.Wait()
 	if waitErr != nil {
+		fullCmd := strings.Join(cmd.Args, " ")
+		log.Printf(`
+⚠️ cfgutil завершился с ошибкой
+   Команда : %s
+   Ошибка  : %v
+─── STDOUT ────────────────────────────────────────────────
+%s
+─── STDERR ────────────────────────────────────────────────
+%s
+───────────────────────────────────────────────────────────`,
+			fullCmd, waitErr, stdoutBuf.String(), stderrBuf.String())
+
 		if restoreCtx.Err() == context.DeadlineExceeded {
 			m.notifier.RestoreFailed(dev, "таймаут cfgutil restore")
 		} else {

@@ -62,9 +62,9 @@ func (d *Device) GetReadableModel() string {
 	l := strings.ToLower(d.Model)
 	switch {
 	case strings.Contains(l, "dfu mode"):
-		return "устройство в режиме ДФУ"
+		return "в режиме ДФУ"
 	case strings.Contains(l, "recovery mode"):
-		return "устройство в режиме восстановления"
+		return "в режиме восстановления"
 	default:
 		return d.Model
 	}

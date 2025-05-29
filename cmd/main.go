@@ -58,7 +58,7 @@ func main() {
 
 	go handleDeviceEvents(ctx, devMon, provMgr, notifier, dfuMgr)
 
-	// Периодический вывод устройств теперь только при MAC_PROV_DEBUG=1
+	// Периодический вывод устройств только при MAC_PROV_DEBUG=1
 	if showDeviceList {
 		go debugConnectedDevices(ctx, devMon, 30*time.Second)
 	}
@@ -113,7 +113,7 @@ func handleDeviceEvents(
 			case device.EventDisconnected:
 				notif.DeviceDisconnected(ev.Device)
 			case device.EventStateChanged:
-				onStateChanged(ctx, ev.Device, prov, notif)
+				onStateChanged(ctx, ev.Device, prov, notif, dfuMgr)
 			}
 		}
 	}
@@ -126,32 +126,32 @@ func onConnected(
 	notif *notification.Manager,
 	dfuMgr *dfu.Manager,
 ) {
+	// === DFU-устройство ===
 	if dev.IsDFU && dev.ECID != "" {
-		notif.DeviceDetected(dev)
-		go prov.ProcessDevice(ctx, dev)
-		return
+		// DFU-mode – готово к прошивке
+		if strings.EqualFold(dev.State, "DFU") {
+			notif.DeviceDetected(dev)
+			go prov.ProcessDevice(ctx, dev)
+			return
+		}
+
+		// Recovery-mode – нужно перевести в DFU
+		if strings.EqualFold(dev.State, "Recovery") {
+			if prov.IsProcessingUSB(dev.USBLocation) {
+				return
+			}
+			notif.DeviceDetected(dev)
+			enterDFUFlow(ctx, dev, notif, dfuMgr)
+			return
+		}
 	}
 
+	// === Живой Mac (Normal) ===
 	if dev.IsNormalMac() {
 		if prov.IsProcessingUSB(dev.USBLocation) {
 			return
 		}
-
-		notif.DeviceConnected(dev)
-		notif.EnteringDFUMode(dev)
-
-		go func(d *device.Device) {
-			if err := dfuMgr.EnterDFUMode(ctx, d.USBLocation); err != nil {
-				if err.Error() == "macvdmtool недоступен, автоматический вход в DFU невозможен" {
-					notif.ManualDFURequired(d)
-					dfuMgr.OfferManualDFU(d.USBLocation)
-				} else {
-					notif.Error(fmt.Sprintf("Ошибка входа в DFU: %v", err))
-				}
-			} else {
-				notif.DFUModeEntered(d)
-			}
-		}(dev)
+		enterDFUFlow(ctx, dev, notif, dfuMgr)
 	}
 }
 
@@ -160,13 +160,52 @@ func onStateChanged(
 	dev *device.Device,
 	prov *provisioner.Manager,
 	notif *notification.Manager,
+	dfuMgr *dfu.Manager,
 ) {
-	if dev.IsDFU && dev.ECID != "" {
+	// Перешёл в DFU → можно шить
+	if dev.IsDFU && dev.ECID != "" && strings.EqualFold(dev.State, "DFU") {
 		notif.DFUModeEntered(dev)
 		go prov.ProcessDevice(ctx, dev)
-	} else if dev.IsNormalMac() {
+		return
+	}
+
+	// Перешёл в Recovery → снова просим DFU
+	if dev.IsDFU && dev.ECID != "" && strings.EqualFold(dev.State, "Recovery") {
+		enterDFUFlow(ctx, dev, notif, dfuMgr)
+		return
+	}
+
+	// Вернулся в Normal
+	if dev.IsNormalMac() {
 		notif.DeviceReady(dev)
 	}
+}
+
+/*
+enterDFUFlow – общая функция для Normal-Mac и Recovery:
+пытаемся автоматом через macvdmtool, иначе просим вручную.
+*/
+func enterDFUFlow(
+	ctx context.Context,
+	dev *device.Device,
+	notif *notification.Manager,
+	dfuMgr *dfu.Manager,
+) {
+	notif.DeviceConnected(dev)
+	notif.EnteringDFUMode(dev)
+
+	go func(d *device.Device) {
+		if err := dfuMgr.EnterDFUMode(ctx, d.USBLocation); err != nil {
+			if err.Error() == "macvdmtool недоступен, автоматический вход в DFU невозможен" {
+				notif.ManualDFURequired(d)
+				dfuMgr.OfferManualDFU(d.USBLocation)
+			} else {
+				notif.Error(fmt.Sprintf("Ошибка входа в DFU: %v", err))
+			}
+		} else {
+			notif.DFUModeEntered(d)
+		}
+	}(dev)
 }
 
 /*

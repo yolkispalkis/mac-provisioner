@@ -68,7 +68,8 @@ func main() {
 ──────────────────────────────────────────────────────────
 
 	Обработчик событий устройств
-	──────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────
 */
 func handleDeviceEvents(
 	ctx context.Context,
@@ -106,16 +107,28 @@ func onConnected(
 	notifier *notification.Manager,
 	dfuMgr *dfu.Manager,
 ) {
+	// Если это уже DFU-устройство с ECID — сразу на прошивку.
 	if dev.IsDFU && dev.ECID != "" {
 		notifier.DeviceDetected(dev)
 		go prov.ProcessDevice(ctx, dev)
 		return
 	}
 
+	// Обычный Mac (Normal mode) — захотим перевести в DFU.
 	if dev.IsNormalMac() {
+
+		// NEW: если этот USB-порт уже «занят» активной прошивкой —
+		// ничего не делаем, чтобы не сбросить устройство обратно в DFU.
+		if prov.IsProcessingUSB(dev.USBLocation) {
+			log.Printf("ℹ️ %s уже прошивается (USB %s) — авто-DFU пропущен.",
+				dev.GetFriendlyName(), strings.TrimPrefix(dev.USBLocation, "0x"))
+			return
+		}
+
 		notifier.DeviceConnected(dev)
 		notifier.EnteringDFUMode(dev)
 
+		// Пытаемся через macvdmtool
 		go func(d *device.Device) {
 			if err := dfuMgr.EnterDFUMode(ctx, d.USBLocation); err != nil {
 				if err.Error() == "macvdmtool недоступен, автоматический вход в DFU невозможен" {
@@ -149,9 +162,14 @@ func onStateChanged(
 ──────────────────────────────────────────────────────────
 
 	Периодический список подключённых устройств (debug)
-	──────────────────────────────────────────────────────────
+
+──────────────────────────────────────────────────────────
 */
-func debugConnectedDevices(ctx context.Context, monitor *device.Monitor, interval time.Duration) {
+func debugConnectedDevices(
+	ctx context.Context,
+	monitor *device.Monitor,
+	interval time.Duration,
+) {
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}

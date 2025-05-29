@@ -28,33 +28,46 @@ import (
 ──────────────────────────────────────────────────────────
 */
 type Manager struct {
-	dfuManager   *dfu.Manager
-	notifier     *notification.Manager
-	stats        *stats.Manager
-	processing   map[string]bool // key = Device.UniqueID()
+	dfuManager *dfu.Manager
+	notifier   *notification.Manager
+	stats      *stats.Manager
+
+	processing    map[string]bool // ключ — Device.UniqueID()
+	processingUSB map[string]bool // ключ — USBLocation (порт)
+
 	processingMu sync.RWMutex
 }
 
 func New(dfuMgr *dfu.Manager, notifier *notification.Manager, stats *stats.Manager) *Manager {
 	return &Manager{
-		dfuManager: dfuMgr,
-		notifier:   notifier,
-		stats:      stats,
-		processing: make(map[string]bool),
+		dfuManager:    dfuMgr,
+		notifier:      notifier,
+		stats:         stats,
+		processing:    make(map[string]bool),
+		processingUSB: make(map[string]bool),
 	}
 }
 
 /*
 ──────────────────────────────────────────────────────────
-
-	PUBLIC
-
+        PUBLIC
 ──────────────────────────────────────────────────────────
 */
+
+// IsProcessingUSB — занят ли этот USB-порт активной прошивкой
+func (m *Manager) IsProcessingUSB(loc string) bool {
+	if loc == "" {
+		return false
+	}
+	m.processingMu.RLock()
+	defer m.processingMu.RUnlock()
+	return m.processingUSB[loc]
+}
+
 func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	uid := dev.UniqueID()
 
-	// блокируем повтор
+	// ---- блокируем повторную обработку того же UID ----
 	m.processingMu.Lock()
 	if m.processing[uid] {
 		m.processingMu.Unlock()
@@ -62,13 +75,22 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 		return
 	}
 	m.processing[uid] = true
+	if dev.USBLocation != "" {
+		m.processingUSB[dev.USBLocation] = true // отмечаем порт
+	}
 	m.processingMu.Unlock()
 
+	// по завершении снимаем все отметки
 	defer func() {
 		m.processingMu.Lock()
 		delete(m.processing, uid)
+		if dev.USBLocation != "" {
+			delete(m.processingUSB, dev.USBLocation)
+		}
 		m.processingMu.Unlock()
 	}()
+
+	// ---------------------------------------------------
 
 	log.Printf("🚀 Старт прошивки: %s (ECID:%s)", dev.GetFriendlyName(), dev.ECID)
 	start := time.Now()
@@ -91,9 +113,11 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 
 	m.notifier.StartingRestore(dev)
 
-	// ──────────────────────────────────────────────────
-	// cfgutil restore (стриминг + буферы)
-	// ──────────────────────────────────────────────────
+	/*
+	   ────────────────────────────────────────────
+	   cfgutil restore
+	   ────────────────────────────────────────────
+	*/
 	restoreCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 
@@ -102,10 +126,7 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	stdOutPipe, _ := cmd.StdoutPipe()
 	stdErrPipe, _ := cmd.StderrPipe()
 
-	// буферы для накопления полного вывода
 	var stdoutBuf, stderrBuf bytes.Buffer
-
-	// TeeReader → и в буфер, и в парсер прогресса
 	stdOut := io.TeeReader(stdOutPipe, &stdoutBuf)
 	stdErr := io.TeeReader(stdErrPipe, &stderrBuf)
 
@@ -117,12 +138,10 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 		return
 	}
 
-	// читаем вывод
 	progressRx := regexp.MustCompile(`(?i)(progress|percent)[:\s]+(\d{1,3})%?`)
 	go m.streamCfgutilOutput(dev, stdOut, progressRx)
-	go m.streamCfgutilOutput(dev, stdErr, progressRx) // stderr может дублировать прогресс
+	go m.streamCfgutilOutput(dev, stdErr, progressRx)
 
-	// ждём завершения
 	waitErr := cmd.Wait()
 	if waitErr != nil {
 		fullCmd := strings.Join(cmd.Args, " ")
@@ -137,7 +156,6 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 ───────────────────────────────────────────────────────────`,
 			fullCmd, waitErr, stdoutBuf.String(), stderrBuf.String())
 
-		// Человеко-читаемая ошибка для TTS
 		humanErr := extractRestoreError(stderrBuf.String(), waitErr)
 		if restoreCtx.Err() == context.DeadlineExceeded {
 			humanErr = "таймаут cfgutil restore"
@@ -148,9 +166,7 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	}
 	log.Printf("✅ cfgutil завершился для %s", dev.GetFriendlyName())
 
-	// ──────────────────────────────────────────────────
-	// ждём выхода из DFU
-	// ──────────────────────────────────────────────────
+	// ждём выхода устройства из DFU
 	if !m.waitExitDFU(ctx, decECID, 30*time.Second) {
 		m.notifier.RestoreFailed(dev, "устройство осталось в DFU после restore")
 		m.stats.DeviceCompleted(false, time.Since(start))
@@ -163,19 +179,18 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 }
 
 /*──────────────────────────────────────────────────────────
-  Helpers
+        Helpers — парсинг прогресса, ожидание DFU-exit и т.д.
 ──────────────────────────────────────────────────────────*/
 
-// читает вывод cfgutil построчно, даёт голосовые уведомления о прогрессе
+// строковый прогресс cfgutil
 func (m *Manager) streamCfgutilOutput(dev *device.Device, r io.Reader, rx *regexp.Regexp) {
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		line := sc.Text()
 		if m.parseProgressLine(dev, line, rx) {
-			continue // прогресс уже обработан
+			continue
 		}
 
-		// дополнительные статусы
 		lc := strings.ToLower(line)
 		switch {
 		case strings.Contains(lc, "preparing"):
@@ -186,7 +201,6 @@ func (m *Manager) streamCfgutilOutput(dev *device.Device, r io.Reader, rx *regex
 	}
 }
 
-// возвращает true, если строка содержала percent
 func (m *Manager) parseProgressLine(dev *device.Device, line string, rx *regexp.Regexp) bool {
 	if !rx.MatchString(line) {
 		return false
@@ -200,7 +214,6 @@ func (m *Manager) parseProgressLine(dev *device.Device, line string, rx *regexp.
 	return true
 }
 
-// ждём, пока устройство выйдет из DFU
 func (m *Manager) waitExitDFU(ctx context.Context, decimalECID string, max time.Duration) bool {
 	waitCtx, cancel := context.WithTimeout(ctx, max)
 	defer cancel()
@@ -236,9 +249,7 @@ func (m *Manager) waitExitDFU(ctx context.Context, decimalECID string, max time.
 ──────────────────────────────────────────────────────────
 */
 func extractRestoreError(stderr string, waitErr error) string {
-	// libusbrestore error:XX
 	reUSB := regexp.MustCompile(`libusbrestore\s+error[:\s]*(\d+)`)
-	// Code: XX
 	reCode := regexp.MustCompile(`Code[:\s]*(\d+)`)
 
 	if m := reUSB.FindStringSubmatch(stderr); len(m) == 2 {
@@ -250,8 +261,6 @@ func extractRestoreError(stderr string, waitErr error) string {
 	if strings.Contains(stderr, "Failed to restore device in recovery mode") {
 		return "ошибка восстановления (recovery mode)"
 	}
-
-	// fallback
 	return waitErr.Error()
 }
 
@@ -273,7 +282,7 @@ func mapRestoreErrorCode(codeStr string) string {
 /*
 ──────────────────────────────────────────────────────────
 
-	UTILITIES (без изменений)
+	UTILITIES
 
 ──────────────────────────────────────────────────────────
 */

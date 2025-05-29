@@ -35,14 +35,17 @@ type Monitor struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	firstScan    bool
+
+	nameResolver *NameResolver // 🔄  новое поле
 }
 
 func NewMonitor(cfg config.MonitoringConfig) *Monitor {
 	return &Monitor{
-		config:    cfg,
-		eventChan: make(chan Event, cfg.EventBufferSize),
-		devices:   make(map[string]*Device),
-		firstScan: true,
+		config:       cfg,
+		eventChan:    make(chan Event, cfg.EventBufferSize),
+		devices:      make(map[string]*Device),
+		firstScan:    true,
+		nameResolver: NewNameResolver(), // 🔄
 	}
 }
 
@@ -251,6 +254,20 @@ func (m *Monitor) cleanupLoop() {
 func (m *Monitor) checkDevices() {
 	current := m.fetchCurrentUSBDevices()
 
+	// 1) нормальные Маки → кэшируем имя по USB
+	for _, dev := range current {
+		if dev.IsNormalMac() {
+			m.nameResolver.rememberNormal(dev)
+		}
+	}
+
+	// 2) DFU → пытаемся «приукрасить» модель
+	for _, dev := range current {
+		if dev.IsDFU {
+			_ = m.nameResolver.tryBeautifyDFU(m.ctx, dev)
+		}
+	}
+
 	m.devicesMutex.Lock()
 	defer m.devicesMutex.Unlock()
 
@@ -435,4 +452,99 @@ func (m *Monitor) GetConnectedDevices() []*Device {
 		out = append(out, &c)
 	}
 	return out
+}
+
+/*
+──────────────────────────────────────────────────────────
+
+	NameResolver – связываем ECID ↔︎ Model
+	──────────────────────────────────────────────────────────
+*/
+type NameResolver struct {
+	ecid2name map[string]string // ECID -> Model
+	usb2name  map[string]string // USB  -> Model (временно, пока нет ECID)
+	mu        sync.RWMutex
+}
+
+func NewNameResolver() *NameResolver {
+	return &NameResolver{
+		ecid2name: make(map[string]string),
+		usb2name:  make(map[string]string),
+	}
+}
+
+func (r *NameResolver) rememberNormal(dev *Device) {
+	if dev.USBLocation == "" || !dev.IsNormalMac() {
+		return
+	}
+	r.mu.Lock()
+	r.usb2name[dev.USBLocation] = dev.Model
+	r.mu.Unlock()
+}
+
+// возвращает true, если удалось присвоить «человеческую» модель
+func (r *NameResolver) tryBeautifyDFU(ctx context.Context, dev *Device) bool {
+	if !dev.IsDFU || dev.ECID == "" {
+		return false
+	}
+
+	// 1) уже знаем ECID → имя
+	r.mu.RLock()
+	if name, ok := r.ecid2name[dev.ECID]; ok {
+		r.mu.RUnlock()
+		dev.Model = name
+		return true
+	}
+	// 2) знаем USB → имя
+	if name, ok := r.usb2name[dev.USBLocation]; ok {
+		r.mu.RUnlock()
+		dev.Model = name
+		r.mu.Lock()
+		r.ecid2name[dev.ECID] = name // кэшируем навсегда
+		r.mu.Unlock()
+		return true
+	}
+	r.mu.RUnlock()
+
+	// 3) спрашиваем cfgutil
+	if name, _ := lookupModelWithCfgutil(ctx, dev.ECID); name != "" {
+		dev.Model = name
+		r.mu.Lock()
+		r.ecid2name[dev.ECID] = name
+		r.mu.Unlock()
+		return true
+	}
+	return false
+}
+
+/*
+cfgutil --format JSON -v list → модель
+*/
+type cfgutilList struct {
+	Output map[string]struct {
+		Name       *string `json:"name"`
+		DeviceType string  `json:"deviceType"`
+	} `json:"Output"`
+}
+
+func lookupModelWithCfgutil(ctx context.Context, ecid string) (string, error) {
+	out, err := exec.CommandContext(ctx, "cfgutil", "--format", "JSON", "-v", "list").Output()
+	if err != nil {
+		return "", err
+	}
+	var data cfgutilList
+	if err := json.Unmarshal(out, &data); err != nil {
+		return "", err
+	}
+	key1 := strings.ToLower(ecid)
+	key2 := "0x" + strings.ToUpper(strings.TrimPrefix(ecid, "0x"))
+	for k, v := range data.Output {
+		if strings.EqualFold(k, key1) || strings.EqualFold(k, key2) {
+			if v.Name != nil && *v.Name != "" {
+				return *v.Name, nil
+			}
+			return v.DeviceType, nil
+		}
+	}
+	return "", fmt.Errorf("нет записи для ECID %s", ecid)
 }

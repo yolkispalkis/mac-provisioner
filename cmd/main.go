@@ -37,9 +37,8 @@ func main() {
 
 	// Voice-движок
 	voiceEng := voice.New(voice.Config{
-		Voice:  cfg.Notifications.Voice,
-		Rate:   cfg.Notifications.Rate,
-		Volume: cfg.Notifications.Volume,
+		Voice: cfg.Notifications.Voice,
+		Rate:  cfg.Notifications.Rate,
 	})
 	defer voiceEng.Shutdown()
 

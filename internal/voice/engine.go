@@ -2,19 +2,18 @@ package voice
 
 import (
 	"context"
-	"fmt"
 	"os/exec"
 	"strconv"
-	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 /*
 VoiceEngine — единый движок озвучки и фоновой мелодии.
-Использование:
+Теперь БЕЗ регулировки громкости.
 
-	v  := voice.New(voice.Config{Voice:"Milena", Rate:200, Volume:0.8})
+	v := voice.New(voice.Config{Voice:"Milena", Rate:200})
 	v.MelodyOn()
 	v.Speak(voice.Normal, "Текст")
 	…
@@ -23,19 +22,17 @@ VoiceEngine — единый движок озвучки и фоновой ме�
 type Priority int
 
 const (
-	System Priority = iota // немедленно, выше всех
+	System Priority = iota // немедленно
 	High                   // в голову очереди
 	Normal                 // FIFO
-	Low                    // слабый, может быть отброшен
+	Low                    // может быть отброшен
 )
 
 type Config struct {
 	Voice        string
 	Rate         int
-	Volume       float64       // 0‥1
-	FadeMs       int           // длительность fade-in/out (мс)
-	MaxQueue     int           // размер очереди
-	DebounceSame time.Duration // анти-спам одинаковых фраз
+	MaxQueue     int
+	DebounceSame time.Duration
 }
 
 type message struct {
@@ -58,9 +55,6 @@ type Engine struct {
 }
 
 func New(c Config) *Engine {
-	if c.FadeMs == 0 {
-		c.FadeMs = 500
-	}
 	if c.MaxQueue == 0 {
 		c.MaxQueue = 30
 	}
@@ -86,7 +80,7 @@ func New(c Config) *Engine {
 
 func (e *Engine) Shutdown() { e.cancel(); e.stopMelody() }
 
-// Speak  — озвучить текст (по приоритету).
+// Speak озвучивает текст с заданным приоритетом.
 func (e *Engine) Speak(p Priority, text string) {
 	if text == "" {
 		return
@@ -95,7 +89,7 @@ func (e *Engine) Speak(p Priority, text string) {
 	e.mu.Lock()
 	if t, ok := e.lastSpoken[text]; ok && time.Since(t) < e.cfg.DebounceSame {
 		e.mu.Unlock()
-		return // недавно уже говорили то же самое
+		return // анти-спам
 	}
 	e.lastSpoken[text] = time.Now()
 	e.mu.Unlock()
@@ -104,15 +98,15 @@ func (e *Engine) Speak(p Priority, text string) {
 	select {
 	case e.queue <- m:
 	default:
-		// очередь переполнена →
-		if p <= High { // важное – проталкиваем, выталкивая Low/Normal
+		// если очередь полна
+		if p <= High { // важно → вытолкнём что-то менее важное
 			<-e.queue
 			e.queue <- m
 		}
 	}
 }
 
-// MelodyOn  – начать тихо крутить системную мелодию (loop).
+// MelodyOn — запускает цикл afplay, если ещё не запущен.
 func (e *Engine) MelodyOn() {
 	if e.melodyCmd != nil && e.melodyCmd.ProcessState == nil {
 		return // уже играет
@@ -120,14 +114,13 @@ func (e *Engine) MelodyOn() {
 	e.melodyCmd = exec.CommandContext(
 		e.ctx,
 		"afplay",
-		"-v", "0.4", // уровень afplay
-		"/System/Library/Sounds/Submarine.aiff", // любой короткий WAV/AIFF
-		"-q", "1", "-t", "999999",               // тихий режим, «бесконечно»
+		"/System/Library/Sounds/Submarine.aiff",
+		"-q", "1", "-t", "999999",
 	)
 	_ = e.melodyCmd.Start()
 }
 
-// MelodyOff  – полностью останавливает фон.
+// MelodyOff — полностью останавливает фон.
 func (e *Engine) MelodyOff() { e.stopMelody() }
 
 /*------------------------------------------------------------------
@@ -140,9 +133,9 @@ func (e *Engine) runner() {
 		case <-e.ctx.Done():
 			return
 		case m := <-e.queue:
-			e.fadeVolume(0.25)
+			e.pauseMelody()
 			e.say(m.txt)
-			e.fadeVolume(e.cfg.Volume)
+			e.resumeMelody()
 		}
 	}
 }
@@ -153,42 +146,19 @@ func (e *Engine) say(text string) {
 }
 
 /*------------------------------------------------------------------
-			   FADE VOLUME helpers
+	              Melody Pause / Resume
 ------------------------------------------------------------------*/
 
-func (e *Engine) fadeVolume(target float64) {
-	cur, _ := e.getVolume()
-	steps := 8
-	delay := time.Duration(e.cfg.FadeMs/steps) * time.Millisecond
-	diff := (target - cur) / float64(steps)
-	for i := 0; i < steps; i++ {
-		cur += diff
-		e.setVolume(cur)
-		time.Sleep(delay)
+func (e *Engine) pauseMelody() {
+	if e.melodyCmd != nil && e.melodyCmd.Process != nil {
+		_ = e.melodyCmd.Process.Signal(syscall.SIGSTOP)
 	}
 }
 
-func (e *Engine) getVolume() (float64, error) {
-	out, err := exec.Command(
-		"osascript", "-e", "output volume of (get volume settings)").Output()
-	if err != nil {
-		return 1, err
+func (e *Engine) resumeMelody() {
+	if e.melodyCmd != nil && e.melodyCmd.Process != nil {
+		_ = e.melodyCmd.Process.Signal(syscall.SIGCONT)
 	}
-	vStr := strings.TrimSpace(string(out))
-	vInt, _ := strconv.Atoi(vStr)
-	return float64(vInt) / 100.0, nil
-}
-
-func (e *Engine) setVolume(vol float64) {
-	if vol < 0 {
-		vol = 0
-	}
-	if vol > 1 {
-		vol = 1
-	}
-	_ = exec.Command(
-		"osascript", "-e",
-		fmt.Sprintf("set volume output volume %d", int(vol*100))).Run()
 }
 
 func (e *Engine) stopMelody() {

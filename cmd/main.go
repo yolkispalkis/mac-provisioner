@@ -132,7 +132,7 @@ func onConnected(
 	// === DFU-устройство ===
 	if dev.IsDFU && dev.ECID != "" {
 		if strings.EqualFold(dev.State, "DFU") {
-			notif.DeviceDetected(dev)
+			notif.DFUModeEntered(dev)
 			go prov.ProcessDevice(ctx, dev)
 			return
 		}

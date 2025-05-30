@@ -1,277 +1,122 @@
 package notification
 
 import (
-	"fmt"
 	"os/exec"
-	"strconv"
-	"strings"
-	"sync"
 	"time"
 
 	"mac-provisioner/internal/config"
+	"mac-provisioner/internal/device"
+	"mac-provisioner/internal/voice"
 )
 
 type Manager struct {
-	config           config.NotificationConfig
-	lastNotification time.Time
-	minInterval      time.Duration
-
-	speechQueue chan string
-	speechMutex sync.Mutex
-	isPlaying   bool
+	cfg             config.NotificationConfig
+	voice           *voice.Engine
+	lastLowPriority time.Time
+	minInterval     time.Duration
 }
 
-/*──────────────────────────────────────────────────────────
-  Конструктор
-  ──────────────────────────────────────────────────────────*/
+/*─────────────────────────────────────────────────────────
+	КОНСТРУКТОР
+─────────────────────────────────────────────────────────*/
 
-func New(cfg config.NotificationConfig) *Manager {
-	m := &Manager{
-		config:      cfg,
+func New(c config.NotificationConfig, v *voice.Engine) *Manager {
+	return &Manager{
+		cfg:         c,
+		voice:       v,
 		minInterval: 2 * time.Second,
-		speechQueue: make(chan string, 10),
-	}
-	go m.processSpeechQueue()
-	return m
-}
-
-/*──────────────────────────────────────────────────────────
-  Публичные методы-события
-  ──────────────────────────────────────────────────────────*/
-
-func (m *Manager) DeviceDetected(device interface{}) {
-	if m.config.Enabled {
-		m.speak("Обнаружено новое устройство. " + voiceName(device))
 	}
 }
 
-func (m *Manager) DeviceConnected(device interface{}) {
-	if m.config.Enabled && m.canNotify() {
-		m.speak("Подключено устройство. " + voiceName(device))
+/*─────────────────────────────────────────────────────────
+	         PUBLIC EVENTS  →  voice.Engine
+─────────────────────────────────────────────────────────*/
+
+func (m *Manager) DeviceDetected(d *device.Device) {
+	m.sp(voice.High, "Обнаружено "+d.GetReadableModel())
+}
+func (m *Manager) DeviceConnected(d *device.Device) {
+	if m.debounceLow() {
+		m.sp(voice.Normal, "Подключено "+d.GetReadableModel())
 	}
 }
-
-func (m *Manager) DeviceDisconnected(device interface{}) {
-	if m.config.Enabled && m.canNotify() {
-		m.speak("Отключено устройство. " + voiceName(device))
+func (m *Manager) DeviceDisconnected(d *device.Device) {
+	if m.debounceLow() {
+		m.sp(voice.Normal, "Отключено "+d.GetReadableModel())
 	}
 }
-
-func (m *Manager) EnteringDFUMode(device interface{}) {
-	if m.config.Enabled {
-		m.speak("Переход в режим восстановления для " + voiceName(device))
+func (m *Manager) EnteringDFUMode(d *device.Device) {
+	m.sp(voice.High, "Переход в режим восстановления для "+d.GetReadableModel())
+}
+func (m *Manager) DFUModeEntered(d *device.Device) {
+	m.sp(voice.High, d.GetReadableModel()+" в режиме восстановления. Готово к прошивке.")
+}
+func (m *Manager) StartingRestore(d *device.Device) {
+	m.sp(voice.High, "Начинается прошивка "+d.GetReadableModel())
+}
+func (m *Manager) RestoreProgress(d *device.Device, status string) {
+	if m.debounceLow() {
+		m.sp(voice.Low, d.GetReadableModel()+". "+status)
 	}
 }
-
-func (m *Manager) DFUModeEntered(device interface{}) {
-	if m.config.Enabled {
-		m.speak(voiceName(device) + " перешло в режим восстановления. Готово к прошивке.")
-	}
+func (m *Manager) RestoreCompleted(d *device.Device) {
+	m.sp(voice.High, "Прошивка завершена для "+d.GetReadableModel())
 }
-
-func (m *Manager) StartingRestore(device interface{}) {
-	if m.config.Enabled {
-		m.speak("Начинается прошивка устройства " + voiceName(device) + ".")
-	}
+func (m *Manager) RestoreFailed(d *device.Device, err string) {
+	m.sp(voice.High, "Ошибка прошивки "+d.GetReadableModel()+". "+err)
 }
-
-func (m *Manager) RestoreProgress(device interface{}, status string) {
-	if m.config.Enabled && m.canNotify() {
-		m.speak(voiceName(device) + ". " + status)
-	}
-}
-
-func (m *Manager) RestoreCompleted(device interface{}) {
-	if m.config.Enabled {
-		m.speak("Прошивка успешно завершена для " + voiceName(device))
-	}
-}
-
-func (m *Manager) RestoreFailed(device interface{}, err string) {
-	if m.config.Enabled {
-		m.speak("Ошибка прошивки " + voiceName(device) + ". " + m.simplifyError(err))
-	}
-}
-
 func (m *Manager) SystemStarted() {
-	if m.config.Enabled {
-		m.speak("Мак Провижнер запущен и готов к работе.")
-	}
+	m.sp(voice.System, "Мак Провижнер запущен и готов к работе.")
 }
-
 func (m *Manager) SystemShutdown() {
-	if m.config.Enabled {
-		m.speakImmediate("Мак Провижнер завершает работу. До свидания!")
+	m.sp(voice.System, "Мак Провижнер завершает работу. До свидания!")
+}
+func (m *Manager) Error(msg string) {
+	m.sp(voice.System, "Системная ошибка. "+msg)
+}
+func (m *Manager) ManualDFURequired(d *device.Device) {
+	m.sp(voice.High, "Для "+d.GetReadableModel()+" нужен ручной DFU.")
+}
+func (m *Manager) WaitingForDFU(d *device.Device) {
+	m.sp(voice.Normal, "Ожидается DFU от "+d.GetReadableModel())
+}
+func (m *Manager) DeviceReady(d *device.Device) {
+	if m.debounceLow() {
+		m.sp(voice.Normal, d.GetReadableModel()+" готов к работе.")
 	}
 }
 
-func (m *Manager) Error(errMsg string) {
-	if m.config.Enabled {
-		m.speak("Системная ошибка. " + m.simplifyError(errMsg))
+/*─────────────────────────────────────────────────────────
+	             ХЕЛПЕРЫ
+─────────────────────────────────────────────────────────*/
+
+func (m *Manager) sp(pr voice.Priority, txt string) {
+	if !m.cfg.Enabled {
+		return
 	}
+	m.voice.Speak(pr, txt)
 }
 
-func (m *Manager) ManualDFURequired(device interface{}) {
-	if m.config.Enabled {
-		m.speak("Для " + voiceName(device) + " требуется ручной переход в режим восстановления.")
-	}
-}
-
-func (m *Manager) WaitingForDFU(device interface{}) {
-	if m.config.Enabled {
-		m.speak("Ожидание перехода " + voiceName(device) + " в режим восстановления.")
-	}
-}
-
-func (m *Manager) DeviceReady(device interface{}) {
-	if m.config.Enabled && m.canNotify() {
-		m.speak(voiceName(device) + " готово к работе.")
-	}
-}
-
-/*──────────────────────────────────────────────────────────
-  Реализация очереди TTS
-  ──────────────────────────────────────────────────────────*/
-
-func (m *Manager) speak(msg string) {
-	select {
-	case m.speechQueue <- msg:
-	default:
-		fmt.Printf("⚠️  Очередь голосовых сообщений переполнена, пропуск. %s\n", msg)
-	}
-}
-
-func (m *Manager) speakImmediate(msg string) {
-	m.speechMutex.Lock()
-	defer m.speechMutex.Unlock()
-	m.executeSpeech(msg)
-}
-
-func (m *Manager) processSpeechQueue() {
-	for msg := range m.speechQueue {
-		m.speechMutex.Lock()
-		m.isPlaying = true
-
-		m.executeSpeech(msg)
-
-		m.isPlaying = false
-		m.speechMutex.Unlock()
-		time.Sleep(500 * time.Millisecond)
-	}
-}
-
-func (m *Manager) executeSpeech(msg string) {
-	if m.config.Volume != 1.0 {
-		_ = exec.Command("osascript", "-e",
-			fmt.Sprintf("set volume output volume %d", int(m.config.Volume*100))).Run()
-	}
-	args := []string{"-v", m.config.Voice, "-r", strconv.Itoa(m.config.Rate), msg}
-	if err := exec.Command("say", args...).Run(); err != nil {
-		fmt.Printf("⚠️  say error: %v\n", err)
-	}
-}
-
-/*──────────────────────────────────────────────────────────
-  Хелперы
-  ──────────────────────────────────────────────────────────*/
-
-func (m *Manager) canNotify() bool {
+func (m *Manager) debounceLow() bool {
 	now := time.Now()
-	if now.Sub(m.lastNotification) < m.minInterval {
+	if now.Sub(m.lastLowPriority) < m.minInterval {
 		return false
 	}
-	m.lastNotification = now
+	m.lastLowPriority = now
 	return true
 }
 
-func voiceName(obj interface{}) string {
-	// Предпочитаем «читабельную модель» без ECID
-	if d, ok := obj.(interface{ GetReadableModel() string }); ok {
-		return d.GetReadableModel()
-	}
-	if d, ok := obj.(interface{ GetFriendlyName() string }); ok {
-		return d.GetFriendlyName()
-	}
-	return "устройство"
-}
-
-func (m *Manager) simplifyError(err string) string {
-	l := strings.ToLower(err)
-	switch {
-	case strings.Contains(l, "timeout"):
-		return "превышено время ожидания"
-	case strings.Contains(l, "dfu"):
-		return "ошибка режима восстановления"
-	case strings.Contains(l, "restore"):
-		return "ошибка процесса восстановления"
-	case strings.Contains(l, "connect"):
-		return "ошибка подключения"
-	case strings.Contains(l, "permission"), strings.Contains(l, "access"):
-		return "ошибка доступа"
-	}
-	words := strings.Fields(err)
-	if len(words) > 5 {
-		return strings.Join(words[:5], " ")
-	}
-	return err
-}
-
-/*──────────────────────────────────────────────────────────
-  Разное / утилиты
-  ──────────────────────────────────────────────────────────*/
-
-func (m *Manager) IsPlaying() bool {
-	m.speechMutex.Lock()
-	defer m.speechMutex.Unlock()
-	return m.isPlaying
-}
-
-func (m *Manager) ClearQueue() {
-	for {
-		select {
-		case <-m.speechQueue:
-		default:
-			return
-		}
-	}
-}
-
-func (m *Manager) StopAll() {
-	_ = exec.Command("killall", "say").Run()
-	m.ClearQueue()
-}
+/*─────────────────────────────────────────────────────────
+	         ALERT / SUCCESS  (звук-колокольчики)
+─────────────────────────────────────────────────────────*/
 
 func (m *Manager) PlayAlert() {
-	if m.config.Enabled {
+	if m.cfg.Enabled {
 		go exec.Command("afplay", "/System/Library/Sounds/Sosumi.aiff").Run()
 	}
 }
-
 func (m *Manager) PlaySuccess() {
-	if m.config.Enabled {
+	if m.cfg.Enabled {
 		go exec.Command("afplay", "/System/Library/Sounds/Glass.aiff").Run()
 	}
-}
-
-func (m *Manager) TestVoice() {
-	m.speakImmediate("Тест голоса Мак Провижнер.")
-}
-
-func (m *Manager) GetAvailableVoices() ([]string, error) {
-	out, err := exec.Command("say", "-v", "?").Output()
-	if err != nil {
-		return nil, err
-	}
-	lines := strings.Split(string(out), "\n")
-	var voices []string
-	for _, l := range lines {
-		if strings.TrimSpace(l) == "" {
-			continue
-		}
-		parts := strings.Fields(l)
-		if len(parts) > 0 {
-			voices = append(voices, parts[0])
-		}
-	}
-	return voices, nil
 }

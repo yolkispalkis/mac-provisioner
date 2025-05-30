@@ -15,59 +15,65 @@ import (
 	"mac-provisioner/internal/dfu"
 	"mac-provisioner/internal/notification"
 	"mac-provisioner/internal/provisioner"
+	"mac-provisioner/internal/voice"
 )
 
 /*
 ──────────────────────────────────────────────────────────
 
-	Debug-флаг для периодического списка устройств
+	DEBUG: периодический вывод подключённых устройств
 
 ──────────────────────────────────────────────────────────
 */
 var showDeviceList = os.Getenv("MAC_PROV_DEBUG") == "1"
 
 func main() {
-	log.Println("🚀 Запуск Mac Provisioner...")
+	log.Println("🚀 Запуск Mac Provisioner…")
 
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("❌ Ошибка загрузки конфигурации: %v", err)
+		log.Fatalf("❌ Ошибка конфигурации: %v", err)
 	}
-	log.Printf("⚙️  Интервал проверки устройств: %v  |  Голос уведомлений: %s",
-		cfg.Monitoring.CheckInterval, cfg.Notifications.Voice)
+
+	// Voice-движок
+	voiceEng := voice.New(voice.Config{
+		Voice:  cfg.Notifications.Voice,
+		Rate:   cfg.Notifications.Rate,
+		Volume: cfg.Notifications.Volume,
+	})
+	defer voiceEng.Shutdown()
+
+	// Core компоненты
+	notifier := notification.New(cfg.Notifications, voiceEng)
+	dfuMgr := dfu.New()
+	devMon := device.NewMonitor(cfg.Monitoring)
+	provMgr := provisioner.New(dfuMgr, notifier, voiceEng)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Ctrl-C / kill
+	// Graceful-shutdown: Ctrl+C / kill
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Core
-	notifier := notification.New(cfg.Notifications)
-	dfuMgr := dfu.New()
-	devMon := device.NewMonitor(cfg.Monitoring)
-	provMgr := provisioner.New(dfuMgr, notifier)
 
 	notifier.SystemStarted()
 
 	if err := devMon.Start(ctx); err != nil {
-		log.Fatalf("❌ Не удалось запустить монитор устройств: %v", err)
+		log.Fatalf("❌ Не запустился монитор устройств: %v", err)
 	}
 
 	go handleDeviceEvents(ctx, devMon, provMgr, notifier, dfuMgr)
 
-	// Периодический вывод устройств только при MAC_PROV_DEBUG=1
 	if showDeviceList {
 		go debugConnectedDevices(ctx, devMon, 30*time.Second)
 	}
 
-	log.Println("✅ Mac Provisioner запущен. Нажмите Ctrl+C для выхода.")
-	log.Println("🔌 Подключите Mac через USB-C для автоматической прошивки...")
+	log.Println("✅ Mac Provisioner готов. Нажмите Ctrl+C для выхода.")
+	log.Println("🔌 Подключите Mac через USB-C для автоматической прошивки…")
 
 	<-sigChan
 
-	// graceful-shutdown
-	log.Println("🛑 Завершение работы...")
+	// graceful exit
+	log.Println("🛑 Завершение работы…")
 	notifier.SystemShutdown()
 	cancel()
 	devMon.Stop()
@@ -78,7 +84,7 @@ func main() {
 /*
 ──────────────────────────────────────────────────────────
 
-	Device events
+	Device-events routing
 
 ──────────────────────────────────────────────────────────
 */
@@ -126,29 +132,20 @@ func onConnected(
 ) {
 	// === DFU-устройство ===
 	if dev.IsDFU && dev.ECID != "" {
-		// DFU-mode – готово к прошивке
 		if strings.EqualFold(dev.State, "DFU") {
 			notif.DeviceDetected(dev)
 			go prov.ProcessDevice(ctx, dev)
 			return
 		}
-
-		// Recovery-mode – нужно перевести в DFU
 		if strings.EqualFold(dev.State, "Recovery") {
-			if prov.IsProcessingUSB(dev.USBLocation) {
-				return
-			}
 			notif.DeviceDetected(dev)
 			enterDFUFlow(ctx, dev, notif, dfuMgr)
 			return
 		}
 	}
 
-	// === Живой Mac (Normal) ===
+	// === Normal-Mac ===
 	if dev.IsNormalMac() {
-		if prov.IsProcessingUSB(dev.USBLocation) {
-			return
-		}
 		enterDFUFlow(ctx, dev, notif, dfuMgr)
 	}
 }
@@ -160,28 +157,22 @@ func onStateChanged(
 	notif *notification.Manager,
 	dfuMgr *dfu.Manager,
 ) {
-	// Перешёл в DFU → можно шить
 	if dev.IsDFU && dev.ECID != "" && strings.EqualFold(dev.State, "DFU") {
 		notif.DFUModeEntered(dev)
 		go prov.ProcessDevice(ctx, dev)
 		return
 	}
-
-	// Перешёл в Recovery → снова просим DFU
 	if dev.IsDFU && dev.ECID != "" && strings.EqualFold(dev.State, "Recovery") {
 		enterDFUFlow(ctx, dev, notif, dfuMgr)
 		return
 	}
-
-	// Вернулся в Normal
 	if dev.IsNormalMac() {
 		notif.DeviceReady(dev)
 	}
 }
 
 /*
-enterDFUFlow – общая функция для Normal-Mac и Recovery:
-пытаемся автоматом через macvdmtool, иначе просим вручную.
+enterDFUFlow — общая функция для Normal-Mac и Recovery.
 */
 func enterDFUFlow(
 	ctx context.Context,
@@ -209,7 +200,7 @@ func enterDFUFlow(
 /*
 ──────────────────────────────────────────────────────────
 
-	Debug device list
+	Debug: список устройств
 
 ──────────────────────────────────────────────────────────
 */
@@ -234,21 +225,21 @@ func debugConnectedDevices(
 				log.Println("🔍 Устройств не обнаружено.")
 				continue
 			}
-			dfuCount, normalCount := 0, 0
+			dfuCnt, normCnt := 0, 0
 			for _, d := range list {
 				if d.IsDFU {
-					dfuCount++
+					dfuCnt++
 				} else {
-					normalCount++
+					normCnt++
 				}
 			}
-			log.Printf("🔍 Подключено: %d DFU + %d Normal", dfuCount, normalCount)
+			log.Printf("🔍 Подключено: %d DFU + %d Normal", dfuCnt, normCnt)
 
 			for i, d := range list {
 				if d.IsDFU {
-					log.Printf("  %d. DFU: %s (State:%s)", i+1, d.GetFriendlyName(), d.State)
+					log.Printf("  %d. DFU: %s (%s)", i+1, d.GetFriendlyName(), d.State)
 				} else {
-					log.Printf("  %d. MAC: %s (USB:%s, State:%s)",
+					log.Printf("  %d. MAC: %s (USB:%s, %s)",
 						i+1, d.GetFriendlyName(),
 						strings.TrimPrefix(d.USBLocation, "0x"),
 						d.State)

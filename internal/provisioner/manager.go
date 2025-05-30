@@ -10,103 +10,66 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"mac-provisioner/internal/device"
 	"mac-provisioner/internal/dfu"
 	"mac-provisioner/internal/notification"
+	"mac-provisioner/internal/voice"
 )
 
-/*─────────────────────────────────────────────────────────
-                         melodyPlayer
-─────────────────────────────────────────────────────────*/
+/*
+──────────────────────────────────────────────────────────
 
-type melodyPlayer struct {
-	mu   sync.Mutex
-	cmd  *exec.Cmd
-	ctx  context.Context
-	stop context.CancelFunc
-}
+	STRUCT
 
-func newMelodyPlayer(parent context.Context, file string) *melodyPlayer {
-	ctx, cancel := context.WithCancel(parent)
-	p := &melodyPlayer{ctx: ctx, stop: cancel}
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				cmd := exec.CommandContext(ctx, "afplay", file)
-				p.mu.Lock()
-				p.cmd = cmd
-				p.mu.Unlock()
-				_ = cmd.Run() // когда файл закончится – перезапустим
-			}
-		}
-	}()
-	return p
-}
-
-func (p *melodyPlayer) Pause() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.cmd != nil && p.cmd.Process != nil {
-		_ = p.cmd.Process.Signal(syscall.SIGSTOP)
-	}
-}
-
-func (p *melodyPlayer) Resume() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.cmd != nil && p.cmd.Process != nil {
-		_ = p.cmd.Process.Signal(syscall.SIGCONT)
-	}
-}
-
-func (p *melodyPlayer) Stop() { p.stop() }
-
-/*─────────────────────────────────────────────────────────
-                          Manager
-─────────────────────────────────────────────────────────*/
-
+──────────────────────────────────────────────────────────
+*/
 type Manager struct {
-	dfuManager *dfu.Manager
-	notifier   *notification.Manager
+	dfuMgr *dfu.Manager
+	notif  *notification.Manager
+	voice  *voice.Engine
 
-	processing    map[string]bool // Device.UniqueID()
-	processingUSB map[string]bool // USB-порт
-	processingMu  sync.RWMutex
+	processing    map[string]bool // UID → true
+	processingUSB map[string]bool // USB-порт → true
+	mu            sync.RWMutex
 }
 
-func New(dfuMgr *dfu.Manager, notifier *notification.Manager) *Manager {
+func New(dfuMgr *dfu.Manager, n *notification.Manager, v *voice.Engine) *Manager {
 	return &Manager{
-		dfuManager:    dfuMgr,
-		notifier:      notifier,
-		processing:    make(map[string]bool),
-		processingUSB: make(map[string]bool),
+		dfuMgr:        dfuMgr,
+		notif:         n,
+		voice:         v,
+		processing:    map[string]bool{},
+		processingUSB: map[string]bool{},
 	}
 }
 
-/*─────────────────────────────────────────────────────────
-                       PUBLIC API
-─────────────────────────────────────────────────────────*/
+/*
+──────────────────────────────────────────────────────────
+                          PUBLIC API
+──────────────────────────────────────────────────────────
+*/
 
-func (m *Manager) IsProcessingUSB(loc string) bool {
-	m.processingMu.RLock()
-	defer m.processingMu.RUnlock()
-	return loc != "" && m.processingUSB[loc]
+// Занят ли USB-порт активной прошивкой?
+func (m *Manager) IsProcessingUSB(port string) bool {
+	if port == "" {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.processingUSB[port]
 }
 
 func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	uid := dev.UniqueID()
 
-	// блокируем повторную обработку
-	m.processingMu.Lock()
+	//----------------------------------------------------
+	// 1) блокируем повторное прохождение того же UID
+	//----------------------------------------------------
+	m.mu.Lock()
 	if m.processing[uid] {
-		m.processingMu.Unlock()
+		m.mu.Unlock()
 		log.Printf("ℹ️ Уже обрабатывается: %s", dev.GetFriendlyName())
 		return
 	}
@@ -114,107 +77,108 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	if dev.USBLocation != "" {
 		m.processingUSB[dev.USBLocation] = true
 	}
-	m.processingMu.Unlock()
+	m.mu.Unlock()
 
+	// по завершении снимаем отметки
 	defer func() {
-		m.processingMu.Lock()
+		m.mu.Lock()
 		delete(m.processing, uid)
 		if dev.USBLocation != "" {
 			delete(m.processingUSB, dev.USBLocation)
 		}
-		m.processingMu.Unlock()
+		m.mu.Unlock()
 	}()
 
-	// ───────────────────────────────────────────────
-
+	//----------------------------------------------------
+	// 2) базовые проверки
+	//----------------------------------------------------
 	if !dev.IsDFU || dev.ECID == "" {
-		m.notifier.RestoreFailed(dev, "устройство не в DFU или нет ECID")
+		m.notif.RestoreFailed(dev, "устройство не в DFU или нет ECID")
 		return
 	}
-
 	decECID, err := normalizeECIDForCfgutil(dev.ECID)
 	if err != nil {
-		m.notifier.RestoreFailed(dev, "неверный формат ECID")
+		m.notif.RestoreFailed(dev, "неверный формат ECID")
 		return
 	}
 
-	// фоновая мелодия + периодические объявления
-	player := newMelodyPlayer(ctx, "/System/Library/Sounds/Submarine.aiff")
-	defer player.Stop()
+	//----------------------------------------------------
+	// 3) фон + голос
+	//----------------------------------------------------
+	m.voice.MelodyOn()
+	defer m.voice.MelodyOff()
 
-	m.speakWithMelody(player, func() { m.notifier.StartingRestore(dev) })
+	m.notif.StartingRestore(dev)
 
-	auxDone := make(chan struct{})
-	go m.announceLoop(ctx, auxDone, player, dev)
+	// Периодический анонс «идет прошивка…»
+	annDone := make(chan struct{})
+	go m.announceLoop(ctx, annDone, dev)
 
-	// ───────────────────────────────────────────────
-	// cfgutil --format JSON restore
-	// ───────────────────────────────────────────────
+	//----------------------------------------------------
+	// 4) cfgutil --format JSON restore
+	//----------------------------------------------------
 	restoreCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 
 	cmd := exec.CommandContext(restoreCtx,
-		"cfgutil", "--ecid", decECID, "--format", "JSON", "restore",
-	)
+		"cfgutil", "--ecid", decECID, "--format", "JSON", "restore")
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 
 	runErr := cmd.Run()
-	close(auxDone) // стоп анонсов
+	close(annDone) // останавливаем анонсы
 
 	if runErr != nil {
-		m.speakWithMelody(player, func() {
-			msg := "не удалось запустить cfgutil"
-			if restoreCtx.Err() == context.DeadlineExceeded {
-				msg = "таймаут cfgutil restore"
-			}
-			m.notifier.RestoreFailed(dev, msg)
-		})
+		msg := "не удалось запустить cfgutil"
+		if restoreCtx.Err() == context.DeadlineExceeded {
+			msg = "таймаут cfgutil restore"
+		}
+		log.Printf("⚠️ cfgutil error: %v ‑ %s", runErr, stderr.String())
+		m.notif.RestoreFailed(dev, msg)
 		return
 	}
 
 	line := strings.TrimSpace(stdout.String())
+	if line == "" {
+		m.notif.RestoreFailed(dev, "пустой ответ cfgutil")
+		return
+	}
+
 	var resp cfgutilJSON
 	if err := json.Unmarshal([]byte(line), &resp); err != nil {
-		m.speakWithMelody(player, func() {
-			m.notifier.RestoreFailed(dev, "некорректный ответ cfgutil")
-		})
+		log.Printf("⚠️ bad cfgutil JSON: %v\n%s", err, line)
+		m.notif.RestoreFailed(dev, "некорректный ответ cfgutil")
 		return
 	}
 
 	switch resp.Type {
 	case "CommandOutput":
-		m.speakWithMelody(player, func() { m.notifier.RestoreCompleted(dev) })
+		log.Printf("🎉 Прошивка успешна: %s", dev.GetFriendlyName())
+		m.notif.RestoreCompleted(dev)
 
 	case "Error":
 		human := mapRestoreErrorCode(strconv.Itoa(resp.Code))
 		if human == "" {
 			human = resp.Message
 		}
-		m.speakWithMelody(player, func() { m.notifier.RestoreFailed(dev, human) })
+		m.notif.RestoreFailed(dev, human)
+		log.Printf("❌ cfgutil Error (%d): %s", resp.Code, resp.Message)
 
 	default:
-		m.speakWithMelody(player, func() { m.notifier.RestoreFailed(dev, "неизвестный ответ cfgutil") })
+		m.notif.RestoreFailed(dev, "неизвестный ответ cfgutil")
+		log.Printf("⚠️ неизвестный JSON-тип %q", resp.Type)
 	}
 }
 
-/*─────────────────────────────────────────────────────────
-                 Melody ↔ Speech кооперация
-─────────────────────────────────────────────────────────*/
+/*
+──────────────────────────────────────────────────────────
 
-func (m *Manager) speakWithMelody(mp *melodyPlayer, speakFn func()) {
-	mp.Pause()
-	speakFn()
-	for m.notifier.IsPlaying() {
-		time.Sleep(150 * time.Millisecond)
-	}
-	mp.Resume()
-}
+	Periodic “in-progress” voice announcements
 
-func (m *Manager) announceLoop(ctx context.Context, done <-chan struct{},
-	mp *melodyPlayer, dev *device.Device) {
-
+──────────────────────────────────────────────────────────
+*/
+func (m *Manager) announceLoop(ctx context.Context, done <-chan struct{}, dev *device.Device) {
 	t := time.NewTicker(15 * time.Second)
 	defer t.Stop()
 
@@ -226,36 +190,38 @@ func (m *Manager) announceLoop(ctx context.Context, done <-chan struct{},
 			return
 		case <-t.C:
 			port := strings.TrimPrefix(dev.USBLocation, "0x")
-			msg := fmt.Sprintf("идёт прошивка %s, порт %s",
-				dev.GetReadableModel(), port)
-			m.speakWithMelody(mp, func() { m.notifier.RestoreProgress(dev, msg) })
+			msg := fmt.Sprintf("идёт прошивка, порт %s", port)
+			m.notif.RestoreProgress(dev, msg)
 		}
 	}
 }
 
-/*─────────────────────────────────────────────────────────
-                   cfgutil JSON ответ
-─────────────────────────────────────────────────────────*/
+/*
+──────────────────────────────────────────────────────────
 
+	cfgutil JSON → struct
+
+──────────────────────────────────────────────────────────
+*/
 type cfgutilJSON struct {
-	Type    string `json:"Type"`
-	Message string `json:"Message,omitempty"`
+	Type    string `json:"Type"`              // "CommandOutput" | "Error"
+	Message string `json:"Message,omitempty"` // при ошибке
 	Code    int    `json:"Code,omitempty"`
-
-	Command string   `json:"Command,omitempty"`
-	Devices []string `json:"Devices,omitempty"`
 }
 
-/*─────────────────────────────────────────────────────────
-             mapRestoreErrorCode (как раньше)
-─────────────────────────────────────────────────────────*/
+/*
+──────────────────────────────────────────────────────────
 
-func mapRestoreErrorCode(codeStr string) string {
-	switch codeStr {
+	error-code → человекочитаемый текст
+
+──────────────────────────────────────────────────────────
+*/
+func mapRestoreErrorCode(code string) string {
+	switch code {
 	case "21":
 		return "ошибка восстановления (код 21)"
 	case "9":
-		return "устройство неожиданно отключилось (код 9)"
+		return "устройство отключилось (код 9)"
 	case "40":
 		return "не удалось прошить (код 40)"
 	case "14":
@@ -265,17 +231,20 @@ func mapRestoreErrorCode(codeStr string) string {
 	}
 }
 
-/*─────────────────────────────────────────────────────────
-             ECID helpers (без изменений)
-─────────────────────────────────────────────────────────*/
+/*
+──────────────────────────────────────────────────────────
 
-func hexToDec(hexStr string) (string, error) {
-	clean := strings.TrimPrefix(strings.ToLower(hexStr), "0x")
-	val, err := strconv.ParseUint(clean, 16, 64)
+	ECID helpers
+
+──────────────────────────────────────────────────────────
+*/
+func hexToDec(h string) (string, error) {
+	clean := strings.TrimPrefix(strings.ToLower(h), "0x")
+	v, err := strconv.ParseUint(clean, 16, 64)
 	if err != nil {
-		return "", fmt.Errorf("парсинг HEX '%s': %w", hexStr, err)
+		return "", fmt.Errorf("hex→dec: %w", err)
 	}
-	return strconv.FormatUint(val, 10), nil
+	return strconv.FormatUint(v, 10), nil
 }
 func isDigits(s string) bool {
 	if s == "" {
@@ -295,8 +264,5 @@ func normalizeECIDForCfgutil(ecid string) (string, error) {
 	if isDigits(ecid) {
 		return ecid, nil
 	}
-	if strings.HasPrefix(strings.ToLower(ecid), "0x") || !isDigits(ecid) {
-		return hexToDec(ecid)
-	}
-	return "", fmt.Errorf("неизвестный формат ECID: %s", ecid)
+	return hexToDec(ecid)
 }

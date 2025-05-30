@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,7 +28,26 @@ const (
 	dfuModePIDAS_DFUManager      = "0x1281"
 	recoveryModePIDAS_DFUManager = "0x1280"
 	dfuModePIDIntelT2_DFUManager = "0x1227"
+
+	// сигнал для внешней логики – когда авто-DFU невозможен
+	errAutoDFUUnavailable = "macvdmtool недоступен, автоматический вход в DFU невозможен"
 )
+
+/*
+DFU-порт: список root-портов (0-based), с которых реально
+удаётся отправить команду macvdmtool dfu. При необходимости
+добавьте/уберите номера.
+*/
+var allowedDFUPorts = map[int]struct{}{
+	0: {}, // «порт 0»  → nibble = 1
+	1: {}, // «порт 1»  → nibble = 2
+}
+
+/*
+   ──────────────────────────────────────────────────────────
+   JSON типов system_profiler (сокращённые)
+   ──────────────────────────────────────────────────────────
+*/
 
 type SPUSBItem_DFUManager struct {
 	Name         string                 `json:"_name"`
@@ -101,16 +121,39 @@ type Manager struct{}
 func New() *Manager { return &Manager{} }
 
 /*
-ВАЖНО: метод теперь принимает usbLocation (ID физического порта),
-а не SerialNumber. Если usbLocation неизвестен – передайте пустую
-строку, лог всё равно будет корректным.
+EnterDFUMode инициирует переход в DFU:
+
+  - проверяем, что устройство воткнуто в «разрешённый» порт;
+  - проверяем наличие macvdmtool;
+  - одна попытка macvdmtool dfu (без sudo);
+  - при любой ошибке возвращаем errAutoDFUUnavailable.
 */
 func (m *Manager) EnterDFUMode(ctx context.Context, usbLocation string) error {
-	if m.hasMacvdmtool() {
-		return m.enterDFUWithMacvdmtool(ctx, usbLocation)
+	// 0. Кабель не в DFU-порту → сразу отказ.
+	if !m.isAllowedDFUPort(usbLocation) {
+		log.Printf("⚠️  Порт %s не является DFU-портом ‒ автоматический DFU пропущен.", usbLocation)
+		return fmt.Errorf(errAutoDFUUnavailable)
 	}
-	return fmt.Errorf("macvdmtool недоступен, автоматический вход в DFU невозможен")
+
+	// 1. macvdmtool отсутствует
+	if !m.hasMacvdmtool() {
+		return fmt.Errorf(errAutoDFUUnavailable)
+	}
+
+	// 2. macvdmtool есть, пробуем
+	if err := m.enterDFUWithMacvdmtool(ctx, usbLocation); err != nil {
+		log.Printf("⚠️  macvdmtool dfu завершился ошибкой: %v", err)
+		return fmt.Errorf(errAutoDFUUnavailable)
+	}
+
+	return nil
 }
+
+/*
+   ──────────────────────────────────────────────────────────
+   PRIVATE HELPERs
+   ──────────────────────────────────────────────────────────
+*/
 
 func (m *Manager) hasMacvdmtool() bool {
 	_, err := exec.LookPath("macvdmtool")
@@ -118,34 +161,66 @@ func (m *Manager) hasMacvdmtool() bool {
 }
 
 func (m *Manager) enterDFUWithMacvdmtool(ctx context.Context, usbLocation string) error {
-	log.Printf("ℹ️ macvdmtool dfu → инициируем переход в DFU (USB %s)…", usbLocation)
+	log.Printf("ℹ️  macvdmtool dfu → инициируем переход в DFU (USB %s)…", usbLocation)
 
-	cmd := exec.CommandContext(ctx, "macvdmtool", "dfu")
-	if err := cmd.Run(); err != nil {
-		log.Printf("⚠️ macvdmtool dfu без sudo не удался: %v. Пробуем sudo -n…", err)
-		if errSudo := exec.CommandContext(ctx, "sudo", "-n", "macvdmtool", "dfu").Run(); errSudo != nil {
-			return fmt.Errorf("macvdmtool failed: %v; sudo macvdmtool failed: %v", err, errSudo)
-		}
+	if err := exec.CommandContext(ctx, "macvdmtool", "dfu").Run(); err != nil {
+		return err
 	}
 
-	log.Println("ℹ️ Команда отправлена. Ожидаем появление DFU-устройства…")
+	log.Println("ℹ️  Команда отправлена. Ожидаем появление DFU-устройства…")
 	return m.WaitForDFUMode(ctx, usbLocation, 2*time.Minute)
 }
 
-func (m *Manager) OfferManualDFU(portHint string) {
-	log.Printf(`
-🔧 РУЧНОЙ DFU
-
-Устройство на порту %s не удалось перевести автоматически.
-Следуйте инструкции, чтобы ввести Mac в DFU/Recovery, затем 
-программа продолжит работу автоматически.
-`, portHint)
+/*
+isAllowedDFUPort — проверяет root-порт Location ID.
+Возвращает true, если он содержится в allowedDFUPorts.
+*/
+func (m *Manager) isAllowedDFUPort(loc string) bool {
+	port := rootPortFromLocation(loc)
+	_, ok := allowedDFUPorts[port]
+	return ok
 }
 
 /*
-WaitForDFUMode ждёт, пока появится ≥1 DFU-девайс.
-purposeHint – произвольная строка, выводится в логах.
+rootPortFromLocation извлекает номер root-порта (0-based) из Location ID.
+Если вычислить не удалось ‒ возвращает −1.
 */
+func rootPortFromLocation(loc string) int {
+	if loc == "" {
+		return -1
+	}
+	base := strings.Split(loc, "/")[0]
+	base = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(base), "0x"))
+
+	if base == "" {
+		return -1
+	}
+	if len(base) < 8 {
+		base = strings.Repeat("0", 8-len(base)) + base
+	} else if len(base) > 8 {
+		base = base[len(base)-8:]
+	}
+
+	for i := 0; i < len(base); i++ {
+		ch := base[i]
+		if ch == '0' {
+			continue
+		}
+		val, err := strconv.ParseInt(string(ch), 16, 0)
+		if err != nil {
+			return -1
+		}
+		return int(val) - 1 // nibble = port+1
+	}
+	return -1
+}
+
+/*
+   ──────────────────────────────────────────────────────────
+   WaitForDFUMode & USB-сканирование (без изменений)
+   ──────────────────────────────────────────────────────────
+*/
+
 func (m *Manager) WaitForDFUMode(ctx context.Context, purposeHint string, timeout time.Duration) error {
 	log.Printf("⏳ Ждём DFU (%s), таймаут %v…", purposeHint, timeout)
 
@@ -172,12 +247,6 @@ func (m *Manager) WaitForDFUMode(ctx context.Context, purposeHint string, timeou
 func (m *Manager) isInDFUMode(ctx context.Context) bool {
 	return len(m.GetDFUDevices(ctx)) > 0
 }
-
-/*
-   ──────────────────────────────────────────────────────────
-   Сканирование USB
-   ──────────────────────────────────────────────────────────
-*/
 
 func (m *Manager) GetDFUDevices(ctx context.Context) []*device.Device {
 	cmd := exec.CommandContext(ctx, "system_profiler", "SPUSBDataType", "-json")
@@ -246,4 +315,14 @@ func (m *Manager) GetFirstDFUECID(ctx context.Context) string {
 		return devs[0].ECID
 	}
 	return ""
+}
+
+func (m *Manager) OfferManualDFU(portHint string) {
+	log.Printf(`
+🔧 РУЧНОЙ DFU
+
+Устройство на порту %s не удалось перевести автоматически.
+Следуйте инструкции, чтобы ввести Mac в DFU/Recovery; после
+этого программа продолжит работу сама.
+`, portHint)
 }

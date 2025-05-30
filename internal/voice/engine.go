@@ -4,21 +4,21 @@ import (
 	"context"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
 
 /*
-VoiceEngine — единый движок озвучки и фоновой мелодии.
-Теперь БЕЗ регулировки громкости.
+Использование:
 
 	v := voice.New(voice.Config{Voice:"Milena", Rate:200})
 	v.MelodyOn()
 	v.Speak(voice.Normal, "Текст")
-	…
 	v.Shutdown()
 */
+
 type Priority int
 
 const (
@@ -28,13 +28,18 @@ const (
 	Low                    // может быть отброшен
 )
 
+/*------------------------------------------------------------------*/
+
 type Config struct {
 	Voice        string
 	Rate         int
-	MaxQueue     int
-	DebounceSame time.Duration
+	MaxQueue     int           // ёмкость канала
+	DebounceSame time.Duration // анти-спам для одинаковых фраз
+	MergeWindow  time.Duration // «склейка» сообщений < MergeWindow
+	MinInterval  time.Duration // пауза между say-процессами
 }
 
+// message во внутренней очереди
 type message struct {
 	txt string
 	pr  Priority
@@ -44,10 +49,13 @@ type message struct {
 /*------------------------------------------------------------------*/
 
 type Engine struct {
-	cfg        Config
-	queue      chan message
-	lastSpoken map[string]time.Time
+	cfg Config
+
+	queue chan message
+
 	mu         sync.Mutex
+	lastSpoken map[string]time.Time // anti-spam
+	lastSay    time.Time            // когда запустился предыдущий say
 
 	melodyCmd *exec.Cmd
 	ctx       context.Context
@@ -55,14 +63,22 @@ type Engine struct {
 }
 
 func New(c Config) *Engine {
+	// значения по-умолчанию
 	if c.MaxQueue == 0 {
-		c.MaxQueue = 30
+		c.MaxQueue = 50
 	}
 	if c.DebounceSame == 0 {
 		c.DebounceSame = 2 * time.Second
 	}
+	if c.MergeWindow == 0 {
+		c.MergeWindow = 120 * time.Millisecond
+	}
+	if c.MinInterval == 0 {
+		c.MinInterval = 300 * time.Millisecond
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+
 	e := &Engine{
 		cfg:        c,
 		queue:      make(chan message, c.MaxQueue),
@@ -70,43 +86,48 @@ func New(c Config) *Engine {
 		ctx:        ctx,
 		cancel:     cancel,
 	}
+
 	go e.runner()
 	return e
 }
 
 /*------------------------------------------------------------------
-	ПУБЛИЧНЫЙ API
+	 PUBLIC API
 ------------------------------------------------------------------*/
 
-func (e *Engine) Shutdown() { e.cancel(); e.stopMelody() }
+func (e *Engine) Shutdown() {
+	e.cancel()
+	e.stopMelody()
+}
 
-// Speak озвучивает текст с заданным приоритетом.
+// Speak – добавить фразу в очередь с приоритетом.
 func (e *Engine) Speak(p Priority, text string) {
 	if text == "" {
 		return
 	}
 
+	// anti-spam: одинаковая фраза не чаще DebounceSame
 	e.mu.Lock()
 	if t, ok := e.lastSpoken[text]; ok && time.Since(t) < e.cfg.DebounceSame {
 		e.mu.Unlock()
-		return // анти-спам
+		return
 	}
 	e.lastSpoken[text] = time.Now()
 	e.mu.Unlock()
 
 	m := message{txt: text, pr: p, t: time.Now()}
+
 	select {
 	case e.queue <- m:
 	default:
-		// если очередь полна
-		if p <= High { // важно → вытолкнём что-то менее важное
+		// очередь заполнена
+		if p <= High { // вытолкнём менее важное
 			<-e.queue
 			e.queue <- m
 		}
 	}
 }
 
-// MelodyOn — запускает цикл afplay, если ещё не запущен.
 func (e *Engine) MelodyOn() {
 	if e.melodyCmd != nil && e.melodyCmd.ProcessState == nil {
 		return // уже играет
@@ -120,11 +141,10 @@ func (e *Engine) MelodyOn() {
 	_ = e.melodyCmd.Start()
 }
 
-// MelodyOff — полностью останавливает фон.
 func (e *Engine) MelodyOff() { e.stopMelody() }
 
 /*------------------------------------------------------------------
-	ВНУТРЕННЯЯ МАШИНА
+	 INTERNAL LOOP
 ------------------------------------------------------------------*/
 
 func (e *Engine) runner() {
@@ -132,16 +152,68 @@ func (e *Engine) runner() {
 		select {
 		case <-e.ctx.Done():
 			return
-		case m := <-e.queue:
+
+		case first := <-e.queue:
+			// Собираем всё, что придёт за MergeWindow
+			buf := []string{first.txt}
+			timeout := time.NewTimer(e.cfg.MergeWindow)
+
+		loop:
+			for {
+				select {
+				case <-e.ctx.Done():
+					timeout.Stop()
+					return
+				case next := <-e.queue:
+					// если System / High – прерываем «приём» и говорим немедленно
+					if next.pr <= High {
+						buf = append(buf, next.txt)
+						break loop
+					}
+					buf = append(buf, next.txt)
+				case <-timeout.C:
+					break loop
+				}
+			}
+
+			// соблюдаем паузу minInterval
+			if delta := time.Since(e.lastSay); delta < e.cfg.MinInterval {
+				time.Sleep(e.cfg.MinInterval - delta)
+			}
+
 			e.pauseMelody()
-			e.say(m.txt)
+			e.runSay(join(buf))
 			e.resumeMelody()
+
+			e.mu.Lock()
+			e.lastSay = time.Now()
+			e.mu.Unlock()
 		}
 	}
 }
 
-func (e *Engine) say(text string) {
-	args := []string{"-v", e.cfg.Voice, "-r", strconv.Itoa(e.cfg.Rate), text}
+/*------------------------------------------------------------------
+	             helpers
+------------------------------------------------------------------*/
+
+func join(parts []string) string {
+	switch len(parts) {
+	case 0:
+		return ""
+	case 1:
+		return parts[0]
+	default:
+		// короткая пауза между склеенными фразами
+		return strings.Join(parts, ". ")
+	}
+}
+
+func (e *Engine) runSay(text string) {
+	args := []string{
+		"-v", e.cfg.Voice,
+		"-r", strconv.Itoa(e.cfg.Rate),
+		text,
+	}
 	_ = exec.CommandContext(e.ctx, "say", args...).Run()
 }
 
@@ -152,6 +224,7 @@ func (e *Engine) say(text string) {
 func (e *Engine) pauseMelody() {
 	if e.melodyCmd != nil && e.melodyCmd.Process != nil {
 		_ = e.melodyCmd.Process.Signal(syscall.SIGSTOP)
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

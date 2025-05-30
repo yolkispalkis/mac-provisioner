@@ -15,7 +15,6 @@ import (
 	"mac-provisioner/internal/dfu"
 	"mac-provisioner/internal/notification"
 	"mac-provisioner/internal/provisioner"
-	"mac-provisioner/internal/stats"
 )
 
 /*
@@ -45,10 +44,9 @@ func main() {
 
 	// Core
 	notifier := notification.New(cfg.Notifications)
-	statsMgr := stats.New()
 	dfuMgr := dfu.New()
 	devMon := device.NewMonitor(cfg.Monitoring)
-	provMgr := provisioner.New(dfuMgr, notifier, statsMgr)
+	provMgr := provisioner.New(dfuMgr, notifier)
 
 	notifier.SystemStarted()
 

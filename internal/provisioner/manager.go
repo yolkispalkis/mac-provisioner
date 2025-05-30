@@ -17,7 +17,6 @@ import (
 	"mac-provisioner/internal/device"
 	"mac-provisioner/internal/dfu"
 	"mac-provisioner/internal/notification"
-	"mac-provisioner/internal/stats"
 )
 
 /*
@@ -30,7 +29,6 @@ import (
 type Manager struct {
 	dfuManager *dfu.Manager
 	notifier   *notification.Manager
-	stats      *stats.Manager
 
 	processing    map[string]bool // ключ — Device.UniqueID()
 	processingUSB map[string]bool // ключ — USBLocation (порт)
@@ -44,11 +42,10 @@ var (
 	progressCache = map[string]int{} // UID → последний % уже озвученный
 )
 
-func New(dfuMgr *dfu.Manager, notifier *notification.Manager, stats *stats.Manager) *Manager {
+func New(dfuMgr *dfu.Manager, notifier *notification.Manager) *Manager {
 	return &Manager{
 		dfuManager:    dfuMgr,
 		notifier:      notifier,
-		stats:         stats,
 		processing:    make(map[string]bool),
 		processingUSB: make(map[string]bool),
 	}
@@ -99,21 +96,17 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	// ---------------------------------------------------
 
 	log.Printf("🚀 Старт прошивки: %s (ECID:%s)", dev.GetFriendlyName(), dev.ECID)
-	start := time.Now()
-	m.stats.DeviceStarted()
 
 	if !dev.IsDFU || dev.ECID == "" {
 		errMsg := "устройство не готово к прошивке (нет DFU или ECID)"
 		log.Printf("❌ %s: %s", dev.GetFriendlyName(), errMsg)
 		m.notifier.RestoreFailed(dev, errMsg)
-		m.stats.DeviceCompleted(false, time.Since(start))
 		return
 	}
 
 	decECID, err := normalizeECIDForCfgutil(dev.ECID)
 	if err != nil {
 		m.notifier.RestoreFailed(dev, "неверный формат ECID")
-		m.stats.DeviceCompleted(false, time.Since(start))
 		return
 	}
 
@@ -140,11 +133,10 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 		log.Printf("❌ Не удалось запустить cfgutil (%s): %v",
 			strings.Join(cmd.Args, " "), err)
 		m.notifier.RestoreFailed(dev, "не удалось запустить cfgutil")
-		m.stats.DeviceCompleted(false, time.Since(start))
 		return
 	}
 
-	// НОВЫЙ универсальный регэксп: любое NN%
+	// Универсальный регэксп: любое NN%
 	progressRx := regexp.MustCompile(`(?i)(\d{1,3})\s*%`)
 	go m.streamCfgutilOutput(dev, stdOut, progressRx)
 	go m.streamCfgutilOutput(dev, stdErr, progressRx)
@@ -168,7 +160,6 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 			humanErr = "таймаут cfgutil restore"
 		}
 		m.notifier.RestoreFailed(dev, humanErr)
-		m.stats.DeviceCompleted(false, time.Since(start))
 		return
 	}
 	log.Printf("✅ cfgutil завершился для %s", dev.GetFriendlyName())
@@ -176,13 +167,11 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	// ждём выхода устройства из DFU
 	if !m.waitExitDFU(ctx, decECID, 30*time.Second) {
 		m.notifier.RestoreFailed(dev, "устройство осталось в DFU после restore")
-		m.stats.DeviceCompleted(false, time.Since(start))
 		return
 	}
 
 	log.Printf("🎉 Прошивка завершена: %s", dev.GetFriendlyName())
 	m.notifier.RestoreCompleted(dev)
-	m.stats.DeviceCompleted(true, time.Since(start))
 }
 
 /*──────────────────────────────────────────────────────────

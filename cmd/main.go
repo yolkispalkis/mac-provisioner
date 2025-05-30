@@ -238,9 +238,9 @@ func debugConnectedDevices(
 				if d.IsDFU {
 					log.Printf("  %d. DFU: %s (%s)", i+1, d.GetFriendlyName(), d.State)
 				} else {
-					log.Printf("  %d. MAC: %s (USB:%s, %s)",
+					log.Printf("  %d. MAC: %s (USB:%s, State:%s)",
 						i+1, d.GetFriendlyName(),
-						strings.TrimPrefix(d.USBLocation, "0x"),
+						d.USBLocation,
 						d.State)
 				}
 			}

@@ -51,8 +51,7 @@ func (d *Device) GetFriendlyName() string {
 		return d.Model // без ECID-хвоста
 	}
 	if d.USBLocation != "" {
-		return fmt.Sprintf("%s (USB: %s)",
-			d.Model, strings.TrimPrefix(d.USBLocation, "0x"))
+		return fmt.Sprintf("%s (USB: %s)", d.Model, d.USBLocation)
 	}
 	return d.Model
 }

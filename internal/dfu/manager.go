@@ -118,8 +118,7 @@ func (m *Manager) hasMacvdmtool() bool {
 }
 
 func (m *Manager) enterDFUWithMacvdmtool(ctx context.Context, usbLocation string) error {
-	log.Printf("ℹ️ macvdmtool dfu → инициируем переход в DFU (USB %s)…",
-		strings.TrimPrefix(usbLocation, "0x"))
+	log.Printf("ℹ️ macvdmtool dfu → инициируем переход в DFU (USB %s)…", usbLocation)
 
 	cmd := exec.CommandContext(ctx, "macvdmtool", "dfu")
 	if err := cmd.Run(); err != nil {

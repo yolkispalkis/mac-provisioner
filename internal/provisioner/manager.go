@@ -213,7 +213,7 @@ func humanPort(loc string) string {
 		return rootStr
 	}
 	hubs := strings.Join(parts[1:], "-")
-	return fmt.Sprintf("%s, хаб %s", rootStr, hubs)
+	return fmt.Sprintf("хаб %s, %s", hubs, rootStr)
 }
 
 /*

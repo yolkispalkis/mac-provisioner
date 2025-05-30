@@ -1,14 +1,12 @@
 package provisioner
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,12 +34,6 @@ type Manager struct {
 	processingMu sync.RWMutex
 }
 
-/* кеш, чтобы не слать прогресс каждую секунду */
-var (
-	progressMu    sync.Mutex
-	progressCache = map[string]int{} // UID → последний % уже озвученный
-)
-
 func New(dfuMgr *dfu.Manager, notifier *notification.Manager) *Manager {
 	return &Manager{
 		dfuManager:    dfuMgr,
@@ -57,7 +49,7 @@ func New(dfuMgr *dfu.Manager, notifier *notification.Manager) *Manager {
 ──────────────────────────────────────────────────────────
 */
 
-// IsProcessingUSB — занят ли этот USB-порт активной прошивкой
+// IsProcessingUSB — занят ли этот USB-порт активной прошивкой?
 func (m *Manager) IsProcessingUSB(loc string) bool {
 	if loc == "" {
 		return false
@@ -83,7 +75,7 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	}
 	m.processingMu.Unlock()
 
-	// по завершении снимаем все отметки
+	// по завершении снимаем отметки
 	defer func() {
 		m.processingMu.Lock()
 		delete(m.processing, uid)
@@ -93,7 +85,7 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 		m.processingMu.Unlock()
 	}()
 
-	// ---------------------------------------------------
+	//----------------------------------------------------
 
 	log.Printf("🚀 Старт прошивки: %s (ECID:%s)", dev.GetFriendlyName(), dev.ECID)
 
@@ -114,155 +106,85 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 
 	/*
 	   ────────────────────────────────────────────
-	   cfgutil restore
+	   cfgutil --format JSON restore
 	   ────────────────────────────────────────────
 	*/
 	restoreCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(restoreCtx, "cfgutil", "--ecid", decECID, "restore")
+	cmd := exec.CommandContext(restoreCtx,
+		"cfgutil",
+		"--ecid", decECID,
+		"--format", "JSON",
+		"restore",
+	)
 
-	stdOutPipe, _ := cmd.StdoutPipe()
-	stdErrPipe, _ := cmd.StderrPipe()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
-	var stdoutBuf, stderrBuf bytes.Buffer
-	stdOut := io.TeeReader(stdOutPipe, &stdoutBuf)
-	stdErr := io.TeeReader(stdErrPipe, &stderrBuf)
-
-	if err := cmd.Start(); err != nil {
-		log.Printf("❌ Не удалось запустить cfgutil (%s): %v",
-			strings.Join(cmd.Args, " "), err)
-		m.notifier.RestoreFailed(dev, "не удалось запустить cfgutil")
+	if err := cmd.Run(); err != nil {
+		// команда не запустилась или упала вне собственного отчёта
+		log.Printf("⚠️ cfgutil error: %v, stderr: %s", err, stderr.String())
+		human := "не удалось запустить cfgutil"
+		if restoreCtx.Err() == context.DeadlineExceeded {
+			human = "таймаут cfgutil restore"
+		}
+		m.notifier.RestoreFailed(dev, human)
 		return
 	}
 
-	// Универсальный регэксп: любое NN%
-	progressRx := regexp.MustCompile(`(?i)(\d{1,3})\s*%`)
-	go m.streamCfgutilOutput(dev, stdOut, progressRx)
-	go m.streamCfgutilOutput(dev, stdErr, progressRx)
+	// cfgutil всегда пишет ровно одну JSON-строку
+	line := strings.TrimSpace(stdout.String())
+	if line == "" {
+		m.notifier.RestoreFailed(dev, "пустой ответ cfgutil")
+		return
+	}
 
-	waitErr := cmd.Wait()
-	if waitErr != nil {
-		fullCmd := strings.Join(cmd.Args, " ")
-		log.Printf(`
-⚠️ cfgutil завершился с ошибкой
-   Команда : %s
-   Ошибка  : %v
-─── STDOUT ────────────────────────────────────────────────
-%s
-─── STDERR ────────────────────────────────────────────────
-%s
-───────────────────────────────────────────────────────────`,
-			fullCmd, waitErr, stdoutBuf.String(), stderrBuf.String())
+	var resp cfgutilJSON
+	if err := json.Unmarshal([]byte(line), &resp); err != nil {
+		log.Printf("⚠️ Некорректный JSON от cfgutil: %v\n%s", err, line)
+		m.notifier.RestoreFailed(dev, "некорректный ответ cfgutil")
+		return
+	}
 
-		humanErr := extractRestoreError(stderrBuf.String(), waitErr)
-		if restoreCtx.Err() == context.DeadlineExceeded {
-			humanErr = "таймаут cfgutil restore"
+	// --- анализ результата ---
+	switch resp.Type {
+	case "CommandOutput":
+		log.Printf("🎉 Прошивка завершена: %s", dev.GetFriendlyName())
+		m.notifier.RestoreCompleted(dev)
+
+	case "Error":
+		humanErr := mapRestoreErrorCode(strconv.Itoa(resp.Code))
+		if humanErr == "" { // если кода нет в мапе — короткое сообщение
+			humanErr = resp.Message
 		}
 		m.notifier.RestoreFailed(dev, humanErr)
-		return
-	}
-	log.Printf("✅ cfgutil завершился для %s", dev.GetFriendlyName())
+		log.Printf("❌ cfgutil Error (%d): %s", resp.Code, resp.Message)
 
-	// ждём выхода устройства из DFU
-	if !m.waitExitDFU(ctx, decECID, 30*time.Second) {
-		m.notifier.RestoreFailed(dev, "устройство осталось в DFU после restore")
-		return
-	}
-
-	log.Printf("🎉 Прошивка завершена: %s", dev.GetFriendlyName())
-	m.notifier.RestoreCompleted(dev)
-}
-
-/*──────────────────────────────────────────────────────────
-        Helpers — парсинг прогресса, ожидание DFU-exit и т.д.
-──────────────────────────────────────────────────────────*/
-
-// строковый прогресс cfgutil
-func (m *Manager) streamCfgutilOutput(dev *device.Device, r io.Reader, rx *regexp.Regexp) {
-	sc := bufio.NewScanner(r)
-	for sc.Scan() {
-		line := sc.Text()
-		if m.parseProgressLine(dev, line, rx) {
-			continue
-		}
-
-		lc := strings.ToLower(line)
-		switch {
-		case strings.Contains(lc, "preparing"):
-			m.notifier.RestoreProgress(dev, "подготовка")
-		case strings.Contains(lc, "downloading"):
-			m.notifier.RestoreProgress(dev, "загрузка прошивки")
-		}
+	default:
+		m.notifier.RestoreFailed(dev, "неизвестный ответ cfgutil")
+		log.Printf("⚠️ Неизвестный Type %q в JSON cfgutil", resp.Type)
 	}
 }
 
-func (m *Manager) parseProgressLine(dev *device.Device, line string, rx *regexp.Regexp) bool {
-	matches := rx.FindStringSubmatch(line)
-	if len(matches) < 2 {
-		return false
-	}
-	percentStr := matches[1]
-	percent, _ := strconv.Atoi(percentStr)
+/*
+──────────────────────────────────────────────────────────
 
-	uid := dev.UniqueID()
+	JSON-ответ cfgutil
 
-	// отправляем, если:
-	//   • 0%   • 100%   • изменилась «десятка» (10,20,30…) или прирост >= 10 %
-	if shouldAnnounce(uid, percent) {
-		m.notifier.RestoreProgress(dev, percentStr+" %")
-	}
-	return true
-}
+──────────────────────────────────────────────────────────
+*/
+type cfgutilJSON struct {
+	// Для Error-ветки
+	Domain  string `json:"Domain,omitempty"`
+	Message string `json:"Message,omitempty"`
+	Code    int    `json:"Code,omitempty"`
+	Type    string `json:"Type"`
 
-/* правила дебаунса прогресса */
-func shouldAnnounce(uid string, p int) bool {
-	progressMu.Lock()
-	defer progressMu.Unlock()
-
-	last := progressCache[uid]
-	notify := false
-
-	switch {
-	case p == 0 || p == 100:
-		notify = true
-	case p/10 != last/10: // другая «десятка»
-		notify = true
-	case p-last >= 10: // или скачок ≥10 %
-		notify = true
-	}
-
-	if notify {
-		progressCache[uid] = p
-	}
-	return notify
-}
-
-func (m *Manager) waitExitDFU(ctx context.Context, decimalECID string, max time.Duration) bool {
-	waitCtx, cancel := context.WithTimeout(ctx, max)
-	defer cancel()
-
-	tick := time.NewTicker(3 * time.Second)
-	defer tick.Stop()
-
-	for {
-		select {
-		case <-waitCtx.Done():
-			return false
-		case <-tick.C:
-			inDFU := false
-			for _, d := range m.dfuManager.GetDFUDevices(waitCtx) {
-				dec, _ := normalizeECIDForCfgutil(d.ECID)
-				if dec == decimalECID {
-					inDFU = true
-					break
-				}
-			}
-			if !inDFU {
-				return true
-			}
-		}
-	}
+	// Для успешного завершения
+	Command string   `json:"Command,omitempty"`
+	Devices []string `json:"Devices,omitempty"`
 }
 
 /*
@@ -272,23 +194,8 @@ func (m *Manager) waitExitDFU(ctx context.Context, decimalECID string, max time.
 
 ──────────────────────────────────────────────────────────
 */
-func extractRestoreError(stderr string, waitErr error) string {
-	reUSB := regexp.MustCompile(`libusbrestore\s+error[:\s]*(\d+)`)
-	reCode := regexp.MustCompile(`Code[:\s]*(\d+)`)
-
-	if m := reUSB.FindStringSubmatch(stderr); len(m) == 2 {
-		return mapRestoreErrorCode(m[1])
-	}
-	if m := reCode.FindStringSubmatch(stderr); len(m) == 2 {
-		return mapRestoreErrorCode(m[1])
-	}
-	if strings.Contains(stderr, "Failed to restore device in recovery mode") {
-		return "ошибка восстановления (recovery mode)"
-	}
-	return waitErr.Error()
-}
-
 func mapRestoreErrorCode(codeStr string) string {
+	// встречаются коды 9, 14, 21, 40 …
 	switch codeStr {
 	case "21":
 		return "ошибка восстановления (код 21)"
@@ -299,14 +206,14 @@ func mapRestoreErrorCode(codeStr string) string {
 	case "14":
 		return "архив прошивки повреждён (код 14)"
 	default:
-		return fmt.Sprintf("ошибка восстановления (код %s)", codeStr)
+		return ""
 	}
 }
 
 /*
 ──────────────────────────────────────────────────────────
 
-	UTILITIES
+	UTILITIES (ECID helpers)
 
 ──────────────────────────────────────────────────────────
 */

@@ -543,7 +543,7 @@ func normalizeECIDKey(s string) string {
 }
 
 func lookupModelWithCfgutil(ctx context.Context, ecid string) (string, error) {
-	out, err := exec.CommandContext(ctx, "cfgutil", "--format", "JSON", "-v", "list").Output()
+	out, err := exec.CommandContext(ctx, "cfgutil", "--format", "JSON", "list").Output()
 	if err != nil {
 		return "", err
 	}

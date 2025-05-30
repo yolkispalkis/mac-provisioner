@@ -2,6 +2,7 @@ package voice
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -13,10 +14,14 @@ import (
 /*
 Использование:
 
-	v := voice.New(voice.Config{Voice:"Milena", Rate:200})
-	v.MelodyOn()
-	v.Speak(voice.Normal, "Текст")
-	v.Shutdown()
+        v := voice.New(voice.Config{
+                Voice:  "Milena",
+                Rate:   200,
+                Volume: 0.8,          // ← новая настройка
+        })
+        v.MelodyOn()
+        v.Speak(voice.Normal, "Текст")
+        v.Shutdown()
 */
 
 type Priority int
@@ -33,6 +38,7 @@ const (
 type Config struct {
 	Voice        string
 	Rate         int
+	Volume       float64       // ← добавлено: 0.0…1.0, влияет на MelodyOn
 	MaxQueue     int           // ёмкость канала
 	DebounceSame time.Duration // анти-спам для одинаковых фраз
 	MergeWindow  time.Duration // «склейка» сообщений < MergeWindow
@@ -54,8 +60,8 @@ type Engine struct {
 	queue chan message
 
 	mu         sync.Mutex
-	lastSpoken map[string]time.Time // anti-spam
-	lastSay    time.Time            // когда запустился предыдущий say
+	lastSpoken map[string]time.Time
+	lastSay    time.Time
 
 	melodyCmd *exec.Cmd
 	ctx       context.Context
@@ -76,6 +82,9 @@ func New(c Config) *Engine {
 	if c.MinInterval == 0 {
 		c.MinInterval = 300 * time.Millisecond
 	}
+	if c.Volume <= 0 || c.Volume > 1 {
+		c.Volume = 0.8 // дефолт: 80 %
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -92,7 +101,7 @@ func New(c Config) *Engine {
 }
 
 /*------------------------------------------------------------------
-	 PUBLIC API
+         PUBLIC API
 ------------------------------------------------------------------*/
 
 func (e *Engine) Shutdown() {
@@ -129,32 +138,33 @@ func (e *Engine) Speak(p Priority, text string) {
 }
 
 func (e *Engine) MelodyOn() {
-	// Учитываем ситуацию, когда процесс ещё жив, а мы уже пытались запускать
+	// если уже играет – ничего не делаем
 	if e.melodyCmd != nil && e.melodyCmd.Process != nil && e.melodyCmd.ProcessState == nil {
-		return // уже играет
+		return
 	}
 
+	volArg := fmt.Sprintf("%.2f", e.cfg.Volume)
+
 	// afplay:
-	//   -q 1   → low-latency режим
-	//   -v 0.4 → громкость 40 % (0.0…1.0)
+	//   -q 1   → low-latency
+	//   -v N   → громкость
 	//   -l 0   → loop ∞
 	e.melodyCmd = exec.CommandContext(
 		e.ctx,
 		"afplay",
 		"/System/Library/Sounds/Submarine.aiff",
 		"-q", "1",
-		"-v", "0.4",
+		"-v", volArg,
 		"-l", "0",
 	)
 
-	// Стартуем асинхронно; ошибки здесь не критичны — игнорируем.
-	_ = e.melodyCmd.Start()
+	_ = e.melodyCmd.Start() // ошибки не критичны
 }
 
 func (e *Engine) MelodyOff() { e.stopMelody() }
 
 /*------------------------------------------------------------------
-	 INTERNAL LOOP
+         INTERNAL LOOP
 ------------------------------------------------------------------*/
 
 func (e *Engine) runner() {
@@ -164,7 +174,7 @@ func (e *Engine) runner() {
 			return
 
 		case first := <-e.queue:
-			// Собираем всё, что придёт за MergeWindow
+			// собираем всё, что придёт за MergeWindow
 			buf := []string{first.txt}
 			timeout := time.NewTimer(e.cfg.MergeWindow)
 
@@ -175,7 +185,7 @@ func (e *Engine) runner() {
 					timeout.Stop()
 					return
 				case next := <-e.queue:
-					// если System / High – прерываем «приём» и говорим немедленно
+					// если System / High – выходим раньше
 					if next.pr <= High {
 						buf = append(buf, next.txt)
 						break loop
@@ -203,7 +213,7 @@ func (e *Engine) runner() {
 }
 
 /*------------------------------------------------------------------
-	             helpers
+                     helpers
 ------------------------------------------------------------------*/
 
 func join(parts []string) string {
@@ -213,7 +223,6 @@ func join(parts []string) string {
 	case 1:
 		return parts[0]
 	default:
-		// короткая пауза между склеенными фразами
 		return strings.Join(parts, ". ")
 	}
 }
@@ -228,7 +237,7 @@ func (e *Engine) runSay(text string) {
 }
 
 /*------------------------------------------------------------------
-	              Melody Pause / Resume
+                      Melody Pause / Resume
 ------------------------------------------------------------------*/
 
 func (e *Engine) pauseMelody() {

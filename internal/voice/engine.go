@@ -14,18 +14,17 @@ import (
 )
 
 /*
-Пример использования:
+Пример:
 
         v := voice.New(voice.Config{
                 Voice:  "Milena",
                 Rate:   200,
-                Volume: 0.8, // 0.0‒1.0, влияет на громкость мелодии
+                Volume: 0.8,
         })
 
-        v.Speak(voice.Normal, "Начинается прошивка")
-        v.MelodyOn()      // фоновая мелодия
-        …                 // работа
-        v.MelodyOff()     // остановка
+        v.MelodyOn()
+        …
+        v.MelodyOff()
         v.Shutdown()
 */
 
@@ -43,14 +42,13 @@ const (
 type Config struct {
 	Voice        string
 	Rate         int
-	Volume       float64       // 0.0…1.0 — используется в MelodyOn
+	Volume       float64       // громкость мелодии 0.0…1.0
 	MaxQueue     int           // ёмкость канала
 	DebounceSame time.Duration // анти-спам одинаковых фраз
-	MergeWindow  time.Duration // «склейка» сообщений < MergeWindow
-	MinInterval  time.Duration // пауза между say-процессами
+	MergeWindow  time.Duration // «склейка» сообщений
+	MinInterval  time.Duration // пауза между say
 }
 
-// внутренний элемент очереди
 type message struct {
 	txt string
 	pr  Priority
@@ -74,7 +72,6 @@ type Engine struct {
 }
 
 func New(c Config) *Engine {
-	// значения по-умолчанию
 	if c.MaxQueue == 0 {
 		c.MaxQueue = 50
 	}
@@ -88,7 +85,7 @@ func New(c Config) *Engine {
 		c.MinInterval = 300 * time.Millisecond
 	}
 	if c.Volume <= 0 || c.Volume > 1 {
-		c.Volume = 0.8 // дефолт 80 %
+		c.Volume = 0.8
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -114,13 +111,11 @@ func (e *Engine) Shutdown() {
 	e.stopMelody()
 }
 
-// Speak — добавить фразу в очередь с заданным приоритетом.
 func (e *Engine) Speak(p Priority, text string) {
 	if text == "" {
 		return
 	}
 
-	// anti-spam: одинаковая фраза не чаще DebounceSame
 	e.mu.Lock()
 	if t, ok := e.lastSpoken[text]; ok && time.Since(t) < e.cfg.DebounceSame {
 		e.mu.Unlock()
@@ -129,35 +124,32 @@ func (e *Engine) Speak(p Priority, text string) {
 	e.lastSpoken[text] = time.Now()
 	e.mu.Unlock()
 
-	m := message{txt: text, pr: p, t: time.Now()}
+	msg := message{txt: text, pr: p, t: time.Now()}
 
 	select {
-	case e.queue <- m:
+	case e.queue <- msg:
 	default:
-		// очередь заполнена
-		if p <= High { // вытолкнём менее важное
+		if p <= High { // вытесняем менее важное
 			<-e.queue
-			e.queue <- m
+			e.queue <- msg
 		}
 	}
 }
 
 /*
-MelodyOn запускает бесконечный afplay-луп (Submarine/Hero);
-если мелодия уже играет — повторный вызов игнорируется.
+MelodyOn — бесконечный зацикленный звук.
+Если уже играет — повторный вызов игнорируется.
 */
 func (e *Engine) MelodyOn() {
-	// уже играет?
 	if e.melodyCmd != nil &&
 		e.melodyCmd.Process != nil &&
 		e.melodyCmd.ProcessState == nil {
 		return
 	}
 
-	// основной и резервный звук macOS
 	sound := "/System/Library/Sounds/Submarine.aiff"
 	if _, err := os.Stat(sound); err != nil {
-		sound = "/System/Library/Sounds/Hero.aiff"
+		sound = "/System/Library/Sounds/Hero.aiff" // запасной
 	}
 
 	volArg := fmt.Sprintf("%.2f", e.cfg.Volume)
@@ -165,10 +157,10 @@ func (e *Engine) MelodyOn() {
 	e.melodyCmd = exec.CommandContext(
 		e.ctx,
 		"afplay",
-		sound,
-		"-q", "1", // low-latency
+		"-q", "1",
 		"-v", volArg,
-		"-l", "0", // loop ∞
+		"-l", "0", // ∞ loop
+		sound, // ← ФАЙЛ ДОЛЖЕН БЫТЬ ПОСЛЕ ОПЦИЙ
 	)
 
 	if err := e.melodyCmd.Start(); err != nil {
@@ -190,29 +182,26 @@ func (e *Engine) runner() {
 			return
 
 		case first := <-e.queue:
-			// собираем всё, что придёт за MergeWindow
 			buf := []string{first.txt}
 			timeout := time.NewTimer(e.cfg.MergeWindow)
 
-		loop:
+		collect:
 			for {
 				select {
 				case <-e.ctx.Done():
 					timeout.Stop()
 					return
-				case next := <-e.queue:
-					// System / High — прекращаем приём и говорим немедленно
-					if next.pr <= High {
-						buf = append(buf, next.txt)
-						break loop
+				case nxt := <-e.queue:
+					if nxt.pr <= High {
+						buf = append(buf, nxt.txt)
+						break collect
 					}
-					buf = append(buf, next.txt)
+					buf = append(buf, nxt.txt)
 				case <-timeout.C:
-					break loop
+					break collect
 				}
 			}
 
-			// пауза minInterval
 			if delta := time.Since(e.lastSay); delta < e.cfg.MinInterval {
 				time.Sleep(e.cfg.MinInterval - delta)
 			}
@@ -259,7 +248,7 @@ func (e *Engine) runSay(text string) {
 func (e *Engine) pauseMelody() {
 	if e.melodyCmd != nil && e.melodyCmd.Process != nil {
 		_ = e.melodyCmd.Process.Signal(syscall.SIGSTOP)
-		time.Sleep(50 * time.Millisecond) // чтобы уверенно приостановить звук
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

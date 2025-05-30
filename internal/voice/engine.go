@@ -129,15 +129,25 @@ func (e *Engine) Speak(p Priority, text string) {
 }
 
 func (e *Engine) MelodyOn() {
-	if e.melodyCmd != nil && e.melodyCmd.ProcessState == nil {
+	// Учитываем ситуацию, когда процесс ещё жив, а мы уже пытались запускать
+	if e.melodyCmd != nil && e.melodyCmd.Process != nil && e.melodyCmd.ProcessState == nil {
 		return // уже играет
 	}
+
+	// afplay:
+	//   -q 1   → low-latency режим
+	//   -v 0.4 → громкость 40 % (0.0…1.0)
+	//   -l 0   → loop ∞
 	e.melodyCmd = exec.CommandContext(
 		e.ctx,
 		"afplay",
 		"/System/Library/Sounds/Submarine.aiff",
-		"-q", "1", "-t", "999999",
+		"-q", "1",
+		"-v", "0.4",
+		"-l", "0",
 	)
+
+	// Стартуем асинхронно; ошибки здесь не критичны — игнорируем.
 	_ = e.melodyCmd.Start()
 }
 

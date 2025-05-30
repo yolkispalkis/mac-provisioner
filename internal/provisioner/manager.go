@@ -259,24 +259,47 @@ func humanPort(loc string) string {
 		return "неизвестный порт"
 	}
 
-	// 1) делим по «/»: первая часть — root-порт, остальные — хабы
-	parts := strings.Split(loc, "/")
-	rootRaw := strings.TrimSpace(parts[0])
+	// ── 1. Отбрасываем всё после «/» (динамический адрес контроллера)
+	base := strings.Split(loc, "/")[0]
+	base = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(base), "0x"))
+	if base == "" {
+		return "неизвестный порт"
+	}
 
-	// — корневой порт
-	rootStr := "неизвестный"
-	if m := rxRoot.FindStringSubmatch(rootRaw); len(m) == 3 {
-		if n, err := strconv.ParseInt(m[2], 16, 0); err == nil {
-			rootStr = fmt.Sprintf("порт %d", n)
+	// ── 2. Приводим к ровно 8 hex-символам (32 бита Location ID)
+	switch {
+	case len(base) < 8:
+		base = strings.Repeat("0", 8-len(base)) + base
+	case len(base) > 8:
+		base = base[len(base)-8:]
+	}
+
+	// ── 3. Проходим по каждому нибблу слева-направо, собираем ненулевые
+	var ports []int // первый — root, остальные — хабы
+	for i := 0; i < len(base); i++ {
+		v, err := strconv.ParseInt(base[i:i+1], 16, 0)
+		if err != nil {
+			return "неизвестный порт"
+		}
+		if v != 0 {
+			ports = append(ports, int(v)) // v = port+1  → говорим как есть
 		}
 	}
-
-	// — цепочка хабов, если есть
-	if len(parts) == 1 {
-		return rootStr
+	if len(ports) == 0 {
+		return "неизвестный порт"
 	}
-	hubs := strings.Join(parts[1:], "-")
-	return fmt.Sprintf("хаб %s, порт %d", hubs, rootStr)
+
+	root := ports[0]
+	if len(ports) == 1 {
+		return fmt.Sprintf("порт %d", root)
+	}
+
+	// ── 4. Собираем цепочку хабов
+	hubs := make([]string, len(ports)-1)
+	for i, p := range ports[1:] {
+		hubs[i] = strconv.Itoa(p)
+	}
+	return fmt.Sprintf("хаб %s, порт %d", strings.Join(hubs, "-"), root)
 }
 
 /*

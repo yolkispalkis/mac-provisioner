@@ -3,6 +3,8 @@ package voice
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -12,15 +14,18 @@ import (
 )
 
 /*
-Использование:
+Пример использования:
 
         v := voice.New(voice.Config{
                 Voice:  "Milena",
                 Rate:   200,
-                Volume: 0.8,          // ← новая настройка
+                Volume: 0.8, // 0.0‒1.0, влияет на громкость мелодии
         })
-        v.MelodyOn()
-        v.Speak(voice.Normal, "Текст")
+
+        v.Speak(voice.Normal, "Начинается прошивка")
+        v.MelodyOn()      // фоновая мелодия
+        …                 // работа
+        v.MelodyOff()     // остановка
         v.Shutdown()
 */
 
@@ -38,14 +43,14 @@ const (
 type Config struct {
 	Voice        string
 	Rate         int
-	Volume       float64       // ← добавлено: 0.0…1.0, влияет на MelodyOn
+	Volume       float64       // 0.0…1.0 — используется в MelodyOn
 	MaxQueue     int           // ёмкость канала
-	DebounceSame time.Duration // анти-спам для одинаковых фраз
+	DebounceSame time.Duration // анти-спам одинаковых фраз
 	MergeWindow  time.Duration // «склейка» сообщений < MergeWindow
 	MinInterval  time.Duration // пауза между say-процессами
 }
 
-// message во внутренней очереди
+// внутренний элемент очереди
 type message struct {
 	txt string
 	pr  Priority
@@ -83,7 +88,7 @@ func New(c Config) *Engine {
 		c.MinInterval = 300 * time.Millisecond
 	}
 	if c.Volume <= 0 || c.Volume > 1 {
-		c.Volume = 0.8 // дефолт: 80 %
+		c.Volume = 0.8 // дефолт 80 %
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -109,7 +114,7 @@ func (e *Engine) Shutdown() {
 	e.stopMelody()
 }
 
-// Speak – добавить фразу в очередь с приоритетом.
+// Speak — добавить фразу в очередь с заданным приоритетом.
 func (e *Engine) Speak(p Priority, text string) {
 	if text == "" {
 		return
@@ -137,28 +142,39 @@ func (e *Engine) Speak(p Priority, text string) {
 	}
 }
 
+/*
+MelodyOn запускает бесконечный afplay-луп (Submarine/Hero);
+если мелодия уже играет — повторный вызов игнорируется.
+*/
 func (e *Engine) MelodyOn() {
-	// если уже играет – ничего не делаем
-	if e.melodyCmd != nil && e.melodyCmd.Process != nil && e.melodyCmd.ProcessState == nil {
+	// уже играет?
+	if e.melodyCmd != nil &&
+		e.melodyCmd.Process != nil &&
+		e.melodyCmd.ProcessState == nil {
 		return
+	}
+
+	// основной и резервный звук macOS
+	sound := "/System/Library/Sounds/Submarine.aiff"
+	if _, err := os.Stat(sound); err != nil {
+		sound = "/System/Library/Sounds/Hero.aiff"
 	}
 
 	volArg := fmt.Sprintf("%.2f", e.cfg.Volume)
 
-	// afplay:
-	//   -q 1   → low-latency
-	//   -v N   → громкость
-	//   -l 0   → loop ∞
 	e.melodyCmd = exec.CommandContext(
 		e.ctx,
 		"afplay",
-		"/System/Library/Sounds/Submarine.aiff",
-		"-q", "1",
+		sound,
+		"-q", "1", // low-latency
 		"-v", volArg,
-		"-l", "0",
+		"-l", "0", // loop ∞
 	)
 
-	_ = e.melodyCmd.Start() // ошибки не критичны
+	if err := e.melodyCmd.Start(); err != nil {
+		log.Printf("⚠️  Не удалось запустить мелодию: %v", err)
+		e.melodyCmd = nil
+	}
 }
 
 func (e *Engine) MelodyOff() { e.stopMelody() }
@@ -185,7 +201,7 @@ func (e *Engine) runner() {
 					timeout.Stop()
 					return
 				case next := <-e.queue:
-					// если System / High – выходим раньше
+					// System / High — прекращаем приём и говорим немедленно
 					if next.pr <= High {
 						buf = append(buf, next.txt)
 						break loop
@@ -196,7 +212,7 @@ func (e *Engine) runner() {
 				}
 			}
 
-			// соблюдаем паузу minInterval
+			// пауза minInterval
 			if delta := time.Since(e.lastSay); delta < e.cfg.MinInterval {
 				time.Sleep(e.cfg.MinInterval - delta)
 			}
@@ -243,7 +259,7 @@ func (e *Engine) runSay(text string) {
 func (e *Engine) pauseMelody() {
 	if e.melodyCmd != nil && e.melodyCmd.Process != nil {
 		_ = e.melodyCmd.Process.Signal(syscall.SIGSTOP)
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond) // чтобы уверенно приостановить звук
 	}
 }
 

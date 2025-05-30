@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,8 +31,8 @@ type Manager struct {
 	notif  *notification.Manager
 	voice  *voice.Engine
 
-	processing    map[string]bool // UID → true
-	processingUSB map[string]bool // USB-порт → true
+	processing    map[string]bool // UID  → true
+	processingUSB map[string]bool // USB → true
 	mu            sync.RWMutex
 }
 
@@ -47,11 +48,11 @@ func New(dfuMgr *dfu.Manager, n *notification.Manager, v *voice.Engine) *Manager
 
 /*
 ──────────────────────────────────────────────────────────
-                          PUBLIC API
+                               PUBLIC
 ──────────────────────────────────────────────────────────
 */
 
-// Занят ли USB-порт активной прошивкой?
+// IsProcessingUSB — идёт ли прошивка на данном USB-порту
 func (m *Manager) IsProcessingUSB(port string) bool {
 	if port == "" {
 		return false
@@ -65,7 +66,7 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	uid := dev.UniqueID()
 
 	//----------------------------------------------------
-	// 1) блокируем повторное прохождение того же UID
+	// 1) блокировка повторной обработки UID / USB-порта
 	//----------------------------------------------------
 	m.mu.Lock()
 	if m.processing[uid] {
@@ -79,7 +80,6 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	}
 	m.mu.Unlock()
 
-	// по завершении снимаем отметки
 	defer func() {
 		m.mu.Lock()
 		delete(m.processing, uid)
@@ -90,7 +90,7 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	}()
 
 	//----------------------------------------------------
-	// 2) базовые проверки
+	// 2) проверки
 	//----------------------------------------------------
 	if !dev.IsDFU || dev.ECID == "" {
 		m.notif.RestoreFailed(dev, "устройство не в DFU или нет ECID")
@@ -103,14 +103,14 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	}
 
 	//----------------------------------------------------
-	// 3) фон + голос
+	// 3) звук: фон + «старт прошивки»
 	//----------------------------------------------------
 	m.voice.MelodyOn()
 	defer m.voice.MelodyOff()
 
 	m.notif.StartingRestore(dev)
 
-	// Периодический анонс «идет прошивка…»
+	// периодический анонс «идёт прошивка, порт …»
 	annDone := make(chan struct{})
 	go m.announceLoop(ctx, annDone, dev)
 
@@ -134,7 +134,7 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 		if restoreCtx.Err() == context.DeadlineExceeded {
 			msg = "таймаут cfgutil restore"
 		}
-		log.Printf("⚠️ cfgutil error: %v ‑ %s", runErr, stderr.String())
+		log.Printf("⚠️ cfgutil error: %v — %s", runErr, stderr.String())
 		m.notif.RestoreFailed(dev, msg)
 		return
 	}
@@ -167,14 +167,14 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 
 	default:
 		m.notif.RestoreFailed(dev, "неизвестный ответ cfgutil")
-		log.Printf("⚠️ неизвестный JSON-тип %q", resp.Type)
+		log.Printf("⚠️ неизвестный JSON-Type %q", resp.Type)
 	}
 }
 
 /*
 ──────────────────────────────────────────────────────────
 
-	Periodic “in-progress” voice announcements
+	Periodic “in-progress” announcements
 
 ──────────────────────────────────────────────────────────
 */
@@ -189,11 +189,28 @@ func (m *Manager) announceLoop(ctx context.Context, done <-chan struct{}, dev *d
 		case <-done:
 			return
 		case <-t.C:
-			port := strings.TrimPrefix(dev.USBLocation, "0x")
-			msg := fmt.Sprintf("идёт прошивка, порт %s", port)
-			m.notif.RestoreProgress(dev, msg)
+			m.notif.RestoreProgress(dev,
+				fmt.Sprintf("идёт прошивка, %s", humanPort(dev.USBLocation)))
 		}
 	}
+}
+
+/*
+──────────────────────────────────────────────────────────
+
+	PORT helper  0x00100000 → «порт 1»
+
+──────────────────────────────────────────────────────────
+*/
+var rxPort = regexp.MustCompile(`(?i)^0x00([0-9a-f])0000$`)
+
+func humanPort(usbLoc string) string {
+	if m := rxPort.FindStringSubmatch(usbLoc); len(m) == 2 {
+		hexDigit := m[1] // 1,2,…
+		n, _ := strconv.ParseInt(hexDigit, 16, 0)
+		return fmt.Sprintf("порт %d", n)
+	}
+	return "неизвестный порт"
 }
 
 /*
@@ -212,7 +229,7 @@ type cfgutilJSON struct {
 /*
 ──────────────────────────────────────────────────────────
 
-	error-code → человекочитаемый текст
+	Error-code → человекочитаемый текст
 
 ──────────────────────────────────────────────────────────
 */
@@ -238,14 +255,15 @@ func mapRestoreErrorCode(code string) string {
 
 ──────────────────────────────────────────────────────────
 */
-func hexToDec(h string) (string, error) {
-	clean := strings.TrimPrefix(strings.ToLower(h), "0x")
+func hexToDec(hexStr string) (string, error) {
+	clean := strings.TrimPrefix(strings.ToLower(hexStr), "0x")
 	v, err := strconv.ParseUint(clean, 16, 64)
 	if err != nil {
 		return "", fmt.Errorf("hex→dec: %w", err)
 	}
 	return strconv.FormatUint(v, 10), nil
 }
+
 func isDigits(s string) bool {
 	if s == "" {
 		return false
@@ -257,6 +275,7 @@ func isDigits(s string) bool {
 	}
 	return true
 }
+
 func normalizeECIDForCfgutil(ecid string) (string, error) {
 	if ecid == "" {
 		return "", fmt.Errorf("ECID пуст")

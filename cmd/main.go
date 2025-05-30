@@ -66,8 +66,6 @@ func main() {
 		go debugConnectedDevices(ctx, devMon, 30*time.Second)
 	}
 
-	log.Println("✅ Mac Provisioner готов. Нажмите Ctrl+C для выхода.")
-
 	<-sigChan
 
 	// graceful exit

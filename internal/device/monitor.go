@@ -186,8 +186,6 @@ func (m *Monitor) Start(ctx context.Context) error {
 	m.running = true
 	m.ctx, m.cancel = context.WithCancel(ctx)
 
-	log.Println("🔍 Запуск мониторинга USB-устройств…")
-
 	if err := m.initialScan(); err != nil {
 		log.Printf("⚠️  Начальное сканирование: %v", err)
 	}
@@ -195,7 +193,6 @@ func (m *Monitor) Start(ctx context.Context) error {
 	go m.monitorLoop()
 	go m.cleanupLoop()
 
-	log.Println("✅ Мониторинг USB-устройств запущен")
 	return nil
 }
 
@@ -424,7 +421,6 @@ func (m *Monitor) sendEvent(e Event) {
 }
 
 func (m *Monitor) initialScan() error {
-	log.Println("🔍 Первое сканирование USB…")
 	devs := m.fetchCurrentUSBDevices()
 
 	m.devicesMutex.Lock()

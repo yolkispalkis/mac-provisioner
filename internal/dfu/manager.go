@@ -122,7 +122,6 @@ EnterDFUMode инициирует переход в DFU.
 func (m *Manager) EnterDFUMode(ctx context.Context, usbLocation string) error {
 	// 0. Проверка «правильного» порта
 	if !isDFUPortLocation(usbLocation) {
-		log.Print("⚠️  Кабель не в DFU-порту — авто-DFU пропущен.")
 		return errors.New(errAutoDFUUnavailable)
 	}
 

@@ -197,7 +197,7 @@ func (m *Manager) announceLoop(ctx context.Context, done <-chan struct{}, dev *d
 ──────────────────────────────────────────────────────────
 */
 
-const configuratorTmpRel = "Library/Containers/com.apple.configurator.xpc.DeviceService/Data/tmp"
+const configuratorTmpRel = "Library/Containers/com.apple.configurator.xpc.DeviceService/Data/tmp/TemporaryItems"
 
 // tryCleanupCache запускает очистку кеша, если нет активных прошивок.
 func (m *Manager) tryCleanupCache() {

@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -34,6 +36,8 @@ type Manager struct {
 	processing    map[string]bool
 	processingUSB map[string]bool
 	mu            sync.RWMutex
+
+	cleaningCache bool // true – идёт асинхронная очистка кеша
 }
 
 func New(dfuMgr *dfu.Manager, n *notification.Manager, v *voice.Engine) *Manager {
@@ -85,6 +89,9 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 			delete(m.processingUSB, dev.USBLocation)
 		}
 		m.mu.Unlock()
+
+		// Если больше нет активных прошивок – чистим кеш Configurator
+		m.tryCleanupCache()
 	}()
 
 	// проверки
@@ -185,6 +192,62 @@ func (m *Manager) announceLoop(ctx context.Context, done <-chan struct{}, dev *d
 /*
 ──────────────────────────────────────────────────────────
 
+	Apple Configurator cache cleanup
+
+──────────────────────────────────────────────────────────
+*/
+
+const configuratorTmpRel = "Library/Containers/com.apple.configurator.xpc.DeviceService/Data/tmp"
+
+// tryCleanupCache запускает очистку кеша, если нет активных прошивок.
+func (m *Manager) tryCleanupCache() {
+	m.mu.Lock()
+	if len(m.processing) > 0 || m.cleaningCache {
+		m.mu.Unlock()
+		return
+	}
+	m.cleaningCache = true
+	m.mu.Unlock()
+
+	go func() {
+		if err := m.cleanConfiguratorCache(); err != nil {
+			log.Printf("⚠️ Очистка кеша Apple Configurator: %v", err)
+		} else {
+			log.Print("🧹 Кеш Apple Configurator очищен")
+		}
+		m.mu.Lock()
+		m.cleaningCache = false
+		m.mu.Unlock()
+	}()
+}
+
+func (m *Manager) cleanConfiguratorCache() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("home dir: %w", err)
+	}
+
+	cacheDir := filepath.Join(home, configuratorTmpRel)
+
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // директории нет – нечего чистить
+		}
+		return err
+	}
+
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(cacheDir, e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+/*
+──────────────────────────────────────────────────────────
+
 	PORT helper 0x00100000/1 → «порт 1, хаб 1»
 
 ──────────────────────────────────────────────────────────
@@ -196,47 +259,24 @@ func humanPort(loc string) string {
 		return "неизвестный порт"
 	}
 
-	// ── 1. Отбрасываем всё после «/» (динамический адрес контроллера)
-	base := strings.Split(loc, "/")[0]
-	base = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(base), "0x"))
-	if base == "" {
-		return "неизвестный порт"
-	}
+	// 1) делим по «/»: первая часть — root-порт, остальные — хабы
+	parts := strings.Split(loc, "/")
+	rootRaw := strings.TrimSpace(parts[0])
 
-	// ── 2. Приводим к ровно 8 hex-символам (32 бита Location ID)
-	switch {
-	case len(base) < 8:
-		base = strings.Repeat("0", 8-len(base)) + base
-	case len(base) > 8:
-		base = base[len(base)-8:]
-	}
-
-	// ── 3. Проходим по каждому нибблу слева-направо, собираем ненулевые
-	var ports []int // первый — root, остальные — хабы
-	for i := 0; i < len(base); i++ {
-		v, err := strconv.ParseInt(base[i:i+1], 16, 0)
-		if err != nil {
-			return "неизвестный порт"
-		}
-		if v != 0 {
-			ports = append(ports, int(v)) // v = port+1  → говорим как есть
+	// — корневой порт
+	rootStr := "неизвестный"
+	if m := rxRoot.FindStringSubmatch(rootRaw); len(m) == 3 {
+		if n, err := strconv.ParseInt(m[2], 16, 0); err == nil {
+			rootStr = fmt.Sprintf("порт %d", n)
 		}
 	}
-	if len(ports) == 0 {
-		return "неизвестный порт"
-	}
 
-	root := ports[0]
-	if len(ports) == 1 {
-		return fmt.Sprintf("порт %d", root)
+	// — цепочка хабов, если есть
+	if len(parts) == 1 {
+		return rootStr
 	}
-
-	// ── 4. Собираем цепочку хабов
-	hubs := make([]string, len(ports)-1)
-	for i, p := range ports[1:] {
-		hubs[i] = strconv.Itoa(p)
-	}
-	return fmt.Sprintf("хаб %s, порт %d", strings.Join(hubs, "-"), root)
+	hubs := strings.Join(parts[1:], "-")
+	return fmt.Sprintf("хаб %s, порт %d", hubs, rootStr)
 }
 
 /*

@@ -1,6 +1,7 @@
 package notification
 
 import (
+	"log"
 	"os/exec"
 	"time"
 
@@ -117,6 +118,7 @@ func (m *Manager) sp(pr voice.Priority, txt string) {
 	if !m.cfg.Enabled {
 		return
 	}
+	log.Print("[Notify] ", txt)
 	m.voice.Speak(pr, txt)
 }
 

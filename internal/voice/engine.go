@@ -14,14 +14,15 @@ import (
 )
 
 /*
-Пример:
+Использование:
 
         v := voice.New(voice.Config{
                 Voice:  "Milena",
                 Rate:   200,
-                Volume: 0.8,
+                Volume: 0.8, // громкость фоновой мелодии 0.0…1.0
         })
 
+        v.Speak(voice.Normal, "Начинается прошивка")
         v.MelodyOn()
         …
         v.MelodyOff()
@@ -32,7 +33,7 @@ type Priority int
 
 const (
 	System Priority = iota // немедленно
-	High                   // в голову очереди
+	High                   // сначала очереди
 	Normal                 // FIFO
 	Low                    // может быть отброшен
 )
@@ -42,7 +43,7 @@ const (
 type Config struct {
 	Voice        string
 	Rate         int
-	Volume       float64       // громкость мелодии 0.0…1.0
+	Volume       float64       // 0.0…1.0 (для MelodyOn)
 	MaxQueue     int           // ёмкость канала
 	DebounceSame time.Duration // анти-спам одинаковых фраз
 	MergeWindow  time.Duration // «склейка» сообщений
@@ -72,6 +73,7 @@ type Engine struct {
 }
 
 func New(c Config) *Engine {
+	// значения по умолчанию
 	if c.MaxQueue == 0 {
 		c.MaxQueue = 50
 	}
@@ -85,7 +87,7 @@ func New(c Config) *Engine {
 		c.MinInterval = 300 * time.Millisecond
 	}
 	if c.Volume <= 0 || c.Volume > 1 {
-		c.Volume = 0.8
+		c.Volume = 0.8 // 80 %
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -116,6 +118,7 @@ func (e *Engine) Speak(p Priority, text string) {
 		return
 	}
 
+	// anti-spam: одинаковая фраза не чаще DebounceSame
 	e.mu.Lock()
 	if t, ok := e.lastSpoken[text]; ok && time.Since(t) < e.cfg.DebounceSame {
 		e.mu.Unlock()
@@ -129,6 +132,7 @@ func (e *Engine) Speak(p Priority, text string) {
 	select {
 	case e.queue <- msg:
 	default:
+		// очередь заполнена
 		if p <= High { // вытесняем менее важное
 			<-e.queue
 			e.queue <- msg
@@ -137,30 +141,30 @@ func (e *Engine) Speak(p Priority, text string) {
 }
 
 /*
-MelodyOn — бесконечный зацикленный звук.
-Если уже играет — повторный вызов игнорируется.
+MelodyOn — запускает «бесконечный» afplay через while-loop.
+Если мелодия уже играет — повторный вызов игнорируется.
 */
 func (e *Engine) MelodyOn() {
 	if e.melodyCmd != nil &&
 		e.melodyCmd.Process != nil &&
 		e.melodyCmd.ProcessState == nil {
-		return
+		return // уже играет
 	}
 
+	// основной и резервный звук macOS
 	sound := "/System/Library/Sounds/Submarine.aiff"
 	if _, err := os.Stat(sound); err != nil {
-		sound = "/System/Library/Sounds/Hero.aiff" // запасной
+		sound = "/System/Library/Sounds/Hero.aiff"
 	}
 
 	volArg := fmt.Sprintf("%.2f", e.cfg.Volume)
 
+	// бесконечный цикл через оболочку sh
+	loopCmd := fmt.Sprintf(`while true; do afplay -q 1 -v %s %s; done`, volArg, sound)
+
 	e.melodyCmd = exec.CommandContext(
 		e.ctx,
-		"afplay",
-		"-q", "1",
-		"-v", volArg,
-		"-l", "0", // ∞ loop
-		sound, // ← ФАЙЛ ДОЛЖЕН БЫТЬ ПОСЛЕ ОПЦИЙ
+		"sh", "-c", loopCmd,
 	)
 
 	if err := e.melodyCmd.Start(); err != nil {

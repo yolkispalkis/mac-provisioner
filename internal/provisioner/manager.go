@@ -23,11 +23,10 @@ import (
 
 /*
 ──────────────────────────────────────────────────────────
-
-	STRUCT
-
+        STRUCT
 ──────────────────────────────────────────────────────────
 */
+
 type Manager struct {
 	dfuMgr *dfu.Manager
 	notif  *notification.Manager
@@ -52,11 +51,10 @@ func New(dfuMgr *dfu.Manager, n *notification.Manager, v *voice.Engine) *Manager
 
 /*
 ──────────────────────────────────────────────────────────
-
-	PUBLIC
-
+        PUBLIC
 ──────────────────────────────────────────────────────────
 */
+
 func (m *Manager) IsProcessingUSB(port string) bool {
 	if port == "" {
 		return false
@@ -69,11 +67,11 @@ func (m *Manager) IsProcessingUSB(port string) bool {
 func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	uid := dev.UniqueID()
 
-	// блокировка повторной обработки
+	// ── блокировка повторной обработки ────────────────────
 	m.mu.Lock()
 	if m.processing[uid] {
 		m.mu.Unlock()
-		log.Printf("ℹ️ Уже обрабатывается: %s", dev.GetFriendlyName())
+		log.Printf("ℹ️  Уже обрабатывается: %s", dev.GetFriendlyName())
 		return
 	}
 	m.processing[uid] = true
@@ -94,7 +92,7 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 		m.tryCleanupCache()
 	}()
 
-	// проверки
+	// ── проверки ───────────────────────────────────────────
 	if !dev.IsDFU || dev.ECID == "" {
 		m.notif.RestoreFailed(dev, "устройство не в DFU или нет ECID")
 		return
@@ -105,7 +103,7 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 		return
 	}
 
-	// звук
+	// ── звук / уведомления ────────────────────────────────
 	m.voice.MelodyOn()
 	defer m.voice.MelodyOff()
 	m.notif.StartingRestore(dev)
@@ -113,12 +111,14 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	annDone := make(chan struct{})
 	go m.announceLoop(ctx, annDone, dev)
 
-	// cfgutil restore
+	// ── cfgutil restore ───────────────────────────────────
 	restoreCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(restoreCtx,
-		"cfgutil", "--ecid", decECID, "--format", "JSON", "restore")
+	cmd := exec.CommandContext(
+		restoreCtx,
+		"cfgutil", "--ecid", decECID, "--format", "JSON", "restore",
+	)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -126,33 +126,35 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	runErr := cmd.Run()
 	close(annDone)
 
-	if runErr != nil {
-		msg := "не удалось запустить cfgutil"
+	// --- 1. пытаемся извлечь JSON-ответ -------------------
+	jsonLine := lastJSONLine(stdout.String())
+
+	if jsonLine == "" {
+		// JSON нет → обобщённая ошибка/таймаут
+		msg := "cfgutil завершился с ошибкой"
 		if restoreCtx.Err() == context.DeadlineExceeded {
 			msg = "таймаут cfgutil restore"
 		}
-		log.Printf("⚠️ cfgutil error: %v — %s", runErr, stderr.String())
+		if runErr != nil {
+			log.Printf("⚠️  cfgutil error: %v — %s", runErr, stderr.String())
+		}
 		m.notif.RestoreFailed(dev, msg)
 		return
 	}
 
-	line := strings.TrimSpace(stdout.String())
-	if line == "" {
-		m.notif.RestoreFailed(dev, "пустой ответ cfgutil")
-		return
-	}
-
 	var resp cfgutilJSON
-	if err := json.Unmarshal([]byte(line), &resp); err != nil {
-		log.Printf("⚠️ bad cfgutil JSON: %v\n%s", err, line)
+	if err := json.Unmarshal([]byte(jsonLine), &resp); err != nil {
+		log.Printf("⚠️  bad cfgutil JSON: %v\n%s", err, jsonLine)
 		m.notif.RestoreFailed(dev, "некорректный ответ cfgutil")
 		return
 	}
 
+	// --- 2. интерпретируем JSON ---------------------------
 	switch resp.Type {
 	case "CommandOutput":
 		log.Printf("🎉 Прошивка успешна: %s", dev.GetFriendlyName())
 		m.notif.RestoreCompleted(dev)
+
 	case "Error":
 		human := mapRestoreErrorCode(strconv.Itoa(resp.Code))
 		if human == "" {
@@ -160,6 +162,7 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 		}
 		m.notif.RestoreFailed(dev, human)
 		log.Printf("❌ cfgutil Error (%d): %s", resp.Code, resp.Message)
+
 	default:
 		m.notif.RestoreFailed(dev, "неизвестный ответ cfgutil")
 	}
@@ -167,11 +170,10 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 
 /*
 ──────────────────────────────────────────────────────────
-
-	Periodic “in-progress” announcements
-
+        Periodic “in-progress” announcements
 ──────────────────────────────────────────────────────────
 */
+
 func (m *Manager) announceLoop(ctx context.Context, done <-chan struct{}, dev *device.Device) {
 	t := time.NewTicker(60 * time.Second)
 	defer t.Stop()
@@ -191,15 +193,12 @@ func (m *Manager) announceLoop(ctx context.Context, done <-chan struct{}, dev *d
 
 /*
 ──────────────────────────────────────────────────────────
-
-	Apple Configurator cache cleanup
-
+        Apple Configurator cache cleanup
 ──────────────────────────────────────────────────────────
 */
 
 const configuratorTmpRel = "Library/Containers/com.apple.configurator.xpc.DeviceService/Data/tmp/TemporaryItems"
 
-// tryCleanupCache запускает очистку кеша, если нет активных прошивок.
 func (m *Manager) tryCleanupCache() {
 	m.mu.Lock()
 	if len(m.processing) > 0 || m.cleaningCache {
@@ -211,9 +210,9 @@ func (m *Manager) tryCleanupCache() {
 
 	go func() {
 		if err := m.cleanConfiguratorCache(); err != nil {
-			log.Printf("⚠️ Очистка кеша Apple Configurator: %v", err)
+			log.Printf("⚠️  Очистка кеша Apple Configurator: %v", err)
 		} else {
-			log.Print("🧹 Кеш Apple Configurator очищен")
+			log.Print("🧹  Кеш Apple Configurator очищен")
 		}
 		m.mu.Lock()
 		m.cleaningCache = false
@@ -232,7 +231,7 @@ func (m *Manager) cleanConfiguratorCache() error {
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil // директории нет – нечего чистить
+			return nil
 		}
 		return err
 	}
@@ -247,11 +246,10 @@ func (m *Manager) cleanConfiguratorCache() error {
 
 /*
 ──────────────────────────────────────────────────────────
-
-	PORT helper 0x00100000/1 → «порт 1, хаб 1»
-
+        PORT helper 0x00100000/1 → «порт 1, хаб 1»
 ──────────────────────────────────────────────────────────
 */
+
 var rxRoot = regexp.MustCompile(`(?i)^(0x)?00([0-9a-f])0000`)
 
 func humanPort(loc string) string {
@@ -259,14 +257,12 @@ func humanPort(loc string) string {
 		return "неизвестный порт"
 	}
 
-	// ── 1. Отбрасываем всё после «/» (динамический адрес контроллера)
 	base := strings.Split(loc, "/")[0]
 	base = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(base), "0x"))
 	if base == "" {
 		return "неизвестный порт"
 	}
 
-	// ── 2. Приводим к ровно 8 hex-символам (32 бита Location ID)
 	switch {
 	case len(base) < 8:
 		base = strings.Repeat("0", 8-len(base)) + base
@@ -274,15 +270,14 @@ func humanPort(loc string) string {
 		base = base[len(base)-8:]
 	}
 
-	// ── 3. Проходим по каждому нибблу слева-направо, собираем ненулевые
-	var ports []int // первый — root, остальные — хабы
+	var ports []int
 	for i := 0; i < len(base); i++ {
 		v, err := strconv.ParseInt(base[i:i+1], 16, 0)
 		if err != nil {
 			return "неизвестный порт"
 		}
 		if v != 0 {
-			ports = append(ports, int(v)) // v = port+1  → говорим как есть
+			ports = append(ports, int(v))
 		}
 	}
 	if len(ports) == 0 {
@@ -294,7 +289,6 @@ func humanPort(loc string) string {
 		return fmt.Sprintf("порт %d", root)
 	}
 
-	// ── 4. Собираем цепочку хабов
 	hubs := make([]string, len(ports)-1)
 	for i, p := range ports[1:] {
 		hubs[i] = strconv.Itoa(p)
@@ -304,11 +298,10 @@ func humanPort(loc string) string {
 
 /*
 ──────────────────────────────────────────────────────────
-
-	cfgutil JSON → struct
-
+        cfgutil JSON → struct
 ──────────────────────────────────────────────────────────
 */
+
 type cfgutilJSON struct {
 	Type    string `json:"Type"`
 	Message string `json:"Message,omitempty"`
@@ -317,11 +310,10 @@ type cfgutilJSON struct {
 
 /*
 ──────────────────────────────────────────────────────────
-
-	mapRestoreErrorCode
-
+        mapRestoreErrorCode
 ──────────────────────────────────────────────────────────
 */
+
 func mapRestoreErrorCode(code string) string {
 	switch code {
 	case "21":
@@ -339,11 +331,10 @@ func mapRestoreErrorCode(code string) string {
 
 /*
 ──────────────────────────────────────────────────────────
-
-	ECID helpers
-
+        ECID helpers
 ──────────────────────────────────────────────────────────
 */
+
 func hexToDec(hexStr string) (string, error) {
 	clean := strings.TrimPrefix(strings.ToLower(hexStr), "0x")
 	v, err := strconv.ParseUint(clean, 16, 64)
@@ -352,6 +343,7 @@ func hexToDec(hexStr string) (string, error) {
 	}
 	return strconv.FormatUint(v, 10), nil
 }
+
 func isDigits(s string) bool {
 	if s == "" {
 		return false
@@ -363,6 +355,7 @@ func isDigits(s string) bool {
 	}
 	return true
 }
+
 func normalizeECIDForCfgutil(ecid string) (string, error) {
 	if ecid == "" {
 		return "", fmt.Errorf("ECID пуст")
@@ -371,4 +364,21 @@ func normalizeECIDForCfgutil(ecid string) (string, error) {
 		return ecid, nil
 	}
 	return hexToDec(ecid)
+}
+
+/*
+──────────────────────────────────────────────────────────
+        helper: достаём последнюю строку, похожую на JSON
+──────────────────────────────────────────────────────────
+*/
+
+func lastJSONLine(out string) string {
+	lines := strings.Split(out, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		l := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(l, "{") && strings.HasSuffix(l, "}") {
+			return l
+		}
+	}
+	return ""
 }

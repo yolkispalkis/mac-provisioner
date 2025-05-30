@@ -166,7 +166,7 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 ──────────────────────────────────────────────────────────
 */
 func (m *Manager) announceLoop(ctx context.Context, done <-chan struct{}, dev *device.Device) {
-	t := time.NewTicker(15 * time.Second)
+	t := time.NewTicker(60 * time.Second)
 	defer t.Stop()
 
 	for {

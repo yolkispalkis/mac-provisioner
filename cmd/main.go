@@ -187,8 +187,6 @@ func enterDFUFlow(
 			} else {
 				notif.Error(fmt.Sprintf("Ошибка входа в DFU: %v", err))
 			}
-		} else {
-			notif.DFUModeEntered(d)
 		}
 	}(dev)
 }

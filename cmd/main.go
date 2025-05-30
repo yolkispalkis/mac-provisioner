@@ -185,7 +185,6 @@ func enterDFUFlow(
 		if err := dfuMgr.EnterDFUMode(ctx, d.USBLocation); err != nil {
 			if err.Error() == "macvdmtool недоступен, автоматический вход в DFU невозможен" {
 				notif.ManualDFURequired(d)
-				dfuMgr.OfferManualDFU(d.USBLocation)
 			} else {
 				notif.Error(fmt.Sprintf("Ошибка входа в DFU: %v", err))
 			}

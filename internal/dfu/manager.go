@@ -176,17 +176,6 @@ func (m *Manager) enterDFUWithMacvdmtool(ctx context.Context, usbLocation string
 	return m.WaitForDFUMode(ctx, usbLocation, 2*time.Minute)
 }
 
-// OfferManualDFU — подсказка при невозможности авто-DFU.
-func (m *Manager) OfferManualDFU(portHint string) {
-	log.Printf(`
-🔧 РУЧНОЙ DFU
-
-Устройство на порту %s не удалось перевести автоматически.
-Следуйте инструкции, чтобы ввести Mac в DFU/Recovery; после
-этого программа продолжит работу сама.
-`, portHint)
-}
-
 /*──────────────────────────────────────────────────────────
   WaitForDFUMode & USB-сканирование (без изменений)
   ──────────────────────────────────────────────────────────*/

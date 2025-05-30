@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"mac-provisioner/internal/device"
@@ -17,21 +18,67 @@ import (
 	"mac-provisioner/internal/notification"
 )
 
-/*
-──────────────────────────────────────────────────────────
+/*─────────────────────────────────────────────────────────
+                         melodyPlayer
+─────────────────────────────────────────────────────────*/
 
-	STRUCT
+type melodyPlayer struct {
+	mu   sync.Mutex
+	cmd  *exec.Cmd
+	ctx  context.Context
+	stop context.CancelFunc
+}
 
-──────────────────────────────────────────────────────────
-*/
+func newMelodyPlayer(parent context.Context, file string) *melodyPlayer {
+	ctx, cancel := context.WithCancel(parent)
+	p := &melodyPlayer{ctx: ctx, stop: cancel}
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				cmd := exec.CommandContext(ctx, "afplay", file)
+				p.mu.Lock()
+				p.cmd = cmd
+				p.mu.Unlock()
+				_ = cmd.Run() // когда файл закончится – перезапустим
+			}
+		}
+	}()
+	return p
+}
+
+func (p *melodyPlayer) Pause() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cmd != nil && p.cmd.Process != nil {
+		_ = p.cmd.Process.Signal(syscall.SIGSTOP)
+	}
+}
+
+func (p *melodyPlayer) Resume() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cmd != nil && p.cmd.Process != nil {
+		_ = p.cmd.Process.Signal(syscall.SIGCONT)
+	}
+}
+
+func (p *melodyPlayer) Stop() { p.stop() }
+
+/*─────────────────────────────────────────────────────────
+                          Manager
+─────────────────────────────────────────────────────────*/
+
 type Manager struct {
 	dfuManager *dfu.Manager
 	notifier   *notification.Manager
 
-	processing    map[string]bool // ключ — Device.UniqueID()
-	processingUSB map[string]bool // ключ — USBLocation (порт)
-
-	processingMu sync.RWMutex
+	processing    map[string]bool // Device.UniqueID()
+	processingUSB map[string]bool // USB-порт
+	processingMu  sync.RWMutex
 }
 
 func New(dfuMgr *dfu.Manager, notifier *notification.Manager) *Manager {
@@ -43,26 +90,20 @@ func New(dfuMgr *dfu.Manager, notifier *notification.Manager) *Manager {
 	}
 }
 
-/*
-──────────────────────────────────────────────────────────
-        PUBLIC
-──────────────────────────────────────────────────────────
-*/
+/*─────────────────────────────────────────────────────────
+                       PUBLIC API
+─────────────────────────────────────────────────────────*/
 
-// IsProcessingUSB — занят ли этот USB-порт активной прошивкой?
 func (m *Manager) IsProcessingUSB(loc string) bool {
-	if loc == "" {
-		return false
-	}
 	m.processingMu.RLock()
 	defer m.processingMu.RUnlock()
-	return m.processingUSB[loc]
+	return loc != "" && m.processingUSB[loc]
 }
 
 func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	uid := dev.UniqueID()
 
-	// ---- блокируем повторную обработку того же UID ----
+	// блокируем повторную обработку
 	m.processingMu.Lock()
 	if m.processing[uid] {
 		m.processingMu.Unlock()
@@ -71,11 +112,10 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	}
 	m.processing[uid] = true
 	if dev.USBLocation != "" {
-		m.processingUSB[dev.USBLocation] = true // отмечаем порт
+		m.processingUSB[dev.USBLocation] = true
 	}
 	m.processingMu.Unlock()
 
-	// по завершении снимаем отметки
 	defer func() {
 		m.processingMu.Lock()
 		delete(m.processing, uid)
@@ -85,14 +125,10 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 		m.processingMu.Unlock()
 	}()
 
-	//----------------------------------------------------
-
-	log.Printf("🚀 Старт прошивки: %s (ECID:%s)", dev.GetFriendlyName(), dev.ECID)
+	// ───────────────────────────────────────────────
 
 	if !dev.IsDFU || dev.ECID == "" {
-		errMsg := "устройство не готово к прошивке (нет DFU или ECID)"
-		log.Printf("❌ %s: %s", dev.GetFriendlyName(), errMsg)
-		m.notifier.RestoreFailed(dev, errMsg)
+		m.notifier.RestoreFailed(dev, "устройство не в DFU или нет ECID")
 		return
 	}
 
@@ -102,100 +138,119 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 		return
 	}
 
-	m.notifier.StartingRestore(dev)
+	// фоновая мелодия + периодические объявления
+	player := newMelodyPlayer(ctx, "/System/Library/Sounds/Submarine.aiff")
+	defer player.Stop()
 
-	/*
-	   ────────────────────────────────────────────
-	   cfgutil --format JSON restore
-	   ────────────────────────────────────────────
-	*/
+	m.speakWithMelody(player, func() { m.notifier.StartingRestore(dev) })
+
+	auxDone := make(chan struct{})
+	go m.announceLoop(ctx, auxDone, player, dev)
+
+	// ───────────────────────────────────────────────
+	// cfgutil --format JSON restore
+	// ───────────────────────────────────────────────
 	restoreCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 
 	cmd := exec.CommandContext(restoreCtx,
-		"cfgutil",
-		"--ecid", decECID,
-		"--format", "JSON",
-		"restore",
+		"cfgutil", "--ecid", decECID, "--format", "JSON", "restore",
 	)
 
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 
-	if err := cmd.Run(); err != nil {
-		// команда не запустилась или упала вне собственного отчёта
-		log.Printf("⚠️ cfgutil error: %v, stderr: %s", err, stderr.String())
-		human := "не удалось запустить cfgutil"
-		if restoreCtx.Err() == context.DeadlineExceeded {
-			human = "таймаут cfgutil restore"
-		}
-		m.notifier.RestoreFailed(dev, human)
+	runErr := cmd.Run()
+	close(auxDone) // стоп анонсов
+
+	if runErr != nil {
+		m.speakWithMelody(player, func() {
+			msg := "не удалось запустить cfgutil"
+			if restoreCtx.Err() == context.DeadlineExceeded {
+				msg = "таймаут cfgutil restore"
+			}
+			m.notifier.RestoreFailed(dev, msg)
+		})
 		return
 	}
 
-	// cfgutil всегда пишет ровно одну JSON-строку
 	line := strings.TrimSpace(stdout.String())
-	if line == "" {
-		m.notifier.RestoreFailed(dev, "пустой ответ cfgutil")
-		return
-	}
-
 	var resp cfgutilJSON
 	if err := json.Unmarshal([]byte(line), &resp); err != nil {
-		log.Printf("⚠️ Некорректный JSON от cfgutil: %v\n%s", err, line)
-		m.notifier.RestoreFailed(dev, "некорректный ответ cfgutil")
+		m.speakWithMelody(player, func() {
+			m.notifier.RestoreFailed(dev, "некорректный ответ cfgutil")
+		})
 		return
 	}
 
-	// --- анализ результата ---
 	switch resp.Type {
 	case "CommandOutput":
-		log.Printf("🎉 Прошивка завершена: %s", dev.GetFriendlyName())
-		m.notifier.RestoreCompleted(dev)
+		m.speakWithMelody(player, func() { m.notifier.RestoreCompleted(dev) })
 
 	case "Error":
-		humanErr := mapRestoreErrorCode(strconv.Itoa(resp.Code))
-		if humanErr == "" { // если кода нет в мапе — короткое сообщение
-			humanErr = resp.Message
+		human := mapRestoreErrorCode(strconv.Itoa(resp.Code))
+		if human == "" {
+			human = resp.Message
 		}
-		m.notifier.RestoreFailed(dev, humanErr)
-		log.Printf("❌ cfgutil Error (%d): %s", resp.Code, resp.Message)
+		m.speakWithMelody(player, func() { m.notifier.RestoreFailed(dev, human) })
 
 	default:
-		m.notifier.RestoreFailed(dev, "неизвестный ответ cfgutil")
-		log.Printf("⚠️ Неизвестный Type %q в JSON cfgutil", resp.Type)
+		m.speakWithMelody(player, func() { m.notifier.RestoreFailed(dev, "неизвестный ответ cfgutil") })
 	}
 }
 
-/*
-──────────────────────────────────────────────────────────
+/*─────────────────────────────────────────────────────────
+                 Melody ↔ Speech кооперация
+─────────────────────────────────────────────────────────*/
 
-	JSON-ответ cfgutil
+func (m *Manager) speakWithMelody(mp *melodyPlayer, speakFn func()) {
+	mp.Pause()
+	speakFn()
+	for m.notifier.IsPlaying() {
+		time.Sleep(150 * time.Millisecond)
+	}
+	mp.Resume()
+}
 
-──────────────────────────────────────────────────────────
-*/
+func (m *Manager) announceLoop(ctx context.Context, done <-chan struct{},
+	mp *melodyPlayer, dev *device.Device) {
+
+	t := time.NewTicker(15 * time.Second)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-t.C:
+			port := strings.TrimPrefix(dev.USBLocation, "0x")
+			msg := fmt.Sprintf("идёт прошивка %s, порт %s",
+				dev.GetReadableModel(), port)
+			m.speakWithMelody(mp, func() { m.notifier.RestoreProgress(dev, msg) })
+		}
+	}
+}
+
+/*─────────────────────────────────────────────────────────
+                   cfgutil JSON ответ
+─────────────────────────────────────────────────────────*/
+
 type cfgutilJSON struct {
-	// Для Error-ветки
-	Domain  string `json:"Domain,omitempty"`
+	Type    string `json:"Type"`
 	Message string `json:"Message,omitempty"`
 	Code    int    `json:"Code,omitempty"`
-	Type    string `json:"Type"`
 
-	// Для успешного завершения
 	Command string   `json:"Command,omitempty"`
 	Devices []string `json:"Devices,omitempty"`
 }
 
-/*
-──────────────────────────────────────────────────────────
+/*─────────────────────────────────────────────────────────
+             mapRestoreErrorCode (как раньше)
+─────────────────────────────────────────────────────────*/
 
-	Ошибка cfgutil → короткое пояснение
-
-──────────────────────────────────────────────────────────
-*/
 func mapRestoreErrorCode(codeStr string) string {
-	// встречаются коды 9, 14, 21, 40 …
 	switch codeStr {
 	case "21":
 		return "ошибка восстановления (код 21)"
@@ -210,13 +265,10 @@ func mapRestoreErrorCode(codeStr string) string {
 	}
 }
 
-/*
-──────────────────────────────────────────────────────────
+/*─────────────────────────────────────────────────────────
+             ECID helpers (без изменений)
+─────────────────────────────────────────────────────────*/
 
-	UTILITIES (ECID helpers)
-
-──────────────────────────────────────────────────────────
-*/
 func hexToDec(hexStr string) (string, error) {
 	clean := strings.TrimPrefix(strings.ToLower(hexStr), "0x")
 	val, err := strconv.ParseUint(clean, 16, 64)
@@ -225,7 +277,6 @@ func hexToDec(hexStr string) (string, error) {
 	}
 	return strconv.FormatUint(val, 10), nil
 }
-
 func isDigits(s string) bool {
 	if s == "" {
 		return false
@@ -237,7 +288,6 @@ func isDigits(s string) bool {
 	}
 	return true
 }
-
 func normalizeECIDForCfgutil(ecid string) (string, error) {
 	if ecid == "" {
 		return "", fmt.Errorf("ECID пуст")

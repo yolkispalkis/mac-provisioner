@@ -115,7 +115,7 @@ func (m *Monitor) monitorLoop() {
 	}
 }
 
-// checkAndTriggerDFU с новой логикой
+// checkAndTriggerDFU с исправленной логикой
 func (m *Monitor) checkAndTriggerDFU() {
 	if m.dfuTriggerFunc == nil {
 		return
@@ -127,23 +127,18 @@ func (m *Monitor) checkAndTriggerDFU() {
 	// Ищем все DFU-порты и определяем, какие устройства на них подключены
 	dfuPorts := make(map[string]*Device) // key = USB location, value = device (или nil если порт пустой)
 
-	// Сначала находим все DFU-порты
+	// Находим все устройства на DFU-портах
 	for _, dev := range m.devices {
 		if m.isDFUPort(dev.USBLocation) {
 			dfuPorts[dev.USBLocation] = dev
 		}
 	}
 
-	// Если нет DFU-портов вообще, добавляем основной порт как пустой
-	if len(dfuPorts) == 0 {
-		dfuPorts["0x00100000/1"] = nil
-	}
-
-	// Проверяем каждый DFU-порт
+	// Проверяем каждый найденный DFU-порт
 	for usbLocation, dev := range dfuPorts {
 		// Пропускаем порты, где идет обработка
 		if m.processingChecker != nil && m.processingChecker(usbLocation) {
-			if m.debugMode && dev != nil {
+			if m.debugMode {
 				log.Printf("🔍 [DEBUG] Порт %s занят обработкой %s", usbLocation, dev.GetDisplayName())
 			}
 			continue
@@ -153,12 +148,22 @@ func (m *Monitor) checkAndTriggerDFU() {
 		var deviceName string
 
 		if dev != nil {
-			// На порту есть устройство
 			deviceECID = dev.ECID
 			deviceName = dev.GetDisplayName()
 
 			// Проверяем только устройства, которые нужно переводить в DFU
-			if !dev.IsNormalMac() && !(dev.IsDFU && dev.State == "Recovery") {
+			// НЕ запускаем DFU для устройств уже в DFU режиме!
+			if dev.IsDFU {
+				if m.debugMode {
+					log.Printf("🔍 [DEBUG] Пропускаем DFU для %s - устройство уже в DFU/Recovery режиме", deviceName)
+				}
+				continue
+			}
+
+			if !dev.IsNormalMac() {
+				if m.debugMode {
+					log.Printf("🔍 [DEBUG] Пропускаем DFU для %s - не обычный Mac", deviceName)
+				}
 				continue
 			}
 		}
@@ -175,17 +180,43 @@ func (m *Monitor) checkAndTriggerDFU() {
 					}
 					log.Printf("⚡ Запуск автоматического DFU для %s", deviceName)
 				} else {
+					// Этот случай не должен происходить, так как мы итерируемся только по найденным устройствам
 					if m.debugMode {
-						log.Printf("🔍 [DEBUG] Запускаем DFU для пустого порта %s: %s",
-							usbLocation, reason)
+						log.Printf("🔍 [DEBUG] Неожиданная ситуация: пустой порт %s в списке устройств", usbLocation)
 					}
-					log.Printf("⚡ Запуск автоматического DFU (порт пустой)")
 				}
 				go m.dfuTriggerFunc(m.ctx)
 				return // Запускаем DFU только для одного порта за раз
 			} else {
 				if m.debugMode && dev != nil {
 					log.Printf("🔍 [DEBUG] Пропускаем DFU для %s: %s", deviceName, reason)
+				}
+			}
+		}
+	}
+
+	// Если нет устройств на DFU-портах вообще, запускаем DFU для пустого порта
+	if len(dfuPorts) == 0 {
+		// Проверяем, что нет активной обработки на основном порту
+		mainPort := "0x00100000/1"
+		if m.processingChecker != nil && m.processingChecker(mainPort) {
+			if m.debugMode {
+				log.Printf("🔍 [DEBUG] Основной порт %s занят обработкой", mainPort)
+			}
+			return
+		}
+
+		if m.cooldownChecker != nil {
+			shouldTrigger, reason := m.cooldownChecker("")
+			if shouldTrigger {
+				if m.debugMode {
+					log.Printf("🔍 [DEBUG] Запускаем DFU для пустого порта %s: %s", mainPort, reason)
+				}
+				log.Printf("⚡ Запуск автоматического DFU (порт пустой)")
+				go m.dfuTriggerFunc(m.ctx)
+			} else {
+				if m.debugMode {
+					log.Printf("🔍 [DEBUG] Пропускаем DFU для пустого порта: %s", reason)
 				}
 			}
 		}

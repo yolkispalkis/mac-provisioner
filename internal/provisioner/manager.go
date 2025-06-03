@@ -213,6 +213,10 @@ func (m *Manager) parseRestoreResult(output string) error {
 	case "CommandOutput":
 		return nil
 	case "Error":
+		// Специальная обработка ошибки 4014 - устройство принудительно переведено в DFU
+		if response.Code == 4014 {
+			return fmt.Errorf("устройство было принудительно переведено в DFU режим во время прошивки")
+		}
 		return fmt.Errorf(m.mapErrorCode(response.Code, response.Message))
 	default:
 		return fmt.Errorf("неизвестный тип ответа: %s", response.Type)
@@ -229,6 +233,8 @@ func (m *Manager) mapErrorCode(code int, message string) string {
 		return "ошибка восстановления системы"
 	case 40:
 		return "не удалось завершить прошивку"
+	case 4014:
+		return "устройство было принудительно переведено в DFU режим"
 	default:
 		return fmt.Sprintf("ошибка прошивки (код %d): %s", code, message)
 	}

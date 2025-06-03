@@ -36,7 +36,7 @@ type Monitor struct {
 	firstScan         bool
 	dfuTriggerFunc    func(context.Context)
 	processingChecker func(string) bool
-	cooldownChecker   func(string) (bool, time.Duration, string)
+	cooldownChecker   func(string) (bool, string)
 	debugMode         bool
 	deviceResolver    *DeviceResolver
 }
@@ -74,7 +74,7 @@ func (m *Monitor) SetProcessingChecker(checker func(string) bool) {
 	m.processingChecker = checker
 }
 
-func (m *Monitor) SetCooldownChecker(checker func(string) (bool, time.Duration, string)) {
+func (m *Monitor) SetCooldownChecker(checker func(string) (bool, string)) {
 	m.cooldownChecker = checker
 }
 
@@ -115,6 +115,7 @@ func (m *Monitor) monitorLoop() {
 	}
 }
 
+// checkAndTriggerDFU с новой логикой
 func (m *Monitor) checkAndTriggerDFU() {
 	if m.dfuTriggerFunc == nil {
 		return
@@ -123,41 +124,71 @@ func (m *Monitor) checkAndTriggerDFU() {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	needsDFUTrigger := false
-	var targetDevice *Device
+	// Ищем все DFU-порты и определяем, какие устройства на них подключены
+	dfuPorts := make(map[string]*Device) // key = USB location, value = device (или nil если порт пустой)
 
+	// Сначала находим все DFU-порты
 	for _, dev := range m.devices {
-		if (dev.IsNormalMac() || (dev.IsDFU && dev.State == "Recovery")) && m.isDFUPort(dev.USBLocation) {
-			if m.processingChecker != nil && m.processingChecker(dev.USBLocation) {
-				if m.debugMode {
-					log.Printf("🔍 [DEBUG] Устройство %s уже обрабатывается, пропускаем DFU триггер", dev.GetDisplayName())
-				}
-				continue
-			}
-
-			if m.cooldownChecker != nil {
-				inCooldown, remaining, lastDevice := m.cooldownChecker(dev.USBLocation)
-				if inCooldown {
-					if m.debugMode {
-						log.Printf("🔍 [DEBUG] Порт %s в периоде охлаждения (осталось %v, последнее устройство: %s)",
-							dev.USBLocation, remaining.Round(time.Minute), lastDevice)
-					}
-					continue
-				}
-			}
-
-			needsDFUTrigger = true
-			targetDevice = dev
-			break
+		if m.isDFUPort(dev.USBLocation) {
+			dfuPorts[dev.USBLocation] = dev
 		}
 	}
 
-	if needsDFUTrigger && targetDevice != nil {
-		if m.debugMode {
-			log.Printf("🔍 [DEBUG] Обнаружено устройство на DFU-порту: %s (%s)", targetDevice.GetDisplayName(), targetDevice.USBLocation)
+	// Если нет DFU-портов вообще, добавляем основной порт как пустой
+	if len(dfuPorts) == 0 {
+		dfuPorts["0x00100000/1"] = nil
+	}
+
+	// Проверяем каждый DFU-порт
+	for usbLocation, dev := range dfuPorts {
+		// Пропускаем порты, где идет обработка
+		if m.processingChecker != nil && m.processingChecker(usbLocation) {
+			if m.debugMode && dev != nil {
+				log.Printf("🔍 [DEBUG] Порт %s занят обработкой %s", usbLocation, dev.GetDisplayName())
+			}
+			continue
 		}
-		log.Printf("⚡ Запуск автоматического DFU для %s", targetDevice.GetDisplayName())
-		go m.dfuTriggerFunc(m.ctx)
+
+		var deviceECID string
+		var deviceName string
+
+		if dev != nil {
+			// На порту есть устройство
+			deviceECID = dev.ECID
+			deviceName = dev.GetDisplayName()
+
+			// Проверяем только устройства, которые нужно переводить в DFU
+			if !dev.IsNormalMac() && !(dev.IsDFU && dev.State == "Recovery") {
+				continue
+			}
+		}
+
+		// Проверяем, нужно ли запускать DFU
+		if m.cooldownChecker != nil {
+			shouldTrigger, reason := m.cooldownChecker(deviceECID)
+
+			if shouldTrigger {
+				if dev != nil {
+					if m.debugMode {
+						log.Printf("🔍 [DEBUG] Запускаем DFU для %s на порту %s: %s",
+							deviceName, usbLocation, reason)
+					}
+					log.Printf("⚡ Запуск автоматического DFU для %s", deviceName)
+				} else {
+					if m.debugMode {
+						log.Printf("🔍 [DEBUG] Запускаем DFU для пустого порта %s: %s",
+							usbLocation, reason)
+					}
+					log.Printf("⚡ Запуск автоматического DFU (порт пустой)")
+				}
+				go m.dfuTriggerFunc(m.ctx)
+				return // Запускаем DFU только для одного порта за раз
+			} else {
+				if m.debugMode && dev != nil {
+					log.Printf("🔍 [DEBUG] Пропускаем DFU для %s: %s", deviceName, reason)
+				}
+			}
+		}
 	}
 }
 

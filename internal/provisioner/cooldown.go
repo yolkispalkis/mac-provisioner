@@ -1,14 +1,16 @@
 package provisioner
 
 import (
+	"fmt"
 	"log"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 type CooldownEntry struct {
-	USBLocation   string
 	ECID          string
 	DeviceName    string
 	CompletedAt   time.Time
@@ -16,7 +18,7 @@ type CooldownEntry struct {
 }
 
 type CooldownManager struct {
-	entries        map[string]*CooldownEntry
+	entries        map[string]*CooldownEntry // key = normalized ECID
 	mutex          sync.RWMutex
 	cooldownPeriod time.Duration
 	debugMode      bool
@@ -35,7 +37,18 @@ func NewCooldownManager(cooldownPeriod time.Duration) *CooldownManager {
 }
 
 func (cm *CooldownManager) AddCompletedDevice(usbLocation, ecid, deviceName string) {
-	if usbLocation == "" {
+	if ecid == "" {
+		if cm.debugMode {
+			log.Printf("🔍 [DEBUG] Не добавляем в кулдаун - нет ECID для %s", deviceName)
+		}
+		return
+	}
+
+	normalizedECID := cm.normalizeECID(ecid)
+	if normalizedECID == "" {
+		if cm.debugMode {
+			log.Printf("🔍 [DEBUG] Не удалось нормализовать ECID %s для %s", ecid, deviceName)
+		}
 		return
 	}
 
@@ -44,59 +57,84 @@ func (cm *CooldownManager) AddCompletedDevice(usbLocation, ecid, deviceName stri
 
 	now := time.Now()
 	entry := &CooldownEntry{
-		USBLocation:   usbLocation,
-		ECID:          ecid,
+		ECID:          normalizedECID,
 		DeviceName:    deviceName,
 		CompletedAt:   now,
 		CooldownUntil: now.Add(cm.cooldownPeriod),
 	}
 
-	cm.entries[usbLocation] = entry
+	cm.entries[normalizedECID] = entry
 
 	log.Printf("🕒 %s добавлен в период охлаждения до %s",
 		deviceName, entry.CooldownUntil.Format("15:04"))
 }
 
-func (cm *CooldownManager) IsInCooldown(usbLocation string) (bool, *CooldownEntry) {
-	if usbLocation == "" {
-		return false, nil
+// IsDeviceInCooldown проверяет, находится ли конкретное устройство в кулдауне
+func (cm *CooldownManager) IsDeviceInCooldown(ecid string) (bool, time.Duration, string) {
+	if ecid == "" {
+		return false, 0, ""
+	}
+
+	normalizedECID := cm.normalizeECID(ecid)
+	if normalizedECID == "" {
+		return false, 0, ""
 	}
 
 	cm.mutex.RLock()
 	defer cm.mutex.RUnlock()
 
-	entry, exists := cm.entries[usbLocation]
+	entry, exists := cm.entries[normalizedECID]
 	if !exists {
-		return false, nil
-	}
-
-	if time.Now().Before(entry.CooldownUntil) {
-		return true, entry
-	}
-
-	return false, nil
-}
-
-func (cm *CooldownManager) GetCooldownInfo(usbLocation string) (bool, time.Duration, string) {
-	inCooldown, entry := cm.IsInCooldown(usbLocation)
-	if !inCooldown {
 		return false, 0, ""
 	}
 
-	remaining := time.Until(entry.CooldownUntil)
-	return true, remaining, entry.DeviceName
+	now := time.Now()
+	if now.Before(entry.CooldownUntil) {
+		remaining := entry.CooldownUntil.Sub(now)
+		return true, remaining, entry.DeviceName
+	}
+
+	return false, 0, ""
 }
 
-func (cm *CooldownManager) RemoveCooldown(usbLocation string) {
-	if usbLocation == "" {
+// ShouldTriggerDFU определяет, нужно ли запускать DFU для порта
+// Логика:
+// - Если порт пустой -> запускать DFU каждые 3 секунды
+// - Если есть устройство и оно НЕ в кулдауне -> запускать DFU
+// - Если есть устройство и оно в кулдауне -> НЕ запускать DFU
+func (cm *CooldownManager) ShouldTriggerDFU(deviceECID string) (bool, string) {
+	// Если устройства нет (порт пустой) - всегда разрешаем DFU
+	if deviceECID == "" {
+		return true, "порт пустой"
+	}
+
+	// Проверяем, в кулдауне ли устройство
+	inCooldown, remaining, deviceName := cm.IsDeviceInCooldown(deviceECID)
+	if inCooldown {
+		reason := fmt.Sprintf("устройство %s в кулдауне (осталось %v)",
+			deviceName, remaining.Round(time.Minute))
+		return false, reason
+	}
+
+	// Устройство есть, но не в кулдауне - разрешаем DFU
+	return true, "устройство не в кулдауне"
+}
+
+func (cm *CooldownManager) RemoveCooldown(ecid string) {
+	if ecid == "" {
+		return
+	}
+
+	normalizedECID := cm.normalizeECID(ecid)
+	if normalizedECID == "" {
 		return
 	}
 
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
 
-	if entry, exists := cm.entries[usbLocation]; exists {
-		delete(cm.entries, usbLocation)
+	if entry, exists := cm.entries[normalizedECID]; exists {
+		delete(cm.entries, normalizedECID)
 		log.Printf("🕒 Период охлаждения снят для %s", entry.DeviceName)
 	}
 }
@@ -118,6 +156,54 @@ func (cm *CooldownManager) GetAllCooldowns() []*CooldownEntry {
 	return active
 }
 
+// normalizeECID нормализует ECID для единообразного сравнения
+func (cm *CooldownManager) normalizeECID(ecid string) string {
+	if ecid == "" {
+		return ""
+	}
+
+	// Убираем префикс 0x и приводим к нижнему регистру
+	clean := strings.ToLower(strings.TrimPrefix(ecid, "0x"))
+
+	// Если это hex, конвертируем в decimal для единообразия
+	if cm.isHexString(clean) {
+		if value, err := strconv.ParseUint(clean, 16, 64); err == nil {
+			return strconv.FormatUint(value, 10)
+		}
+	}
+
+	// Если уже decimal, возвращаем как есть
+	if cm.isDecimalString(clean) {
+		return clean
+	}
+
+	return clean
+}
+
+func (cm *CooldownManager) isHexString(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func (cm *CooldownManager) isDecimalString(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func (cm *CooldownManager) cleanupLoop() {
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
@@ -134,9 +220,9 @@ func (cm *CooldownManager) cleanup() {
 	now := time.Now()
 	var removed []string
 
-	for location, entry := range cm.entries {
+	for ecid, entry := range cm.entries {
 		if now.After(entry.CooldownUntil) {
-			delete(cm.entries, location)
+			delete(cm.entries, ecid)
 			removed = append(removed, entry.DeviceName)
 		}
 	}

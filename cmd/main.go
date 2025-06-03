@@ -38,8 +38,8 @@ func main() {
 	deviceMonitor.SetProcessingChecker(func(usbLocation string) bool {
 		return provisionerManager.IsProcessingByUSB(usbLocation)
 	})
-	deviceMonitor.SetCooldownChecker(func(usbLocation string) (bool, time.Duration, string) {
-		return provisionerManager.IsInCooldown(usbLocation)
+	deviceMonitor.SetCooldownChecker(func(deviceECID string) (bool, string) {
+		return provisionerManager.ShouldTriggerDFU(deviceECID)
 	})
 
 	// Контекст для graceful shutdown
@@ -170,11 +170,12 @@ func handleDeviceConnected(
 		notifier.DFUModeEntered(dev)
 		go provisioner.ProcessDevice(ctx, dev)
 	} else if dev.IsDFU && dev.State == "Recovery" {
-		// Устройство в Recovery режиме - проверяем период охлаждения
-		if inCooldown, remaining, lastDevice := provisioner.IsInCooldown(dev.USBLocation); inCooldown {
+		// Устройство в Recovery режиме - проверяем кулдаун устройства
+		inCooldown, remaining, deviceName := provisioner.IsDeviceInCooldown(dev.ECID)
+		if inCooldown {
 			if os.Getenv("MAC_PROV_DEBUG") == "1" {
-				log.Printf("🔍 [DEBUG] Устройство %s подключено к порту в периоде охлаждения (осталось %v, последнее: %s)",
-					dev.GetDisplayName(), remaining.Round(time.Minute), lastDevice)
+				log.Printf("🔍 [DEBUG] Устройство %s в кулдауне (осталось %v, последнее: %s)",
+					dev.GetDisplayName(), remaining.Round(time.Minute), deviceName)
 			}
 			notifier.DeviceConnected(dev)
 		} else {
@@ -182,11 +183,12 @@ func handleDeviceConnected(
 			notifier.EnteringDFUMode(dev)
 		}
 	} else if dev.IsNormalMac() {
-		// Обычный Mac - проверяем период охлаждения
-		if inCooldown, remaining, lastDevice := provisioner.IsInCooldown(dev.USBLocation); inCooldown {
+		// Обычный Mac - проверяем кулдаун устройства
+		inCooldown, remaining, deviceName := provisioner.IsDeviceInCooldown(dev.ECID)
+		if inCooldown {
 			if os.Getenv("MAC_PROV_DEBUG") == "1" {
-				log.Printf("🔍 [DEBUG] Устройство %s подключено к порту в периоде охлаждения (осталось %v, последнее: %s)",
-					dev.GetDisplayName(), remaining.Round(time.Minute), lastDevice)
+				log.Printf("🔍 [DEBUG] Устройство %s в кулдауне (осталось %v, последнее: %s)",
+					dev.GetDisplayName(), remaining.Round(time.Minute), deviceName)
 			}
 			notifier.DeviceConnected(dev)
 		} else {
@@ -227,8 +229,8 @@ func debugCooldownStatus(ctx context.Context, provisioner *provisioner.Manager, 
 				log.Printf("🔍 [DEBUG] Активные периоды охлаждения (%d):", len(cooldowns))
 				for i, entry := range cooldowns {
 					remaining := time.Until(entry.CooldownUntil)
-					log.Printf("🔍 [DEBUG]   %d. %s (порт: %s, осталось: %v)",
-						i+1, entry.DeviceName, entry.USBLocation, remaining.Round(time.Minute))
+					log.Printf("🔍 [DEBUG]   %d. %s (ECID: %s, осталось: %v)",
+						i+1, entry.DeviceName, entry.ECID, remaining.Round(time.Minute))
 				}
 			}
 		}

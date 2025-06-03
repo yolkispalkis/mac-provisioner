@@ -66,8 +66,16 @@ func (m *Manager) IsProcessingByUSB(usbLocation string) bool {
 	return m.processingUSB[usbLocation]
 }
 
-func (m *Manager) IsInCooldown(usbLocation string) (bool, time.Duration, string) {
-	return m.cooldownManager.GetCooldownInfo(usbLocation)
+func (m *Manager) IsDeviceInCooldown(ecid string) (bool, time.Duration, string) {
+	return m.cooldownManager.IsDeviceInCooldown(ecid)
+}
+
+func (m *Manager) ShouldTriggerDFU(deviceECID string) (bool, string) {
+	return m.cooldownManager.ShouldTriggerDFU(deviceECID)
+}
+
+func (m *Manager) RemoveDeviceCooldown(ecid string) {
+	m.cooldownManager.RemoveCooldown(ecid)
 }
 
 func (m *Manager) MarkUSBProcessing(usbLocation string, processing bool) {
@@ -140,7 +148,7 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	} else {
 		log.Printf("✅ Прошивка завершена: %s", dev.GetDisplayName())
 		m.notifier.RestoreCompleted(dev)
-		// Используем красивое имя для периода охлаждения
+		// Добавляем устройство в кулдаун по ECID
 		m.cooldownManager.AddCompletedDevice(dev.USBLocation, dev.ECID, dev.GetDisplayName())
 	}
 }
@@ -269,8 +277,4 @@ func (m *Manager) announceProgress(ctx context.Context, dev *device.Device) {
 
 func (m *Manager) GetCooldownStatus() []*CooldownEntry {
 	return m.cooldownManager.GetAllCooldowns()
-}
-
-func (m *Manager) RemoveCooldown(usbLocation string) {
-	m.cooldownManager.RemoveCooldown(usbLocation)
 }

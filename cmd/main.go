@@ -31,7 +31,16 @@ func main() {
 	notifier := notification.New(cfg.Notifications, voiceEngine)
 	dfuManager := dfu.New()
 	deviceMonitor := device.NewMonitor(cfg.Monitoring)
-	provisionerManager := provisioner.New(dfuManager, notifier)
+	provisionerManager := provisioner.New(dfuManager, notifier, cfg.Provisioning)
+
+	// Настраиваем автоматический DFU триггер и проверки
+	deviceMonitor.SetDFUTrigger(dfuManager.AutoTriggerDFU)
+	deviceMonitor.SetProcessingChecker(func(usbLocation string) bool {
+		return provisionerManager.IsProcessingByUSB(usbLocation)
+	})
+	deviceMonitor.SetCooldownChecker(func(usbLocation string) (bool, time.Duration, string) {
+		return provisionerManager.IsInCooldown(usbLocation)
+	})
 
 	// Контекст для graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -43,6 +52,7 @@ func main() {
 
 	// Запуск системы
 	notifier.SystemStarted()
+	log.Printf("⚙️ Период охлаждения DFU: %v", cfg.Provisioning.DFUCooldownPeriod)
 
 	if err := deviceMonitor.Start(ctx); err != nil {
 		log.Fatalf("❌ Не удалось запустить мониторинг устройств: %v", err)
@@ -50,6 +60,11 @@ func main() {
 
 	// Обработка событий устройств
 	go handleDeviceEvents(ctx, deviceMonitor, provisionerManager, notifier, dfuManager)
+
+	// Периодический вывод статуса периодов охлаждения (для отладки)
+	if os.Getenv("MAC_PROV_DEBUG") == "1" {
+		go debugCooldownStatus(ctx, provisionerManager, 5*time.Minute)
+	}
 
 	// Ожидание сигнала завершения
 	<-sigChan
@@ -122,15 +137,25 @@ func handleDeviceConnected(
 		notifier.DFUModeEntered(dev)
 		go provisioner.ProcessDevice(ctx, dev)
 	} else if dev.IsDFU && dev.State == "Recovery" {
-		// Устройство в Recovery режиме - переводим в DFU
-		notifier.DeviceConnected(dev)
-		notifier.EnteringDFUMode(dev)
-		go enterDFUMode(ctx, dev, dfuMgr, notifier, provisioner)
+		// Устройство в Recovery режиме - проверяем период охлаждения
+		if inCooldown, remaining, lastDevice := provisioner.IsInCooldown(dev.USBLocation); inCooldown {
+			log.Printf("🕒 Устройство %s подключено к порту в периоде охлаждения (осталось %v, последнее: %s)",
+				dev.Name, remaining.Round(time.Minute), lastDevice)
+			notifier.DeviceConnected(dev)
+		} else {
+			notifier.DeviceConnected(dev)
+			notifier.EnteringDFUMode(dev)
+		}
 	} else if dev.IsNormalMac() {
-		// Обычный Mac - переводим в DFU
-		notifier.DeviceConnected(dev)
-		notifier.EnteringDFUMode(dev)
-		go enterDFUMode(ctx, dev, dfuMgr, notifier, provisioner)
+		// Обычный Mac - проверяем период охлаждения
+		if inCooldown, remaining, lastDevice := provisioner.IsInCooldown(dev.USBLocation); inCooldown {
+			log.Printf("🕒 Устройство %s подключено к порту в периоде охлаждения (осталось %v, последнее: %s)",
+				dev.Name, remaining.Round(time.Minute), lastDevice)
+			notifier.DeviceConnected(dev)
+		} else {
+			notifier.DeviceConnected(dev)
+			notifier.EnteringDFUMode(dev)
+		}
 	}
 }
 
@@ -148,18 +173,27 @@ func handleDeviceStateChanged(
 	}
 }
 
-func enterDFUMode(
-	ctx context.Context,
-	dev *device.Device,
-	dfuMgr *dfu.Manager,
-	notifier *notification.Manager,
-	provisioner *provisioner.Manager,
-) {
-	// Помечаем USB порт как обрабатываемый
-	provisioner.MarkUSBProcessing(dev.USBLocation, true)
-	defer provisioner.MarkUSBProcessing(dev.USBLocation, false)
+// debugCooldownStatus периодически выводит информацию о периодах охлаждения
+func debugCooldownStatus(ctx context.Context, provisioner *provisioner.Manager, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-	if err := dfuMgr.EnterDFUMode(ctx, dev.USBLocation); err != nil {
-		notifier.ManualDFURequired(dev)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cooldowns := provisioner.GetCooldownStatus()
+			if len(cooldowns) == 0 {
+				log.Println("🕒 Активных периодов охлаждения нет")
+			} else {
+				log.Printf("🕒 Активные периоды охлаждения (%d):", len(cooldowns))
+				for i, entry := range cooldowns {
+					remaining := time.Until(entry.CooldownUntil)
+					log.Printf("  %d. %s (порт: %s, осталось: %v)",
+						i+1, entry.DeviceName, entry.USBLocation, remaining.Round(time.Minute))
+				}
+			}
+		}
 	}
 }

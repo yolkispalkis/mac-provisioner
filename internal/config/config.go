@@ -11,6 +11,7 @@ import (
 type Config struct {
 	Monitoring    MonitoringConfig   `yaml:"monitoring"`
 	Notifications NotificationConfig `yaml:"notifications"`
+	Provisioning  ProvisioningConfig `yaml:"provisioning"`
 }
 
 type MonitoringConfig struct {
@@ -25,6 +26,11 @@ type NotificationConfig struct {
 	Volume  float64 `yaml:"volume"`
 }
 
+type ProvisioningConfig struct {
+	DFUCooldownPeriod time.Duration `yaml:"dfu_cooldown_period"`
+	MaxConcurrent     int           `yaml:"max_concurrent"`
+}
+
 func Load() (*Config, error) {
 	cfg := &Config{
 		Monitoring: MonitoringConfig{
@@ -36,6 +42,10 @@ func Load() (*Config, error) {
 			Voice:   "Milena",
 			Rate:    200,
 			Volume:  0.8,
+		},
+		Provisioning: ProvisioningConfig{
+			DFUCooldownPeriod: 1 * time.Hour,
+			MaxConcurrent:     10,
 		},
 	}
 

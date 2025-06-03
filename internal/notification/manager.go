@@ -67,7 +67,7 @@ func (m *Manager) RestoreProgress(dev *device.Device, status string) {
 
 func (m *Manager) RestoreCompleted(dev *device.Device) {
 	m.playSound("Glass")
-	m.speak(voice.High, "Прошивка завершена для "+dev.GetReadableName())
+	m.speak(voice.High, "Прошивка завершена для "+dev.GetReadableName()+". Устройство добавлено в период охлаждения")
 }
 
 func (m *Manager) RestoreFailed(dev *device.Device, reason string) {

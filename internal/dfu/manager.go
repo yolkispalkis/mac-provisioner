@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -15,36 +16,49 @@ import (
 type Manager struct {
 	lastTrigger  time.Time
 	triggerMutex sync.Mutex
+	debugMode    bool
 }
 
 func New() *Manager {
-	return &Manager{}
+	return &Manager{
+		debugMode: os.Getenv("MAC_PROV_DEBUG") == "1",
+	}
 }
 
 // AutoTriggerDFU автоматически запускает macvdmtool dfu
-// Вызывается монитором после каждого сканирования
 func (m *Manager) AutoTriggerDFU(ctx context.Context) {
 	m.triggerMutex.Lock()
 	defer m.triggerMutex.Unlock()
 
 	// Защита от слишком частых вызовов
 	if time.Since(m.lastTrigger) < 2*time.Second {
+		if m.debugMode {
+			log.Printf("🔍 [DEBUG] Автоматический DFU пропущен (слишком частые вызовы)")
+		}
 		return
 	}
 	m.lastTrigger = time.Now()
 
 	if !m.hasMacvdmtool() {
-		log.Printf("⚠️ macvdmtool недоступен для автоматического DFU")
+		if m.debugMode {
+			log.Printf("🔍 [DEBUG] macvdmtool недоступен для автоматического DFU")
+		}
 		return
 	}
 
-	log.Printf("🔄 Автоматический запуск macvdmtool dfu...")
+	if m.debugMode {
+		log.Printf("🔍 [DEBUG] Выполняем: macvdmtool dfu")
+	}
 
 	cmd := exec.CommandContext(ctx, "macvdmtool", "dfu")
 	if err := cmd.Run(); err != nil {
-		log.Printf("⚠️ Автоматический macvdmtool завершился с ошибкой: %v", err)
+		if m.debugMode {
+			log.Printf("🔍 [DEBUG] Автоматический macvdmtool завершился с ошибкой: %v", err)
+		}
 	} else {
-		log.Printf("✅ Автоматический macvdmtool выполнен успешно")
+		if m.debugMode {
+			log.Printf("🔍 [DEBUG] Автоматический macvdmtool выполнен успешно")
+		}
 	}
 }
 
@@ -63,14 +77,15 @@ func (m *Manager) EnterDFUMode(ctx context.Context, usbLocation string) error {
 
 	cmd := exec.CommandContext(ctx, "macvdmtool", "dfu")
 	if err := cmd.Run(); err != nil {
-		log.Printf("⚠️ Ошибка macvdmtool: %v", err)
+		if m.debugMode {
+			log.Printf("🔍 [DEBUG] Ошибка macvdmtool: %v", err)
+		}
 		return errors.New("не удалось перевести устройство в DFU режим")
 	}
 
 	return m.waitForDFUMode(ctx, 2*time.Minute)
 }
 
-// isDFUPort проверяет, является ли порт DFU-совместимым
 func (m *Manager) isDFUPort(usbLocation string) bool {
 	if usbLocation == "" {
 		return false
@@ -90,7 +105,6 @@ func (m *Manager) isDFUPort(usbLocation string) bool {
 	return strings.HasPrefix(baseLocation, "00100000")
 }
 
-// CheckDFUPortCompatibility расширенная проверка с человекочитаемым описанием
 func (m *Manager) CheckDFUPortCompatibility(usbLocation string) (bool, string) {
 	if usbLocation == "" {
 		return false, "USB порт не определен"
@@ -106,7 +120,6 @@ func (m *Manager) CheckDFUPortCompatibility(usbLocation string) (bool, string) {
 	}
 }
 
-// humanPort преобразует USB location в человекочитаемый формат
 func (m *Manager) humanPort(loc string) string {
 	if loc == "" {
 		return "неизвестный порт"

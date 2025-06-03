@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -35,7 +36,9 @@ type Monitor struct {
 	firstScan         bool
 	dfuTriggerFunc    func(context.Context)
 	processingChecker func(string) bool
-	cooldownChecker   func(string) (bool, time.Duration, string) // Новый чекер для периода охлаждения
+	cooldownChecker   func(string) (bool, time.Duration, string)
+	debugMode         bool
+	deviceResolver    *DeviceResolver
 }
 
 type USBDevice struct {
@@ -54,10 +57,12 @@ type USBData struct {
 
 func NewMonitor(cfg config.MonitoringConfig) *Monitor {
 	return &Monitor{
-		config:    cfg,
-		events:    make(chan Event, 100),
-		devices:   make(map[string]*Device),
-		firstScan: true,
+		config:         cfg,
+		events:         make(chan Event, 100),
+		devices:        make(map[string]*Device),
+		firstScan:      true,
+		debugMode:      os.Getenv("MAC_PROV_DEBUG") == "1",
+		deviceResolver: NewDeviceResolver(),
 	}
 }
 
@@ -69,13 +74,15 @@ func (m *Monitor) SetProcessingChecker(checker func(string) bool) {
 	m.processingChecker = checker
 }
 
-// SetCooldownChecker устанавливает функцию для проверки периода охлаждения
 func (m *Monitor) SetCooldownChecker(checker func(string) (bool, time.Duration, string)) {
 	m.cooldownChecker = checker
 }
 
 func (m *Monitor) Start(ctx context.Context) error {
 	m.ctx, m.cancel = context.WithCancel(ctx)
+
+	// Запускаем очистку кэша имен устройств
+	go m.deviceResolver.StartCleanupRoutine(ctx)
 
 	m.scanDevices()
 
@@ -108,7 +115,6 @@ func (m *Monitor) monitorLoop() {
 	}
 }
 
-// checkAndTriggerDFU проверяет наличие устройств на DFU-портах и запускает macvdmtool
 func (m *Monitor) checkAndTriggerDFU() {
 	if m.dfuTriggerFunc == nil {
 		return
@@ -118,34 +124,39 @@ func (m *Monitor) checkAndTriggerDFU() {
 	defer m.mutex.RUnlock()
 
 	needsDFUTrigger := false
+	var targetDevice *Device
 
 	for _, dev := range m.devices {
-		// Проверяем только обычные Mac и Recovery устройства на DFU-портах
 		if (dev.IsNormalMac() || (dev.IsDFU && dev.State == "Recovery")) && m.isDFUPort(dev.USBLocation) {
-			// Проверяем, не обрабатывается ли уже это устройство
 			if m.processingChecker != nil && m.processingChecker(dev.USBLocation) {
-				log.Printf("ℹ️ Устройство %s уже обрабатывается, пропускаем DFU триггер", dev.Name)
+				if m.debugMode {
+					log.Printf("🔍 [DEBUG] Устройство %s уже обрабатывается, пропускаем DFU триггер", dev.GetDisplayName())
+				}
 				continue
 			}
 
-			// Проверяем период охлаждения
 			if m.cooldownChecker != nil {
 				inCooldown, remaining, lastDevice := m.cooldownChecker(dev.USBLocation)
 				if inCooldown {
-					log.Printf("🕒 Порт %s в периоде охлаждения (осталось %v, последнее устройство: %s), пропускаем DFU триггер",
-						dev.USBLocation, remaining.Round(time.Minute), lastDevice)
+					if m.debugMode {
+						log.Printf("🔍 [DEBUG] Порт %s в периоде охлаждения (осталось %v, последнее устройство: %s)",
+							dev.USBLocation, remaining.Round(time.Minute), lastDevice)
+					}
 					continue
 				}
 			}
 
-			log.Printf("🔄 Обнаружено устройство на DFU-порту: %s (%s)", dev.Name, dev.USBLocation)
 			needsDFUTrigger = true
+			targetDevice = dev
 			break
 		}
 	}
 
-	if needsDFUTrigger {
-		log.Printf("⚡ Запускаем автоматический DFU триггер...")
+	if needsDFUTrigger && targetDevice != nil {
+		if m.debugMode {
+			log.Printf("🔍 [DEBUG] Обнаружено устройство на DFU-порту: %s (%s)", targetDevice.GetDisplayName(), targetDevice.USBLocation)
+		}
+		log.Printf("⚡ Запуск автоматического DFU для %s", targetDevice.GetDisplayName())
 		go m.dfuTriggerFunc(m.ctx)
 	}
 }
@@ -179,6 +190,11 @@ func (m *Monitor) scanDevices() {
 	for _, dev := range current {
 		key := m.getDeviceKey(dev)
 		currentMap[key] = dev
+
+		// Асинхронно получаем красивое имя для DFU устройств
+		if dev.IsDFU && dev.ECID != "" {
+			dev.ResolveNameAsync(m.ctx, m.deviceResolver)
+		}
 	}
 
 	if m.firstScan {
@@ -195,8 +211,18 @@ func (m *Monitor) scanDevices() {
 			m.devices[key] = dev
 			m.sendEvent(Event{Type: EventConnected, Device: dev})
 		} else if m.hasStateChanged(old, dev) {
+			// Сохраняем resolved name из старого устройства
+			if old.ResolvedName != "" {
+				dev.ResolvedName = old.ResolvedName
+			}
 			m.devices[key] = dev
 			m.sendEvent(Event{Type: EventStateChanged, Device: dev})
+		} else {
+			// Обновляем resolved name если он появился
+			if old.ResolvedName != "" && dev.ResolvedName == "" {
+				dev.ResolvedName = old.ResolvedName
+			}
+			m.devices[key] = dev
 		}
 	}
 
@@ -228,13 +254,17 @@ func (m *Monitor) getCurrentDevices() []*Device {
 	cmd.Stdout = &out
 
 	if err := cmd.Run(); err != nil {
-		log.Printf("⚠️ Ошибка выполнения system_profiler: %v", err)
+		if m.debugMode {
+			log.Printf("🔍 [DEBUG] Ошибка выполнения system_profiler: %v", err)
+		}
 		return nil
 	}
 
 	var data USBData
 	if err := json.Unmarshal(out.Bytes(), &data); err != nil {
-		log.Printf("⚠️ Ошибка парсинга JSON: %v", err)
+		if m.debugMode {
+			log.Printf("🔍 [DEBUG] Ошибка парсинга JSON: %v", err)
+		}
 		return nil
 	}
 
@@ -280,7 +310,9 @@ func (m *Monitor) createDevice(item *USBDevice) *Device {
 		}
 
 		if dev.ECID == "" {
-			log.Printf("⚠️ DFU устройство без ECID игнорируется: %s", item.Name)
+			if m.debugMode {
+				log.Printf("🔍 [DEBUG] DFU устройство без ECID игнорируется: %s", item.Name)
+			}
 			return nil
 		}
 	} else if m.isNormalMac(item) {
@@ -366,6 +398,13 @@ func (m *Monitor) sendEvent(event Event) {
 	select {
 	case m.events <- event:
 	case <-time.After(100 * time.Millisecond):
-		log.Printf("⚠️ Буфер событий переполнен, событие пропущено: %s для %s", event.Type, event.Device.Name)
+		if m.debugMode {
+			log.Printf("🔍 [DEBUG] Буфер событий переполнен, событие пропущено: %s для %s", event.Type, event.Device.GetDisplayName())
+		}
 	}
+}
+
+// GetDeviceResolver возвращает resolver для использования в других компонентах
+func (m *Monitor) GetDeviceResolver() *DeviceResolver {
+	return m.deviceResolver
 }

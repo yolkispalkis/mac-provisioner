@@ -1,13 +1,17 @@
 package device
 
-import "strings"
+import (
+	"context"
+	"strings"
+)
 
 type Device struct {
-	ECID        string `json:"ecid"`
-	USBLocation string `json:"usb_location"`
-	Name        string `json:"name"`
-	State       string `json:"state"`
-	IsDFU       bool   `json:"is_dfu"`
+	ECID         string `json:"ecid"`
+	USBLocation  string `json:"usb_location"`
+	Name         string `json:"name"`          // Исходное имя из system_profiler
+	ResolvedName string `json:"resolved_name"` // Красивое имя из cfgutil
+	State        string `json:"state"`
+	IsDFU        bool   `json:"is_dfu"`
 }
 
 func (d *Device) UniqueID() string {
@@ -21,13 +25,40 @@ func (d *Device) IsNormalMac() bool {
 	return !d.IsDFU && d.State == "Normal"
 }
 
-func (d *Device) GetReadableName() string {
-	name := d.Name
-	if strings.Contains(strings.ToLower(name), "dfu mode") {
-		return "устройство в режиме DFU"
+// GetDisplayName возвращает лучшее доступное имя устройства
+func (d *Device) GetDisplayName() string {
+	if d.ResolvedName != "" {
+		return d.ResolvedName
 	}
-	if strings.Contains(strings.ToLower(name), "recovery mode") {
+	return d.Name
+}
+
+// GetReadableName возвращает имя для голосовых уведомлений
+func (d *Device) GetReadableName() string {
+	name := d.GetDisplayName()
+
+	// Обрабатываем специальные случаи для TTS
+	name = strings.ToLower(name)
+	if strings.Contains(name, "dfu mode") {
+		return "устройство в режиме ДФУ"
+	}
+	if strings.Contains(name, "recovery mode") {
 		return "устройство в режиме восстановления"
 	}
-	return name
+
+	return d.GetDisplayName()
+}
+
+// ResolveNameAsync асинхронно получает красивое имя устройства
+func (d *Device) ResolveNameAsync(ctx context.Context, resolver *DeviceResolver) {
+	if d.ECID == "" {
+		return
+	}
+
+	go func() {
+		resolvedName := resolver.ResolveDeviceName(ctx, d.ECID, d.Name)
+		if resolvedName != d.Name {
+			d.ResolvedName = resolvedName
+		}
+	}()
 }

@@ -2,11 +2,11 @@ package provisioner
 
 import (
 	"log"
+	"os"
 	"sync"
 	"time"
 )
 
-// CooldownEntry запись о недавно прошитом устройстве
 type CooldownEntry struct {
 	USBLocation   string
 	ECID          string
@@ -15,26 +15,25 @@ type CooldownEntry struct {
 	CooldownUntil time.Time
 }
 
-// CooldownManager управляет периодом охлаждения после прошивки
 type CooldownManager struct {
-	entries        map[string]*CooldownEntry // key = USB location
+	entries        map[string]*CooldownEntry
 	mutex          sync.RWMutex
 	cooldownPeriod time.Duration
+	debugMode      bool
 }
 
 func NewCooldownManager(cooldownPeriod time.Duration) *CooldownManager {
 	cm := &CooldownManager{
 		entries:        make(map[string]*CooldownEntry),
 		cooldownPeriod: cooldownPeriod,
+		debugMode:      os.Getenv("MAC_PROV_DEBUG") == "1",
 	}
 
-	// Запускаем очистку устаревших записей
 	go cm.cleanupLoop()
 
 	return cm
 }
 
-// AddCompletedDevice добавляет устройство в список недавно прошитых
 func (cm *CooldownManager) AddCompletedDevice(usbLocation, ecid, deviceName string) {
 	if usbLocation == "" {
 		return
@@ -54,11 +53,10 @@ func (cm *CooldownManager) AddCompletedDevice(usbLocation, ecid, deviceName stri
 
 	cm.entries[usbLocation] = entry
 
-	log.Printf("🕒 Устройство %s добавлено в период охлаждения до %s",
-		deviceName, entry.CooldownUntil.Format("15:04:05"))
+	log.Printf("🕒 %s добавлен в период охлаждения до %s",
+		deviceName, entry.CooldownUntil.Format("15:04"))
 }
 
-// IsInCooldown проверяет, находится ли порт в периоде охлаждения
 func (cm *CooldownManager) IsInCooldown(usbLocation string) (bool, *CooldownEntry) {
 	if usbLocation == "" {
 		return false, nil
@@ -79,7 +77,6 @@ func (cm *CooldownManager) IsInCooldown(usbLocation string) (bool, *CooldownEntr
 	return false, nil
 }
 
-// GetCooldownInfo возвращает информацию о периоде охлаждения
 func (cm *CooldownManager) GetCooldownInfo(usbLocation string) (bool, time.Duration, string) {
 	inCooldown, entry := cm.IsInCooldown(usbLocation)
 	if !inCooldown {
@@ -90,7 +87,6 @@ func (cm *CooldownManager) GetCooldownInfo(usbLocation string) (bool, time.Durat
 	return true, remaining, entry.DeviceName
 }
 
-// RemoveCooldown принудительно удаляет устройство из периода охлаждения
 func (cm *CooldownManager) RemoveCooldown(usbLocation string) {
 	if usbLocation == "" {
 		return
@@ -105,7 +101,6 @@ func (cm *CooldownManager) RemoveCooldown(usbLocation string) {
 	}
 }
 
-// GetAllCooldowns возвращает все активные периоды охлаждения
 func (cm *CooldownManager) GetAllCooldowns() []*CooldownEntry {
 	cm.mutex.RLock()
 	defer cm.mutex.RUnlock()
@@ -115,7 +110,6 @@ func (cm *CooldownManager) GetAllCooldowns() []*CooldownEntry {
 
 	for _, entry := range cm.entries {
 		if now.Before(entry.CooldownUntil) {
-			// Создаем копию для безопасности
 			entryCopy := *entry
 			active = append(active, &entryCopy)
 		}
@@ -124,7 +118,6 @@ func (cm *CooldownManager) GetAllCooldowns() []*CooldownEntry {
 	return active
 }
 
-// cleanupLoop периодически удаляет устаревшие записи
 func (cm *CooldownManager) cleanupLoop() {
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
@@ -134,7 +127,6 @@ func (cm *CooldownManager) cleanupLoop() {
 	}
 }
 
-// cleanup удаляет устаревшие записи
 func (cm *CooldownManager) cleanup() {
 	cm.mutex.Lock()
 	defer cm.mutex.Unlock()
@@ -149,7 +141,7 @@ func (cm *CooldownManager) cleanup() {
 		}
 	}
 
-	if len(removed) > 0 {
-		log.Printf("🧹 Очищены периоды охлаждения для: %v", removed)
+	if len(removed) > 0 && cm.debugMode {
+		log.Printf("🔍 [DEBUG] Очищены периоды охлаждения для: %v", removed)
 	}
 }

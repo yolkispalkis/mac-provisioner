@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -26,6 +27,7 @@ type Manager struct {
 	processingUSB   map[string]bool
 	mutex           sync.RWMutex
 	config          config.ProvisioningConfig
+	debugMode       bool
 }
 
 type RestoreResponse struct {
@@ -42,6 +44,7 @@ func New(dfuMgr *dfu.Manager, notifier *notification.Manager, cfg config.Provisi
 		processingECID:  make(map[string]bool),
 		processingUSB:   make(map[string]bool),
 		config:          cfg,
+		debugMode:       os.Getenv("MAC_PROV_DEBUG") == "1",
 	}
 }
 
@@ -63,7 +66,6 @@ func (m *Manager) IsProcessingByUSB(usbLocation string) bool {
 	return m.processingUSB[usbLocation]
 }
 
-// IsInCooldown проверяет, находится ли порт в периоде охлаждения
 func (m *Manager) IsInCooldown(usbLocation string) (bool, time.Duration, string) {
 	return m.cooldownManager.GetCooldownInfo(usbLocation)
 }
@@ -77,23 +79,29 @@ func (m *Manager) MarkUSBProcessing(usbLocation string, processing bool) {
 
 	if processing {
 		m.processingUSB[usbLocation] = true
+		if m.debugMode {
+			log.Printf("🔍 [DEBUG] Помечен как обрабатываемый: %s", usbLocation)
+		}
 	} else {
 		delete(m.processingUSB, usbLocation)
+		if m.debugMode {
+			log.Printf("🔍 [DEBUG] Снята отметка обработки: %s", usbLocation)
+		}
 	}
 }
 
 func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
-	// Проверяем готовность устройства
 	if !dev.IsDFU || dev.ECID == "" {
 		m.notifier.RestoreFailed(dev, "устройство не готово к прошивке")
 		return
 	}
 
-	// Проверяем, не обрабатывается ли уже это устройство
 	m.mutex.Lock()
 	if m.processingECID[dev.ECID] {
 		m.mutex.Unlock()
-		log.Printf("ℹ️ Устройство с ECID %s уже обрабатывается", dev.ECID)
+		if m.debugMode {
+			log.Printf("🔍 [DEBUG] Устройство с ECID %s уже обрабатывается", dev.ECID)
+		}
 		return
 	}
 	m.processingECID[dev.ECID] = true
@@ -111,33 +119,29 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 		m.mutex.Unlock()
 	}()
 
-	// Нормализуем ECID для cfgutil
 	ecid, err := m.normalizeECID(dev.ECID)
 	if err != nil {
 		m.notifier.RestoreFailed(dev, "неверный формат ECID")
 		return
 	}
 
-	log.Printf("🔄 Начинаем прошивку устройства %s (ECID: %s)", dev.Name, ecid)
+	log.Printf("🔄 Начинается прошивка %s", dev.GetDisplayName())
 	m.notifier.StartingRestore(dev)
 
-	// Запускаем периодические уведомления о прогрессе
 	progressCtx, cancelProgress := context.WithCancel(ctx)
 	go m.announceProgress(progressCtx, dev)
 
-	// Выполняем прошивку
 	err = m.runRestore(ctx, ecid)
 	cancelProgress()
 
 	if err != nil {
-		log.Printf("❌ Ошибка прошивки %s: %v", dev.Name, err)
+		log.Printf("❌ Ошибка прошивки %s: %v", dev.GetDisplayName(), err)
 		m.notifier.RestoreFailed(dev, err.Error())
 	} else {
-		log.Printf("✅ Прошивка завершена успешно: %s", dev.Name)
+		log.Printf("✅ Прошивка завершена: %s", dev.GetDisplayName())
 		m.notifier.RestoreCompleted(dev)
-
-		// Добавляем устройство в период охлаждения
-		m.cooldownManager.AddCompletedDevice(dev.USBLocation, dev.ECID, dev.Name)
+		// Используем красивое имя для периода охлаждения
+		m.cooldownManager.AddCompletedDevice(dev.USBLocation, dev.ECID, dev.GetDisplayName())
 	}
 }
 
@@ -151,15 +155,19 @@ func (m *Manager) runRestore(ctx context.Context, ecid string) error {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	log.Printf("🔧 Выполняем: cfgutil --ecid %s --format JSON restore", ecid)
+	if m.debugMode {
+		log.Printf("🔍 [DEBUG] Выполняем: cfgutil --ecid %s --format JSON restore", ecid)
+	}
 
 	err := cmd.Run()
 
-	if stdout.Len() > 0 {
-		log.Printf("📄 cfgutil stdout: %s", stdout.String())
-	}
-	if stderr.Len() > 0 {
-		log.Printf("⚠️ cfgutil stderr: %s", stderr.String())
+	if m.debugMode {
+		if stdout.Len() > 0 {
+			log.Printf("🔍 [DEBUG] cfgutil stdout: %s", stdout.String())
+		}
+		if stderr.Len() > 0 {
+			log.Printf("🔍 [DEBUG] cfgutil stderr: %s", stderr.String())
+		}
 	}
 
 	if err != nil {
@@ -259,12 +267,10 @@ func (m *Manager) announceProgress(ctx context.Context, dev *device.Device) {
 	}
 }
 
-// GetCooldownStatus возвращает статус всех активных периодов охлаждения
 func (m *Manager) GetCooldownStatus() []*CooldownEntry {
 	return m.cooldownManager.GetAllCooldowns()
 }
 
-// RemoveCooldown принудительно снимает период охлаждения с порта
 func (m *Manager) RemoveCooldown(usbLocation string) {
 	m.cooldownManager.RemoveCooldown(usbLocation)
 }

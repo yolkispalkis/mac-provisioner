@@ -52,7 +52,12 @@ func main() {
 
 	// Запуск системы
 	notifier.SystemStarted()
-	log.Printf("⚙️ Период охлаждения DFU: %v", cfg.Provisioning.DFUCooldownPeriod)
+
+	// Показываем настройки только в debug режиме
+	if os.Getenv("MAC_PROV_DEBUG") == "1" {
+		log.Printf("🔍 [DEBUG] Период охлаждения DFU: %v", cfg.Provisioning.DFUCooldownPeriod)
+		log.Printf("🔍 [DEBUG] Интервал сканирования: %v", cfg.Monitoring.CheckInterval)
+	}
 
 	if err := deviceMonitor.Start(ctx); err != nil {
 		log.Fatalf("❌ Не удалось запустить мониторинг устройств: %v", err)
@@ -61,7 +66,7 @@ func main() {
 	// Обработка событий устройств
 	go handleDeviceEvents(ctx, deviceMonitor, provisionerManager, notifier, dfuManager)
 
-	// Периодический вывод статуса периодов охлаждения (для отладки)
+	// Периодический вывод статуса периодов охлаждения (только в debug режиме)
 	if os.Getenv("MAC_PROV_DEBUG") == "1" {
 		go debugCooldownStatus(ctx, provisionerManager, 5*time.Minute)
 	}
@@ -102,11 +107,17 @@ func handleSingleEvent(
 	dfuMgr *dfu.Manager,
 ) {
 	dev := event.Device
-	log.Printf("📨 %s: %s", event.Type, dev.Name)
+
+	// Показываем события только для важных изменений
+	if shouldLogEvent(event, provisioner) {
+		log.Printf("📨 %s: %s", event.Type, dev.GetDisplayName())
+	}
 
 	// Игнорируем события для устройств, которые уже обрабатываются
 	if provisioner.IsProcessingByUSB(dev.USBLocation) || provisioner.IsProcessingByECID(dev.ECID) {
-		log.Printf("ℹ️ Устройство уже обрабатывается, игнорируем событие: %s", dev.Name)
+		if os.Getenv("MAC_PROV_DEBUG") == "1" {
+			log.Printf("🔍 [DEBUG] Устройство уже обрабатывается, игнорируем событие: %s", dev.GetDisplayName())
+		}
 		return
 	}
 
@@ -125,6 +136,28 @@ func handleSingleEvent(
 	}
 }
 
+// shouldLogEvent определяет, стоит ли логировать событие
+func shouldLogEvent(event device.Event, provisioner *provisioner.Manager) bool {
+	dev := event.Device
+
+	// Всегда логируем подключение новых устройств
+	if event.Type == device.EventConnected {
+		return true
+	}
+
+	// Логируем отключение только если устройство не обрабатывается
+	if event.Type == device.EventDisconnected {
+		return !provisioner.IsProcessingByUSB(dev.USBLocation) && !provisioner.IsProcessingByECID(dev.ECID)
+	}
+
+	// Логируем изменения состояния только для перехода в DFU
+	if event.Type == device.EventStateChanged {
+		return dev.IsDFU && dev.State == "DFU"
+	}
+
+	return false
+}
+
 func handleDeviceConnected(
 	ctx context.Context,
 	dev *device.Device,
@@ -139,8 +172,10 @@ func handleDeviceConnected(
 	} else if dev.IsDFU && dev.State == "Recovery" {
 		// Устройство в Recovery режиме - проверяем период охлаждения
 		if inCooldown, remaining, lastDevice := provisioner.IsInCooldown(dev.USBLocation); inCooldown {
-			log.Printf("🕒 Устройство %s подключено к порту в периоде охлаждения (осталось %v, последнее: %s)",
-				dev.Name, remaining.Round(time.Minute), lastDevice)
+			if os.Getenv("MAC_PROV_DEBUG") == "1" {
+				log.Printf("🔍 [DEBUG] Устройство %s подключено к порту в периоде охлаждения (осталось %v, последнее: %s)",
+					dev.GetDisplayName(), remaining.Round(time.Minute), lastDevice)
+			}
 			notifier.DeviceConnected(dev)
 		} else {
 			notifier.DeviceConnected(dev)
@@ -149,8 +184,10 @@ func handleDeviceConnected(
 	} else if dev.IsNormalMac() {
 		// Обычный Mac - проверяем период охлаждения
 		if inCooldown, remaining, lastDevice := provisioner.IsInCooldown(dev.USBLocation); inCooldown {
-			log.Printf("🕒 Устройство %s подключено к порту в периоде охлаждения (осталось %v, последнее: %s)",
-				dev.Name, remaining.Round(time.Minute), lastDevice)
+			if os.Getenv("MAC_PROV_DEBUG") == "1" {
+				log.Printf("🔍 [DEBUG] Устройство %s подключено к порту в периоде охлаждения (осталось %v, последнее: %s)",
+					dev.GetDisplayName(), remaining.Round(time.Minute), lastDevice)
+			}
 			notifier.DeviceConnected(dev)
 		} else {
 			notifier.DeviceConnected(dev)
@@ -185,12 +222,12 @@ func debugCooldownStatus(ctx context.Context, provisioner *provisioner.Manager, 
 		case <-ticker.C:
 			cooldowns := provisioner.GetCooldownStatus()
 			if len(cooldowns) == 0 {
-				log.Println("🕒 Активных периодов охлаждения нет")
+				log.Println("🔍 [DEBUG] Активных периодов охлаждения нет")
 			} else {
-				log.Printf("🕒 Активные периоды охлаждения (%d):", len(cooldowns))
+				log.Printf("🔍 [DEBUG] Активные периоды охлаждения (%d):", len(cooldowns))
 				for i, entry := range cooldowns {
 					remaining := time.Until(entry.CooldownUntil)
-					log.Printf("  %d. %s (порт: %s, осталось: %v)",
+					log.Printf("🔍 [DEBUG]   %d. %s (порт: %s, осталось: %v)",
 						i+1, entry.DeviceName, entry.USBLocation, remaining.Round(time.Minute))
 				}
 			}

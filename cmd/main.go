@@ -89,33 +89,76 @@ func handleSingleEvent(
 	dev := event.Device
 	log.Printf("📨 %s: %s", event.Type, dev.Name)
 
+	// Игнорируем события для устройств, которые уже обрабатываются
+	if provisioner.IsProcessingByUSB(dev.USBLocation) || provisioner.IsProcessingByECID(dev.ECID) {
+		log.Printf("ℹ️ Устройство уже обрабатывается, игнорируем событие: %s", dev.Name)
+		return
+	}
+
 	switch event.Type {
 	case device.EventConnected:
-		if dev.IsDFU && dev.State == "DFU" {
-			notifier.DFUModeEntered(dev)
-			go provisioner.ProcessDevice(ctx, dev)
-		} else if dev.IsDFU && dev.State == "Recovery" {
-			notifier.DeviceConnected(dev)
-			notifier.EnteringDFUMode(dev)
-			go enterDFUMode(ctx, dev, dfuMgr, notifier)
-		} else if dev.IsNormalMac() {
-			notifier.DeviceConnected(dev)
-			notifier.EnteringDFUMode(dev)
-			go enterDFUMode(ctx, dev, dfuMgr, notifier)
-		}
+		handleDeviceConnected(ctx, dev, provisioner, notifier, dfuMgr)
 
 	case device.EventDisconnected:
-		notifier.DeviceDisconnected(dev)
+		// Уведомляем об отключении только если устройство не обрабатывается
+		if !provisioner.IsProcessingByUSB(dev.USBLocation) && !provisioner.IsProcessingByECID(dev.ECID) {
+			notifier.DeviceDisconnected(dev)
+		}
 
 	case device.EventStateChanged:
-		if dev.IsDFU && dev.State == "DFU" {
-			notifier.DFUModeEntered(dev)
-			go provisioner.ProcessDevice(ctx, dev)
-		}
+		handleDeviceStateChanged(ctx, dev, provisioner, notifier, dfuMgr)
 	}
 }
 
-func enterDFUMode(ctx context.Context, dev *device.Device, dfuMgr *dfu.Manager, notifier *notification.Manager) {
+func handleDeviceConnected(
+	ctx context.Context,
+	dev *device.Device,
+	provisioner *provisioner.Manager,
+	notifier *notification.Manager,
+	dfuMgr *dfu.Manager,
+) {
+	if dev.IsDFU && dev.State == "DFU" && dev.ECID != "" {
+		// Устройство уже в DFU режиме - начинаем прошивку
+		notifier.DFUModeEntered(dev)
+		go provisioner.ProcessDevice(ctx, dev)
+	} else if dev.IsDFU && dev.State == "Recovery" {
+		// Устройство в Recovery режиме - переводим в DFU
+		notifier.DeviceConnected(dev)
+		notifier.EnteringDFUMode(dev)
+		go enterDFUMode(ctx, dev, dfuMgr, notifier, provisioner)
+	} else if dev.IsNormalMac() {
+		// Обычный Mac - переводим в DFU
+		notifier.DeviceConnected(dev)
+		notifier.EnteringDFUMode(dev)
+		go enterDFUMode(ctx, dev, dfuMgr, notifier, provisioner)
+	}
+}
+
+func handleDeviceStateChanged(
+	ctx context.Context,
+	dev *device.Device,
+	provisioner *provisioner.Manager,
+	notifier *notification.Manager,
+	dfuMgr *dfu.Manager,
+) {
+	// Обрабатываем только переход в DFU режим
+	if dev.IsDFU && dev.State == "DFU" && dev.ECID != "" {
+		notifier.DFUModeEntered(dev)
+		go provisioner.ProcessDevice(ctx, dev)
+	}
+}
+
+func enterDFUMode(
+	ctx context.Context,
+	dev *device.Device,
+	dfuMgr *dfu.Manager,
+	notifier *notification.Manager,
+	provisioner *provisioner.Manager,
+) {
+	// Помечаем USB порт как обрабатываемый
+	provisioner.MarkUSBProcessing(dev.USBLocation, true)
+	defer provisioner.MarkUSBProcessing(dev.USBLocation, false)
+
 	if err := dfuMgr.EnterDFUMode(ctx, dev.USBLocation); err != nil {
 		notifier.ManualDFURequired(dev)
 	}

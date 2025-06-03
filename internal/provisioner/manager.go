@@ -18,10 +18,11 @@ import (
 )
 
 type Manager struct {
-	dfuManager *dfu.Manager
-	notifier   *notification.Manager
-	processing map[string]bool
-	mutex      sync.RWMutex
+	dfuManager     *dfu.Manager
+	notifier       *notification.Manager
+	processingECID map[string]bool
+	processingUSB  map[string]bool
+	mutex          sync.RWMutex
 }
 
 type RestoreResponse struct {
@@ -32,42 +33,73 @@ type RestoreResponse struct {
 
 func New(dfuMgr *dfu.Manager, notifier *notification.Manager) *Manager {
 	return &Manager{
-		dfuManager: dfuMgr,
-		notifier:   notifier,
-		processing: make(map[string]bool),
+		dfuManager:     dfuMgr,
+		notifier:       notifier,
+		processingECID: make(map[string]bool),
+		processingUSB:  make(map[string]bool),
 	}
 }
 
-func (m *Manager) IsProcessing(deviceID string) bool {
+func (m *Manager) IsProcessingByECID(ecid string) bool {
+	if ecid == "" {
+		return false
+	}
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
-	return m.processing[deviceID]
+	return m.processingECID[ecid]
+}
+
+func (m *Manager) IsProcessingByUSB(usbLocation string) bool {
+	if usbLocation == "" {
+		return false
+	}
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	return m.processingUSB[usbLocation]
+}
+
+func (m *Manager) MarkUSBProcessing(usbLocation string, processing bool) {
+	if usbLocation == "" {
+		return
+	}
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if processing {
+		m.processingUSB[usbLocation] = true
+	} else {
+		delete(m.processingUSB, usbLocation)
+	}
 }
 
 func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
-	deviceID := dev.UniqueID()
-
-	// Проверяем, не обрабатывается ли уже это устройство
-	m.mutex.Lock()
-	if m.processing[deviceID] {
-		m.mutex.Unlock()
-		log.Printf("ℹ️ Устройство %s уже обрабатывается", dev.Name)
-		return
-	}
-	m.processing[deviceID] = true
-	m.mutex.Unlock()
-
-	defer func() {
-		m.mutex.Lock()
-		delete(m.processing, deviceID)
-		m.mutex.Unlock()
-	}()
-
 	// Проверяем готовность устройства
 	if !dev.IsDFU || dev.ECID == "" {
 		m.notifier.RestoreFailed(dev, "устройство не готово к прошивке")
 		return
 	}
+
+	// Проверяем, не обрабатывается ли уже это устройство
+	m.mutex.Lock()
+	if m.processingECID[dev.ECID] {
+		m.mutex.Unlock()
+		log.Printf("ℹ️ Устройство с ECID %s уже обрабатывается", dev.ECID)
+		return
+	}
+	m.processingECID[dev.ECID] = true
+	if dev.USBLocation != "" {
+		m.processingUSB[dev.USBLocation] = true
+	}
+	m.mutex.Unlock()
+
+	defer func() {
+		m.mutex.Lock()
+		delete(m.processingECID, dev.ECID)
+		if dev.USBLocation != "" {
+			delete(m.processingUSB, dev.USBLocation)
+		}
+		m.mutex.Unlock()
+	}()
 
 	// Нормализуем ECID для cfgutil
 	ecid, err := m.normalizeECID(dev.ECID)
@@ -88,8 +120,10 @@ func (m *Manager) ProcessDevice(ctx context.Context, dev *device.Device) {
 	cancelProgress()
 
 	if err != nil {
+		log.Printf("❌ Ошибка прошивки %s: %v", dev.Name, err)
 		m.notifier.RestoreFailed(dev, err.Error())
 	} else {
+		log.Printf("✅ Прошивка завершена успешно: %s", dev.Name)
 		m.notifier.RestoreCompleted(dev)
 	}
 }
@@ -106,7 +140,17 @@ func (m *Manager) runRestore(ctx context.Context, ecid string) error {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
+	log.Printf("🔧 Выполняем: cfgutil --ecid %s --format JSON restore", ecid)
+
 	err := cmd.Run()
+
+	// Логируем вывод для отладки
+	if stdout.Len() > 0 {
+		log.Printf("📄 cfgutil stdout: %s", stdout.String())
+	}
+	if stderr.Len() > 0 {
+		log.Printf("⚠️ cfgutil stderr: %s", stderr.String())
+	}
 
 	// Анализируем результат
 	if err != nil {

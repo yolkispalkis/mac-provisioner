@@ -1,7 +1,6 @@
 package device
 
 import (
-	"context"
 	"strings"
 )
 
@@ -47,18 +46,4 @@ func (d *Device) GetReadableName() string {
 	}
 
 	return d.GetDisplayName()
-}
-
-// ResolveNameAsync асинхронно получает красивое имя устройства
-func (d *Device) ResolveNameAsync(ctx context.Context, resolver *DeviceResolver) {
-	if d.ECID == "" {
-		return
-	}
-
-	go func() {
-		resolvedName := resolver.ResolveDeviceName(ctx, d.ECID, d.Name)
-		if resolvedName != d.Name {
-			d.ResolvedName = resolvedName
-		}
-	}()
 }

@@ -252,14 +252,11 @@ func (m *Monitor) scanDevices() {
 	for _, dev := range current {
 		key := m.getDeviceKey(dev)
 		currentMap[key] = dev
-
-		// Асинхронно получаем красивое имя для DFU устройств
-		if dev.IsDFU && dev.ECID != "" {
-			dev.ResolveNameAsync(m.ctx, m.deviceResolver)
-		}
 	}
 
 	if m.firstScan {
+		// Для первого сканирования сначала получаем имена, потом отправляем события
+		m.resolveDeviceNamesSync(current)
 		m.devices = currentMap
 		for _, dev := range current {
 			m.sendEvent(Event{Type: EventConnected, Device: dev})
@@ -270,12 +267,20 @@ func (m *Monitor) scanDevices() {
 
 	for key, dev := range currentMap {
 		if old, exists := m.devices[key]; !exists {
+			// Новое устройство - сначала получаем имя, потом отправляем событие
+			if dev.IsDFU && dev.ECID != "" {
+				m.resolveDeviceNameSync(dev)
+			}
 			m.devices[key] = dev
 			m.sendEvent(Event{Type: EventConnected, Device: dev})
 		} else if m.hasStateChanged(old, dev) {
 			// Сохраняем resolved name из старого устройства
 			if old.ResolvedName != "" {
 				dev.ResolvedName = old.ResolvedName
+			}
+			// Если это переход в DFU и у нас еще нет красивого имени - получаем его
+			if dev.IsDFU && dev.ECID != "" && dev.ResolvedName == "" {
+				m.resolveDeviceNameSync(dev)
 			}
 			m.devices[key] = dev
 			m.sendEvent(Event{Type: EventStateChanged, Device: dev})
@@ -292,6 +297,61 @@ func (m *Monitor) scanDevices() {
 		if _, exists := currentMap[key]; !exists {
 			delete(m.devices, key)
 			m.sendEvent(Event{Type: EventDisconnected, Device: dev})
+		}
+	}
+}
+
+// resolveDeviceNamesSync синхронно получает имена для всех DFU устройств
+func (m *Monitor) resolveDeviceNamesSync(devices []*Device) {
+	var dfuDevices []*Device
+	for _, dev := range devices {
+		if dev.IsDFU && dev.ECID != "" {
+			dfuDevices = append(dfuDevices, dev)
+		}
+	}
+
+	if len(dfuDevices) == 0 {
+		return
+	}
+
+	if m.debugMode {
+		log.Printf("🔍 [DEBUG] Получаем имена для %d DFU устройств...", len(dfuDevices))
+	}
+
+	// Получаем имена синхронно с таймаутом
+	ctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
+	defer cancel()
+
+	for _, dev := range dfuDevices {
+		resolvedName := m.deviceResolver.ResolveDeviceNameSync(ctx, dev.ECID, dev.Name)
+		if resolvedName != dev.Name {
+			dev.ResolvedName = resolvedName
+			if m.debugMode {
+				log.Printf("🔍 [DEBUG] Получено имя: %s -> %s", dev.ECID, resolvedName)
+			}
+		}
+	}
+}
+
+// resolveDeviceNameSync синхронно получает имя для одного устройства
+func (m *Monitor) resolveDeviceNameSync(dev *Device) {
+	if dev.ECID == "" {
+		return
+	}
+
+	if m.debugMode {
+		log.Printf("🔍 [DEBUG] Получаем имя для устройства %s...", dev.ECID)
+	}
+
+	// Получаем имя синхронно с таймаутом
+	ctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
+	defer cancel()
+
+	resolvedName := m.deviceResolver.ResolveDeviceNameSync(ctx, dev.ECID, dev.Name)
+	if resolvedName != dev.Name {
+		dev.ResolvedName = resolvedName
+		if m.debugMode {
+			log.Printf("🔍 [DEBUG] Получено имя: %s -> %s", dev.ECID, resolvedName)
 		}
 	}
 }

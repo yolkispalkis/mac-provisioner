@@ -42,8 +42,8 @@ func NewDeviceResolver() *DeviceResolver {
 	}
 }
 
-// ResolveDeviceName получает красивое имя устройства по ECID
-func (dr *DeviceResolver) ResolveDeviceName(ctx context.Context, ecid, fallbackName string) string {
+// ResolveDeviceNameSync синхронно получает красивое имя устройства по ECID
+func (dr *DeviceResolver) ResolveDeviceNameSync(ctx context.Context, ecid, fallbackName string) string {
 	if ecid == "" {
 		return fallbackName
 	}
@@ -61,7 +61,7 @@ func (dr *DeviceResolver) ResolveDeviceName(ctx context.Context, ecid, fallbackN
 	}
 	dr.mutex.RUnlock()
 
-	// Получаем из cfgutil
+	// Получаем из cfgutil синхронно
 	name := dr.fetchFromCfgutil(ctx, ecid)
 	if name == "" {
 		if dr.debugMode {
@@ -75,7 +75,7 @@ func (dr *DeviceResolver) ResolveDeviceName(ctx context.Context, ecid, fallbackN
 	dr.cache[ecid] = CachedDevice{
 		Name:     name,
 		CachedAt: time.Now(),
-		TTL:      10 * time.Minute, // Кэшируем на 10 минут
+		TTL:      10 * time.Minute,
 	}
 	dr.mutex.Unlock()
 
@@ -84,6 +84,11 @@ func (dr *DeviceResolver) ResolveDeviceName(ctx context.Context, ecid, fallbackN
 	}
 
 	return name
+}
+
+// ResolveDeviceName для обратной совместимости
+func (dr *DeviceResolver) ResolveDeviceName(ctx context.Context, ecid, fallbackName string) string {
+	return dr.ResolveDeviceNameSync(ctx, ecid, fallbackName)
 }
 
 // fetchFromCfgutil выполняет запрос к cfgutil для получения имени устройства

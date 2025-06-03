@@ -11,147 +11,103 @@ import (
 )
 
 type Manager struct {
-	cfg             config.NotificationConfig
-	voice           *voice.Engine
-	lastLowPriority time.Time
-	minInterval     time.Duration
+	config      config.NotificationConfig
+	voice       *voice.Engine
+	lastNotify  time.Time
+	minInterval time.Duration
 }
 
-/*─────────────────────────────────────────────────────────
-	КОНСТРУКТОР
-─────────────────────────────────────────────────────────*/
-
-func New(c config.NotificationConfig, v *voice.Engine) *Manager {
+func New(cfg config.NotificationConfig, voiceEngine *voice.Engine) *Manager {
 	return &Manager{
-		cfg:         c,
-		voice:       v,
+		config:      cfg,
+		voice:       voiceEngine,
 		minInterval: 2 * time.Second,
 	}
 }
 
-/*─────────────────────────────────────────────────────────
-	         PUBLIC EVENTS  →  voice.Engine
-─────────────────────────────────────────────────────────*/
-
-func (m *Manager) DeviceDetected(d *device.Device) {
-	m.PlayEvent()
-	m.sp(voice.High, "Обнаружено "+d.GetReadableModel())
-}
-
-func (m *Manager) DeviceConnected(d *device.Device) {
-	if m.debounceLow() {
-		m.PlayEvent()
-		m.sp(voice.Normal, "Подключено "+d.GetReadableModel())
-	}
-}
-
-func (m *Manager) DeviceDisconnected(d *device.Device) {
-	if m.debounceLow() {
-		m.PlayEvent()
-		m.sp(voice.Normal, "Отключено "+d.GetReadableModel())
-	}
-}
-
-func (m *Manager) EnteringDFUMode(d *device.Device) {
-	m.sp(voice.High, "Переход в режим восстановления для "+d.GetReadableModel())
-}
-
-func (m *Manager) DFUModeEntered(d *device.Device) {
-	m.PlayEvent()
-	m.sp(voice.High, d.GetReadableModel()+" в режиме восстановления. Готово к прошивке.")
-}
-
-func (m *Manager) StartingRestore(d *device.Device) {
-	m.sp(voice.High, "Начинается прошивка "+d.GetReadableModel())
-}
-
-func (m *Manager) RestoreProgress(d *device.Device, status string) {
-	if m.debounceLow() {
-		m.sp(voice.Low, d.GetReadableModel()+". "+status)
-	}
-}
-
-func (m *Manager) RestoreCompleted(d *device.Device) {
-	m.PlaySuccess()
-	m.sp(voice.High, "Прошивка завершена для "+d.GetReadableModel())
-}
-
-func (m *Manager) RestoreFailed(d *device.Device, err string) {
-	m.PlayAlert()
-	m.sp(voice.High, "Ошибка прошивки "+d.GetReadableModel()+". "+err)
-}
-
 func (m *Manager) SystemStarted() {
-	m.sp(voice.System, "Мак Провижнер запущен и готов к работе.")
+	m.speak(voice.System, "Мак Провижнер запущен и готов к работе")
 }
 
 func (m *Manager) SystemShutdown() {
-	m.sp(voice.System, "Мак Провижнер завершает работу. До свидания!")
+	m.speak(voice.System, "Мак Провижнер завершает работу")
 }
 
-func (m *Manager) Error(msg string) {
-	m.PlayAlert()
-	m.sp(voice.System, "Системная ошибка. "+msg)
-}
-
-func (m *Manager) ManualDFURequired(d *device.Device) {
-	m.PlayAlert()
-	m.sp(voice.High, "Для "+d.GetReadableModel()+" нужен ручной DFU.")
-}
-
-func (m *Manager) WaitingForDFU(d *device.Device) {
-	m.sp(voice.Normal, "Ожидается DFU от "+d.GetReadableModel())
-}
-
-func (m *Manager) DeviceReady(d *device.Device) {
-	if m.debounceLow() {
-		m.PlayEvent()
-		m.sp(voice.Normal, d.GetReadableModel()+" готов к работе.")
+func (m *Manager) DeviceConnected(dev *device.Device) {
+	if m.shouldNotify() {
+		m.playSound("Pop")
+		m.speak(voice.Normal, "Подключено "+dev.GetReadableName())
 	}
 }
 
-/*─────────────────────────────────────────────────────────
-	             ХЕЛПЕРЫ
-─────────────────────────────────────────────────────────*/
+func (m *Manager) DeviceDisconnected(dev *device.Device) {
+	if m.shouldNotify() {
+		m.speak(voice.Normal, "Отключено "+dev.GetReadableName())
+	}
+}
 
-func (m *Manager) sp(pr voice.Priority, txt string) {
-	if !m.cfg.Enabled {
+func (m *Manager) EnteringDFUMode(dev *device.Device) {
+	m.speak(voice.High, "Переход в режим восстановления для "+dev.GetReadableName())
+}
+
+func (m *Manager) DFUModeEntered(dev *device.Device) {
+	m.playSound("Glass")
+	m.speak(voice.High, dev.GetReadableName()+" в режиме восстановления. Готово к прошивке")
+}
+
+func (m *Manager) StartingRestore(dev *device.Device) {
+	m.speak(voice.High, "Начинается прошивка "+dev.GetReadableName())
+}
+
+func (m *Manager) RestoreProgress(dev *device.Device, status string) {
+	if m.shouldNotify() {
+		m.speak(voice.Low, dev.GetReadableName()+". "+status)
+	}
+}
+
+func (m *Manager) RestoreCompleted(dev *device.Device) {
+	m.playSound("Glass")
+	m.speak(voice.High, "Прошивка завершена для "+dev.GetReadableName())
+}
+
+func (m *Manager) RestoreFailed(dev *device.Device, reason string) {
+	m.playSound("Sosumi")
+	m.speak(voice.High, "Ошибка прошивки "+dev.GetReadableName()+". "+reason)
+}
+
+func (m *Manager) ManualDFURequired(dev *device.Device) {
+	m.playSound("Sosumi")
+	m.speak(voice.High, "Для "+dev.GetReadableName()+" требуется ручной переход в DFU режим")
+}
+
+func (m *Manager) Error(message string) {
+	m.playSound("Sosumi")
+	m.speak(voice.System, "Системная ошибка. "+message)
+}
+
+func (m *Manager) speak(priority voice.Priority, text string) {
+	if !m.config.Enabled {
 		return
 	}
-	log.Print("[Notify] ", txt)
-	m.voice.Speak(pr, txt)
+
+	log.Printf("[Уведомление] %s", text)
+	m.voice.Speak(priority, text)
 }
 
-func (m *Manager) debounceLow() bool {
+func (m *Manager) shouldNotify() bool {
 	now := time.Now()
-	if now.Sub(m.lastLowPriority) < m.minInterval {
+	if now.Sub(m.lastNotify) < m.minInterval {
 		return false
 	}
-	m.lastLowPriority = now
+	m.lastNotify = now
 	return true
 }
 
-/*─────────────────────────────────────────────────────────
-	        SOUNDS: ALERT / SUCCESS / EVENT
-─────────────────────────────────────────────────────────*/
-
-// PlayAlert – «Sosumi» (ошибка / предупреждение).
-func (m *Manager) PlayAlert() {
-	if m.cfg.Enabled {
-		go exec.Command("afplay", "/System/Library/Sounds/Sosumi.aiff").Run()
+func (m *Manager) playSound(soundName string) {
+	if !m.config.Enabled {
+		return
 	}
-}
 
-// PlaySuccess – «Glass» (успешное завершение).
-func (m *Manager) PlaySuccess() {
-	if m.cfg.Enabled {
-		go exec.Command("afplay", "/System/Library/Sounds/Glass.aiff").Run()
-	}
-}
-
-// PlayEvent – «Pop» (обычное информационное событие).
-func (m *Manager) PlayEvent() {
-	if m.cfg.Enabled {
-		go exec.Command("afplay", "/System/Library/Sounds/Pop.aiff").Run()
-	}
+	soundPath := "/System/Library/Sounds/" + soundName + ".aiff"
+	go exec.Command("afplay", soundPath).Run()
 }

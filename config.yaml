@@ -1,0 +1,9 @@
+monitoring:
+  check_interval: 3s
+  cleanup_interval: 30s
+
+notifications:
+  enabled: true
+  voice: "Milena"
+  rate: 200
+  volume: 0.8

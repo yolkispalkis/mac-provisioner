@@ -67,6 +67,21 @@ func parseDeviceTree(rawItem json.RawMessage) []*model.Device {
 	return found
 }
 
+// isValidHexECID проверяет, похожа ли строка на ECID в формате hex.
+func isValidHexECID(s string) bool {
+	s = strings.TrimPrefix(strings.ToLower(s), "0x")
+	// Эвристическая проверка длины для 64-битных ECID
+	if len(s) < 10 || len(s) > 20 {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 // createDeviceFromProfiler преобразует данные из system_profiler в нашу модель.
 func createDeviceFromProfiler(item *struct {
 	Name         string            `json:"_name"`
@@ -97,12 +112,22 @@ func createDeviceFromProfiler(item *struct {
 		return nil // Неизвестное устройство Apple, игнорируем
 	}
 
-	// Извлекаем ECID из серийного номера
-	re := regexp.MustCompile(`(?i)ECID:? ([0-9A-F]+)`)
+	// --- ИСПРАВЛЕННАЯ ЛОГИКА ---
+	// Сначала ищем по шаблону "ECID: XXXXX"
+	re := regexp.MustCompile(`(?i)ECID:?\s*([0-9A-F]+)`)
 	matches := re.FindStringSubmatch(item.SerialNum)
 	if len(matches) > 1 {
 		dev.ECID = "0x" + matches[1]
+	} else if isValidHexECID(item.SerialNum) {
+		// Если не нашли, проверяем, не является ли вся строка серийного номера валидным ECID
+		ecidStr := strings.ToLower(item.SerialNum)
+		if !strings.HasPrefix(ecidStr, "0x") {
+			dev.ECID = "0x" + ecidStr
+		} else {
+			dev.ECID = ecidStr
+		}
 	}
+	// --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
 	return dev
 }

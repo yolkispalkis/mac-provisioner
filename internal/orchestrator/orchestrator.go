@@ -114,11 +114,13 @@ func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *m
 
 		prev, exists := o.knownDevices[devID]
 		if !exists {
-			log.Printf("🔌 Подключено: %s (State: %s)", dev.GetDisplayName(), dev.State)
+			// --- УЛУЧШЕННЫЙ ЛОГ ---
+			log.Printf("🔌 Подключено: %s (State: %s, ECID: %s)", dev.GetDisplayName(), dev.State, dev.ECID)
 			o.notifier.Speak("Подключено " + dev.GetReadableName())
 			o.knownDevices[devID] = dev
 		} else if prev.State != dev.State {
-			log.Printf("🔄 Изменение состояния: %s -> %s", prev.GetDisplayName(), dev.State)
+			// --- УЛУЧШЕННЫЙ ЛОГ ---
+			log.Printf("🔄 Изменение состояния: %s -> %s (ECID: %s)", prev.GetDisplayName(), dev.State, dev.ECID)
 			o.knownDevices[devID] = dev
 		}
 

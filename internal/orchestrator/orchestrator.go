@@ -15,12 +15,10 @@ import (
 type Orchestrator struct {
 	cfg             *config.Config
 	notifier        notifier.Notifier
-	resolver        *Resolver
 	knownDevices    map[string]*model.Device
 	cooldowns       map[string]time.Time
 	processing      map[string]bool
 	processingPorts map[string]bool
-	resolvedNames   map[string]string // Кэш точных имен [ECID -> Name]
 	mu              sync.RWMutex
 }
 
@@ -28,12 +26,10 @@ func New(cfg *config.Config, notifier notifier.Notifier) *Orchestrator {
 	return &Orchestrator{
 		cfg:             cfg,
 		notifier:        notifier,
-		resolver:        NewResolver(),
 		knownDevices:    make(map[string]*model.Device),
 		cooldowns:       make(map[string]time.Time),
 		processing:      make(map[string]bool),
 		processingPorts: make(map[string]bool),
-		resolvedNames:   make(map[string]string),
 	}
 }
 
@@ -59,43 +55,16 @@ func (o *Orchestrator) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				// --- ИЗМЕНЕННАЯ ЛОГИКА ---
-				// 1. Получаем сырые данные от сканера
-				devices, err := scanUSB(ctx)
-				if err != nil {
+				if devices, err := scanUSB(ctx); err == nil {
+					deviceScanChan <- devices
+				} else {
 					log.Printf("⚠️ Ошибка сканирования USB: %v", err)
-					continue
 				}
-
-				// 2. Получаем точные имена от резолвера
-				resolved := o.resolver.GetResolvedNames(ctx)
-
-				o.mu.Lock()
-				// 3. Обновляем глобальный кэш имен
-				for ecid, name := range resolved {
-					if name != "" {
-						o.resolvedNames[ecid] = name
-					}
-				}
-
-				// 4. Принудительно применяем имена из кэша ко всем устройствам
-				for _, dev := range devices {
-					if dev.ECID != "" {
-						if name, ok := o.resolvedNames[dev.ECID]; ok {
-							dev.Name = name
-						}
-					}
-				}
-				o.mu.Unlock()
-
-				// 5. Отправляем обогащенные данные в оркестратор
-				deviceScanChan <- devices
 			}
 		}
 	}()
 
-	// Остальная часть Start остается без изменений
-	// ...
+	// Воркер 2: Пул прошивальщиков
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -109,6 +78,7 @@ func (o *Orchestrator) Start(ctx context.Context) {
 		}
 	}()
 
+	// Главный цикл Оркестратора
 	dfuTriggerTicker := time.NewTicker(o.cfg.CheckInterval * 2)
 	defer dfuTriggerTicker.Stop()
 
@@ -128,10 +98,7 @@ func (o *Orchestrator) Start(ctx context.Context) {
 	}
 }
 
-// --- Методы processDeviceList, processProvisionResult, checkAndTriggerDFU остаются без изменений,
-// --- но теперь они будут работать с уже обновленными именами.
-// --- Я скопирую их снова для полноты.
-
+// processDeviceList анализирует список устройств и реагирует на изменения.
 func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *model.Device) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -140,6 +107,9 @@ func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *m
 
 	for _, dev := range devices {
 		devID := dev.ID()
+		if devID == "" { // Игнорируем устройства без ID
+			continue
+		}
 		currentDevices[devID] = true
 
 		if (dev.ECID != "" && o.processing[dev.ECID]) || (dev.USBLocation != "" && o.processingPorts[dev.USBLocation]) {
@@ -147,14 +117,25 @@ func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *m
 		}
 
 		prev, exists := o.knownDevices[devID]
+
+		// --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ ---
+		if exists && prev.Name != "" && dev.Name != prev.Name {
+			// Если мы уже знаем хорошее имя для этого устройства (по ID),
+			// а новое имя другое (например, "Apple Mobile Device..."),
+			// то сохраняем старое, хорошее имя.
+			dev.Name = prev.Name
+		}
+		// --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
+
 		if !exists {
 			log.Printf("🔌 Подключено: %s (State: %s, ECID: %s)", dev.GetDisplayName(), dev.State, dev.ECID)
 			o.notifier.Speak("Подключено " + dev.GetReadableName())
-			o.knownDevices[devID] = dev
-		} else if prev.State != dev.State || prev.Name != dev.Name {
+		} else if prev.State != dev.State {
 			log.Printf("🔄 Изменение состояния: %s -> %s (ECID: %s)", dev.GetDisplayName(), dev.State, dev.ECID)
-			o.knownDevices[devID] = dev
 		}
+
+		// Обновляем запись в любом случае
+		o.knownDevices[devID] = dev
 
 		if dev.State == model.StateDFU && dev.ECID != "" {
 			if cooldownTime, onCooldown := o.cooldowns[dev.ECID]; onCooldown && time.Now().Before(cooldownTime) {
@@ -164,7 +145,7 @@ func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *m
 				if dev.USBLocation != "" {
 					o.processingPorts[dev.USBLocation] = true
 				}
-				jobs <- dev // Отправляем указатель, так как имя уже обновлено
+				jobs <- dev
 			}
 		}
 	}

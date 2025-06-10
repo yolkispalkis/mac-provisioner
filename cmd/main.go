@@ -7,9 +7,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"mac-provisioner-v2/internal/config"
-	"mac-provisioner-v2/internal/notifier"
-	"mac-provisioner-v2/internal/orchestrator"
+	"mac-provisioner/internal/config"
+	"mac-provisioner/internal/notifier"
+	"mac-provisioner/internal/orchestrator"
 )
 
 func main() {

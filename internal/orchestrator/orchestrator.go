@@ -6,9 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"mac-provisioner-v2/internal/config"
-	"mac-provisioner-v2/internal/model"
-	"mac-provisioner-v2/internal/notifier"
+	"mac-provisioner/internal/config"
+	"mac-provisioner/internal/model"
+	"mac-provisioner/internal/notifier"
 )
 
 // Orchestrator управляет всем жизненным циклом приложения.

@@ -8,7 +8,7 @@ import (
 	"regexp"
 	"strings"
 
-	"mac-provisioner-v2/internal/model"
+	"mac-provisioner/internal/model"
 )
 
 // scanUSB выполняет системный вызов для получения списка USB-устройств.

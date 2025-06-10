@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"mac-provisioner-v2/internal/model"
+	"mac-provisioner/internal/model"
 )
 
 // ProvisionResult содержит результат операции прошивки.

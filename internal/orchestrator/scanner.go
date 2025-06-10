@@ -111,8 +111,6 @@ func createDeviceFromProfiler(item *struct {
 		return nil
 	}
 
-	// --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ ---
-
 	// 1. Ищем ECID в формате 'XXXXXXXX-XXXXXXXXXXXXXXXX'
 	if parts := strings.Split(item.SerialNum, "-"); len(parts) == 2 && isValidHexECID(parts[1]) {
 		ecidStr := strings.ToLower(parts[1])
@@ -142,8 +140,6 @@ func createDeviceFromProfiler(item *struct {
 		}
 		return dev // ECID найден, выходим
 	}
-
-	// --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
 
 	return dev
 }

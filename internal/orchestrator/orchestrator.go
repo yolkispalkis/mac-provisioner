@@ -13,26 +13,25 @@ import (
 
 // Orchestrator управляет всем жизненным циклом приложения.
 type Orchestrator struct {
-	cfg          *config.Config
-	notifier     notifier.Notifier
-	knownDevices map[string]*model.Device // Карта известных устройств [ID -> Device]
-	cooldowns    map[string]time.Time     // Карта кулдаунов [ECID -> CooldownUntil]
-	processing   map[string]bool          // Карта устройств в процессе прошивки [ECID -> true]
-
-	// --- НОВОЕ ПОЛЕ ---
-	processingPorts map[string]bool // <-- ИЗМЕНЕНИЕ: Карта USB-портов, занятых прошивкой [USBLocation -> true]
-
-	mu sync.RWMutex // Мьютекс для защиты карт
+	cfg             *config.Config
+	notifier        notifier.Notifier
+	resolver        *Resolver // <-- НОВЫЙ КОМПОНЕНТ
+	knownDevices    map[string]*model.Device
+	cooldowns       map[string]time.Time
+	processing      map[string]bool
+	processingPorts map[string]bool
+	mu              sync.RWMutex
 }
 
 func New(cfg *config.Config, notifier notifier.Notifier) *Orchestrator {
 	return &Orchestrator{
 		cfg:             cfg,
 		notifier:        notifier,
+		resolver:        NewResolver(), // <-- ИНИЦИАЛИЗАЦИЯ
 		knownDevices:    make(map[string]*model.Device),
 		cooldowns:       make(map[string]time.Time),
 		processing:      make(map[string]bool),
-		processingPorts: make(map[string]bool), // <-- ИЗМЕНЕНИЕ: Инициализация новой карты
+		processingPorts: make(map[string]bool),
 	}
 }
 
@@ -59,6 +58,8 @@ func (o *Orchestrator) Start(ctx context.Context) {
 				return
 			case <-ticker.C:
 				if devices, err := scanUSB(ctx); err == nil {
+					// --- ИЗМЕНЕНИЕ: Обогащаем данные перед отправкой ---
+					o.resolver.ResolveAndUpdate(ctx, devices)
 					deviceScanChan <- devices
 				} else {
 					log.Printf("⚠️ Ошибка сканирования USB: %v", err)
@@ -101,7 +102,10 @@ func (o *Orchestrator) Start(ctx context.Context) {
 	}
 }
 
-// processDeviceList анализирует список устройств и реагирует на изменения.
+// ... Остальные методы (processDeviceList, processProvisionResult, checkAndTriggerDFU) остаются без изменений ...
+// Они уже готовы работать с обогащенными данными.
+// Для краткости я их не привожу, просто скопируйте весь код выше в свой файл.
+// ВАЖНО: убедитесь, что оставшиеся методы в файле не были удалены.
 func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *model.Device) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -112,9 +116,7 @@ func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *m
 		devID := dev.ID()
 		currentDevices[devID] = true
 
-		// --- УЛУЧШЕННАЯ ПРОВЕРКА ---
-		// Игнорируем устройство, если его ECID или USB-порт уже в обработке
-		if (dev.ECID != "" && o.processing[dev.ECID]) || (dev.USBLocation != "" && o.processingPorts[dev.USBLocation]) { // <-- ИЗМЕНЕНИЕ
+		if (dev.ECID != "" && o.processing[dev.ECID]) || (dev.USBLocation != "" && o.processingPorts[dev.USBLocation]) {
 			continue
 		}
 
@@ -123,27 +125,24 @@ func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *m
 			log.Printf("🔌 Подключено: %s (State: %s, ECID: %s)", dev.GetDisplayName(), dev.State, dev.ECID)
 			o.notifier.Speak("Подключено " + dev.GetReadableName())
 			o.knownDevices[devID] = dev
-		} else if prev.State != dev.State {
-			log.Printf("🔄 Изменение состояния: %s -> %s (ECID: %s)", prev.GetDisplayName(), dev.State, dev.ECID)
+		} else if prev.State != dev.State || prev.Name != dev.Name { // Добавлена проверка на изменение имени
+			log.Printf("🔄 Изменение состояния: %s -> %s (ECID: %s)", dev.GetDisplayName(), dev.State, dev.ECID)
 			o.knownDevices[devID] = dev
 		}
 
-		// Проверяем, готово ли устройство к прошивке
 		if dev.State == model.StateDFU && dev.ECID != "" {
 			if cooldownTime, onCooldown := o.cooldowns[dev.ECID]; onCooldown && time.Now().Before(cooldownTime) {
 				// В кулдауне
 			} else {
-				// --- ОТПРАВКА НА ПРОШИВКУ С БЛОКИРОВКОЙ ПОРТА ---
 				o.processing[dev.ECID] = true
 				if dev.USBLocation != "" {
-					o.processingPorts[dev.USBLocation] = true // <-- ИЗМЕНЕНИЕ: Блокируем порт
+					o.processingPorts[dev.USBLocation] = true
 				}
 				jobs <- dev
 			}
 		}
 	}
 
-	// Ищем отключенные устройства
 	for id, dev := range o.knownDevices {
 		if !currentDevices[id] {
 			log.Printf("🔌 Отключено: %s", dev.GetDisplayName())
@@ -153,15 +152,13 @@ func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *m
 	}
 }
 
-// processProvisionResult обрабатывает результат завершенной прошивки.
 func (o *Orchestrator) processProvisionResult(result ProvisionResult) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	// --- ОСВОБОЖДАЕМ ECID И ПОРТ ---
 	delete(o.processing, result.Device.ECID)
 	if result.Device.USBLocation != "" {
-		delete(o.processingPorts, result.Device.USBLocation) // <-- ИЗМЕНЕНИЕ: Освобождаем порт
+		delete(o.processingPorts, result.Device.USBLocation)
 	}
 
 	if result.Err != nil {
@@ -174,16 +171,13 @@ func (o *Orchestrator) processProvisionResult(result ProvisionResult) {
 	}
 }
 
-// checkAndTriggerDFU проверяет, нужно ли запустить macvdmtool.
 func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 
 	for _, dev := range o.knownDevices {
 		if isDFUPort(dev.USBLocation) && dev.State == model.StateNormal {
-			// --- УЛУЧШЕННАЯ ПРОВЕРКА ---
-			// Проверяем, что ни ECID, ни порт не заняты
-			if (dev.ECID != "" && o.processing[dev.ECID]) || (dev.USBLocation != "" && o.processingPorts[dev.USBLocation]) { // <-- ИЗМЕНЕНИЕ
+			if (dev.ECID != "" && o.processing[dev.ECID]) || (dev.USBLocation != "" && o.processingPorts[dev.USBLocation]) {
 				continue
 			}
 

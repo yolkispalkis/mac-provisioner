@@ -14,7 +14,7 @@ import (
 
 func main() {
 	log.SetFlags(log.Ltime)
-	log.Println("🚀 Запуск Mac Provisioner (v2, архитектура на каналах)")
+	log.Println("🚀 Запуск Mac Provisioner")
 
 	cfg, err := config.Load("config.yaml")
 	if err != nil {

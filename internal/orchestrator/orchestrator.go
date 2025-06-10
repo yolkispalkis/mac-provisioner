@@ -20,11 +20,8 @@ type Orchestrator struct {
 	cooldowns       map[string]time.Time
 	processing      map[string]bool
 	processingPorts map[string]bool
-
-	// --- НОВОЕ ПОЛЕ ---
-	resolvedNames map[string]string // <-- Кэш точных имен [ECID -> Name]
-
-	mu sync.RWMutex
+	resolvedNames   map[string]string // Кэш точных имен [ECID -> Name]
+	mu              sync.RWMutex
 }
 
 func New(cfg *config.Config, notifier notifier.Notifier) *Orchestrator {
@@ -36,7 +33,7 @@ func New(cfg *config.Config, notifier notifier.Notifier) *Orchestrator {
 		cooldowns:       make(map[string]time.Time),
 		processing:      make(map[string]bool),
 		processingPorts: make(map[string]bool),
-		resolvedNames:   make(map[string]string), // <-- Инициализация
+		resolvedNames:   make(map[string]string),
 	}
 }
 
@@ -62,28 +59,43 @@ func (o *Orchestrator) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if devices, err := scanUSB(ctx); err == nil {
-					resolved := o.resolver.ResolveAndUpdate(ctx, devices)
+				// --- ИЗМЕНЕННАЯ ЛОГИКА ---
+				// 1. Получаем сырые данные от сканера
+				devices, err := scanUSB(ctx)
+				if err != nil {
+					log.Printf("⚠️ Ошибка сканирования USB: %v", err)
+					continue
+				}
 
-					// --- ИЗМЕНЕНИЕ: Сохраняем распознанные имена ---
-					o.mu.Lock()
-					for ecid, info := range resolved {
-						if info.Name != "" {
-							o.resolvedNames[ecid] = info.Name
+				// 2. Получаем точные имена от резолвера
+				resolved := o.resolver.GetResolvedNames(ctx)
+
+				o.mu.Lock()
+				// 3. Обновляем глобальный кэш имен
+				for ecid, name := range resolved {
+					if name != "" {
+						o.resolvedNames[ecid] = name
+					}
+				}
+
+				// 4. Принудительно применяем имена из кэша ко всем устройствам
+				for _, dev := range devices {
+					if dev.ECID != "" {
+						if name, ok := o.resolvedNames[dev.ECID]; ok {
+							dev.Name = name
 						}
 					}
-					o.mu.Unlock()
-
-					deviceScanChan <- devices
-				} else {
-					log.Printf("⚠️ Ошибка сканирования USB: %v", err)
 				}
+				o.mu.Unlock()
+
+				// 5. Отправляем обогащенные данные в оркестратор
+				deviceScanChan <- devices
 			}
 		}
 	}()
 
-	// Остальная часть Start остается без изменений...
-	// Воркер 2: Пул прошивальщиков
+	// Остальная часть Start остается без изменений
+	// ...
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -97,7 +109,6 @@ func (o *Orchestrator) Start(ctx context.Context) {
 		}
 	}()
 
-	// Главный цикл Оркестратора
 	dfuTriggerTicker := time.NewTicker(o.cfg.CheckInterval * 2)
 	defer dfuTriggerTicker.Stop()
 
@@ -117,17 +128,10 @@ func (o *Orchestrator) Start(ctx context.Context) {
 	}
 }
 
-// getDisplayNameWithCache возвращает лучшее имя для устройства, используя кэш.
-func (o *Orchestrator) getDisplayNameWithCache(dev *model.Device) string {
-	if dev.ECID != "" {
-		if name, ok := o.resolvedNames[dev.ECID]; ok {
-			return name
-		}
-	}
-	return dev.GetDisplayName()
-}
+// --- Методы processDeviceList, processProvisionResult, checkAndTriggerDFU остаются без изменений,
+// --- но теперь они будут работать с уже обновленными именами.
+// --- Я скопирую их снова для полноты.
 
-// processDeviceList анализирует список устройств и реагирует на изменения.
 func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *model.Device) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -138,20 +142,17 @@ func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *m
 		devID := dev.ID()
 		currentDevices[devID] = true
 
-		// --- ИЗМЕНЕНИЕ: Используем имя из кэша ---
-		displayName := o.getDisplayNameWithCache(dev)
-
 		if (dev.ECID != "" && o.processing[dev.ECID]) || (dev.USBLocation != "" && o.processingPorts[dev.USBLocation]) {
 			continue
 		}
 
 		prev, exists := o.knownDevices[devID]
 		if !exists {
-			log.Printf("🔌 Подключено: %s (State: %s, ECID: %s)", displayName, dev.State, dev.ECID)
+			log.Printf("🔌 Подключено: %s (State: %s, ECID: %s)", dev.GetDisplayName(), dev.State, dev.ECID)
 			o.notifier.Speak("Подключено " + dev.GetReadableName())
 			o.knownDevices[devID] = dev
 		} else if prev.State != dev.State || prev.Name != dev.Name {
-			log.Printf("🔄 Изменение состояния: %s -> %s (ECID: %s)", displayName, dev.State, dev.ECID)
+			log.Printf("🔄 Изменение состояния: %s -> %s (ECID: %s)", dev.GetDisplayName(), dev.State, dev.ECID)
 			o.knownDevices[devID] = dev
 		}
 
@@ -159,35 +160,27 @@ func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *m
 			if cooldownTime, onCooldown := o.cooldowns[dev.ECID]; onCooldown && time.Now().Before(cooldownTime) {
 				// В кулдауне
 			} else {
-				// Создаем копию устройства для задания, чтобы избежать гонки данных
-				jobDev := *dev
-				jobDev.Name = displayName // Передаем в задание точное имя
-
 				o.processing[dev.ECID] = true
 				if dev.USBLocation != "" {
 					o.processingPorts[dev.USBLocation] = true
 				}
-				jobs <- &jobDev
+				jobs <- dev // Отправляем указатель, так как имя уже обновлено
 			}
 		}
 	}
 
 	for id, dev := range o.knownDevices {
 		if !currentDevices[id] {
-			displayName := o.getDisplayNameWithCache(dev)
-			log.Printf("🔌 Отключено: %s", displayName)
+			log.Printf("🔌 Отключено: %s", dev.GetDisplayName())
 			o.notifier.Speak("Отключено " + dev.GetReadableName())
 			delete(o.knownDevices, id)
 		}
 	}
 }
 
-// processProvisionResult обрабатывает результат завершенной прошивки.
 func (o *Orchestrator) processProvisionResult(result ProvisionResult) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-
-	displayName := o.getDisplayNameWithCache(result.Device)
 
 	delete(o.processing, result.Device.ECID)
 	if result.Device.USBLocation != "" {
@@ -195,16 +188,15 @@ func (o *Orchestrator) processProvisionResult(result ProvisionResult) {
 	}
 
 	if result.Err != nil {
-		log.Printf("❌ Ошибка прошивки %s: %v", displayName, result.Err)
-		o.notifier.Speak("Ошибка прошивки " + displayName)
+		log.Printf("❌ Ошибка прошивки %s: %v", result.Device.GetDisplayName(), result.Err)
+		o.notifier.Speak("Ошибка прошивки " + result.Device.GetReadableName())
 	} else {
-		log.Printf("✅ Прошивка завершена для %s. Установлен кулдаун.", displayName)
-		o.notifier.Speak("Прошивка " + displayName + " завершена")
+		log.Printf("✅ Прошивка завершена для %s. Установлен кулдаун.", result.Device.GetDisplayName())
+		o.notifier.Speak("Прошивка " + result.Device.GetDisplayName() + " завершена")
 		o.cooldowns[result.Device.ECID] = time.Now().Add(o.cfg.DFUCooldown)
 	}
 }
 
-// checkAndTriggerDFU проверяет, нужно ли запустить macvdmtool.
 func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()

@@ -4,26 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
-
-	"mac-provisioner/internal/model"
 )
 
-// ResolvedInfo содержит обогащенную информацию об устройстве из cfgutil.
-type ResolvedInfo struct {
-	ECID       string
-	DeviceType string
-	Name       string
-}
-
-// Resolver обогащает данные об устройствах, используя `cfgutil list`.
+// Resolver вызывает `cfgutil list` для получения точных имен устройств.
 type Resolver struct {
-	cache      map[string]ResolvedInfo // Ключ - USB Location ID
+	cache      map[string]string // Кэш [ECID -> Name]
 	cacheTime  time.Time
 	cacheTTL   time.Duration
 	mu         sync.Mutex
@@ -32,27 +22,34 @@ type Resolver struct {
 
 func NewResolver() *Resolver {
 	return &Resolver{
-		cache:      make(map[string]ResolvedInfo),
-		cacheTTL:   10 * time.Second, // Можно вернуть обратно на 10с
+		cache:      make(map[string]string),
+		cacheTTL:   10 * time.Second,
 		lastCallOk: true,
 	}
 }
 
-// ResolveAndUpdate обогащает устройства и возвращает карту распознанных устройств.
-func (r *Resolver) ResolveAndUpdate(ctx context.Context, devices []*model.Device) map[string]ResolvedInfo {
+// GetResolvedNames выполняет `cfgutil list` и возвращает карту [ECID -> Name].
+func (r *Resolver) GetResolvedNames(ctx context.Context) map[string]string {
 	r.mu.Lock()
+	// Используем кэш, если он свежий и последняя попытка была успешной
 	if time.Since(r.cacheTime) < r.cacheTTL && r.lastCallOk {
-		r.mu.Unlock()
-		return r.updateFromCache(devices)
+		defer r.mu.Unlock()
+		// Возвращаем копию, чтобы избежать гонки данных
+		cacheCopy := make(map[string]string, len(r.cache))
+		for k, v := range r.cache {
+			cacheCopy[k] = v
+		}
+		return cacheCopy
 	}
 	r.mu.Unlock()
 
+	// Выполняем `cfgutil list`
 	cmd := exec.CommandContext(ctx, "cfgutil", "--format", "json", "list")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
 		r.lastCallOk = false
-		if !strings.Contains(err.Error(), "exit status 70") {
+		if !strings.Contains(err.Error(), "exit status 70") { // Игнорируем ошибку "нет устройств"
 			log.Printf("⚠️ Не удалось выполнить cfgutil list: %v.", err)
 		}
 		return nil
@@ -61,7 +58,6 @@ func (r *Resolver) ResolveAndUpdate(ctx context.Context, devices []*model.Device
 
 	var response struct {
 		Output map[string]struct {
-			LocationID int     `json:"locationID"`
 			ECID       string  `json:"ECID"`
 			Name       *string `json:"name"`
 			DeviceType string  `json:"deviceType"`
@@ -76,15 +72,13 @@ func (r *Resolver) ResolveAndUpdate(ctx context.Context, devices []*model.Device
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.cache = make(map[string]ResolvedInfo)
-	newlyResolved := make(map[string]ResolvedInfo)
+	r.cache = make(map[string]string) // Очищаем старый кэш
 
 	for _, devInfo := range response.Output {
 		if devInfo.ECID == "" {
 			continue
 		}
 
-		locationKey := fmt.Sprintf("0x%x", devInfo.LocationID)
 		ecid := strings.ToLower(devInfo.ECID)
 		if !strings.HasPrefix(ecid, "0x") {
 			ecid = "0x" + ecid
@@ -92,58 +86,21 @@ func (r *Resolver) ResolveAndUpdate(ctx context.Context, devices []*model.Device
 
 		var name string
 		if devInfo.Name != nil && *devInfo.Name != "" {
-			name = *devInfo.Name
+			name = *devInfo.Name // Приоритет у кастомного имени
 		} else {
-			name = devInfo.DeviceType
+			name = devInfo.DeviceType // Иначе используем тип устройства
 		}
 
-		info := ResolvedInfo{
-			ECID:       ecid,
-			DeviceType: devInfo.DeviceType,
-			Name:       name,
+		if name != "" {
+			r.cache[ecid] = name
 		}
-
-		if locationKey != "0x0" {
-			r.cache[locationKey] = info
-		}
-		newlyResolved[ecid] = info
 	}
 	r.cacheTime = time.Now()
 
-	r.updateDevices(devices)
-	return newlyResolved
-}
-
-func (r *Resolver) updateFromCache(devices []*model.Device) map[string]ResolvedInfo {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.updateDevices(devices)
-
-	// Возвращаем копию кэша, преобразованную для оркестратора
-	resolvedMap := make(map[string]ResolvedInfo)
-	for _, info := range r.cache {
-		resolvedMap[info.ECID] = info
+	// Возвращаем копию нового кэша
+	cacheCopy := make(map[string]string, len(r.cache))
+	for k, v := range r.cache {
+		cacheCopy[k] = v
 	}
-	return resolvedMap
-}
-
-func (r *Resolver) updateDevices(devices []*model.Device) {
-	if len(r.cache) == 0 {
-		return
-	}
-
-	for _, dev := range devices {
-		if dev.USBLocation == "" {
-			continue
-		}
-		baseLocation := strings.TrimSpace(strings.Split(dev.USBLocation, "/")[0])
-		if info, ok := r.cache[baseLocation]; ok {
-			if dev.ECID == "" && info.ECID != "" {
-				dev.ECID = info.ECID
-			}
-			if info.Name != "" {
-				dev.Name = info.Name
-			}
-		}
-	}
+	return cacheCopy
 }

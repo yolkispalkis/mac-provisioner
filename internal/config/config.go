@@ -1,7 +1,7 @@
 package config
 
 import (
-	"fmt"
+	"log"
 	"os"
 	"time"
 
@@ -9,51 +9,39 @@ import (
 )
 
 type Config struct {
-	Monitoring    MonitoringConfig   `yaml:"monitoring"`
-	Notifications NotificationConfig `yaml:"notifications"`
-	Provisioning  ProvisioningConfig `yaml:"provisioning"`
+	CheckInterval     time.Duration `yaml:"check_interval"`
+	DFUCooldown       time.Duration `yaml:"dfu_cooldown"`
+	MaxConcurrentJobs int           `yaml:"max_concurrent_jobs"`
+	Notifications     struct {
+		Enabled bool   `yaml:"enabled"`
+		Voice   string `yaml:"voice"`
+		Rate    int    `yaml:"rate"`
+	} `yaml:"notifications"`
 }
 
-type MonitoringConfig struct {
-	CheckInterval   time.Duration `yaml:"check_interval"`
-	CleanupInterval time.Duration `yaml:"cleanup_interval"`
-}
-
-type NotificationConfig struct {
-	Enabled bool    `yaml:"enabled"`
-	Voice   string  `yaml:"voice"`
-	Rate    int     `yaml:"rate"`
-	Volume  float64 `yaml:"volume"`
-}
-
-type ProvisioningConfig struct {
-	DFUCooldownPeriod time.Duration `yaml:"dfu_cooldown_period"`
-	MaxConcurrent     int           `yaml:"max_concurrent"`
-}
-
-func Load() (*Config, error) {
+func Load(path string) (*Config, error) {
+	// Значения по умолчанию
 	cfg := &Config{
-		Monitoring: MonitoringConfig{
-			CheckInterval:   3 * time.Second,
-			CleanupInterval: 30 * time.Second,
-		},
-		Notifications: NotificationConfig{
-			Enabled: true,
-			Voice:   "Milena",
-			Rate:    200,
-			Volume:  0.8,
-		},
-		Provisioning: ProvisioningConfig{
-			DFUCooldownPeriod: 1 * time.Hour,
-			MaxConcurrent:     10,
-		},
+		CheckInterval:     3 * time.Second,
+		DFUCooldown:       1 * time.Hour,
+		MaxConcurrentJobs: 10,
 	}
+	cfg.Notifications.Enabled = true
+	cfg.Notifications.Voice = "Milena"
+	cfg.Notifications.Rate = 200
 
-	if data, err := os.ReadFile("config.yaml"); err == nil {
-		if err := yaml.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("ошибка парсинга конфигурации: %w", err)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		// Если файл не найден, это не ошибка - используем значения по умолчанию.
+		if os.IsNotExist(err) {
+			log.Printf("Файл конфигурации '%s' не найден, используются значения по умолчанию.", path)
+			return cfg, nil
 		}
+		return nil, err
 	}
 
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }

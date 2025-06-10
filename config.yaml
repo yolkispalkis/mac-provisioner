@@ -1,13 +1,14 @@
-monitoring:
-  check_interval: 3s
-  cleanup_interval: 30s
+# Интервал сканирования подключенных USB-устройств.
+check_interval: 3s
 
+# Период, на который устройство блокируется от повторной прошивки после успешного завершения.
+dfu_cooldown: 1h
+
+# Максимальное количество одновременных операций прошивки.
+max_concurrent_jobs: 10
+
+# Настройки голосовых уведомлений.
 notifications:
   enabled: true
   voice: "Milena"
   rate: 200
-  volume: 0.8
-
-provisioning:
-  dfu_cooldown_period: 1h
-  max_concurrent: 10

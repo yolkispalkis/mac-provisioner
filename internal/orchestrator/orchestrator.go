@@ -98,70 +98,78 @@ func (o *Orchestrator) Start(ctx context.Context) {
 	}
 }
 
-// processDeviceList анализирует список устройств и реагирует на изменения.
+// processDeviceList - ПЕРЕПИСАННАЯ ВЕРСИЯ
 func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *model.Device) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	currentDevices := make(map[string]bool)
+	currentDeviceIDs := make(map[string]bool)
+	newDeviceMap := make(map[string]*model.Device)
 
+	// 1. Создаем карту новых устройств и сохраняем "хорошие" имена из старого списка.
 	for _, dev := range devices {
 		devID := dev.ID()
-		if devID == "" { // Игнорируем устройства без ID
+		if devID == "" {
 			continue
 		}
-		currentDevices[devID] = true
+		currentDeviceIDs[devID] = true
 
+		// Если для этого ID у нас уже есть запись с хорошим именем, используем его.
+		if oldDev, exists := o.knownDevices[devID]; exists && oldDev.Name != "" {
+			if dev.Name != oldDev.Name {
+				dev.Name = oldDev.Name // Принудительно ставим старое, хорошее имя.
+			}
+		}
+		newDeviceMap[devID] = dev
+	}
+
+	// 2. Определяем события (подключено/изменилось)
+	for devID, dev := range newDeviceMap {
+		oldDev, exists := o.knownDevices[devID]
+
+		// Игнорируем, если устройство уже в обработке
 		if (dev.ECID != "" && o.processing[dev.ECID]) || (dev.USBLocation != "" && o.processingPorts[dev.USBLocation]) {
 			continue
 		}
 
-		prev, exists := o.knownDevices[devID]
-
-		// --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ ---
-		if exists && prev.Name != "" && dev.Name != prev.Name {
-			// Если мы уже знаем хорошее имя для этого устройства (по ID),
-			// а новое имя другое (например, "Apple Mobile Device..."),
-			// то сохраняем старое, хорошее имя.
-			dev.Name = prev.Name
-		}
-		// --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
-
 		if !exists {
 			log.Printf("🔌 Подключено: %s (State: %s, ECID: %s)", dev.GetDisplayName(), dev.State, dev.ECID)
 			o.notifier.Speak("Подключено " + dev.GetReadableName())
-		} else if prev.State != dev.State {
+		} else if oldDev.State != dev.State {
 			log.Printf("🔄 Изменение состояния: %s -> %s (ECID: %s)", dev.GetDisplayName(), dev.State, dev.ECID)
 		}
 
-		// Обновляем запись в любом случае
-		o.knownDevices[devID] = dev
-
+		// Проверяем, готово ли устройство к прошивке
 		if dev.State == model.StateDFU && dev.ECID != "" {
-			if cooldownTime, onCooldown := o.cooldowns[dev.ECID]; onCooldown && time.Now().Before(cooldownTime) {
-				// В кулдауне
-			} else {
+			if cooldownTime, onCooldown := o.cooldowns[dev.ECID]; !onCooldown || time.Now().After(cooldownTime) {
 				o.processing[dev.ECID] = true
 				if dev.USBLocation != "" {
 					o.processingPorts[dev.USBLocation] = true
 				}
+				// Отправляем на прошивку устройство с уже исправленным именем
 				jobs <- dev
 			}
 		}
 	}
 
-	for id, dev := range o.knownDevices {
-		if !currentDevices[id] {
+	// 3. Определяем отключенные устройства
+	for devID, dev := range o.knownDevices {
+		if !currentDeviceIDs[devID] {
 			log.Printf("🔌 Отключено: %s", dev.GetDisplayName())
 			o.notifier.Speak("Отключено " + dev.GetReadableName())
-			delete(o.knownDevices, id)
 		}
 	}
+
+	// 4. Обновляем основную карту устройств
+	o.knownDevices = newDeviceMap
 }
 
 func (o *Orchestrator) processProvisionResult(result ProvisionResult) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+
+	// Используем имя из результата, так как оно было зафиксировано при старте задачи
+	displayName := result.Device.GetDisplayName()
 
 	delete(o.processing, result.Device.ECID)
 	if result.Device.USBLocation != "" {
@@ -169,11 +177,11 @@ func (o *Orchestrator) processProvisionResult(result ProvisionResult) {
 	}
 
 	if result.Err != nil {
-		log.Printf("❌ Ошибка прошивки %s: %v", result.Device.GetDisplayName(), result.Err)
-		o.notifier.Speak("Ошибка прошивки " + result.Device.GetReadableName())
+		log.Printf("❌ Ошибка прошивки %s: %v", displayName, result.Err)
+		o.notifier.Speak("Ошибка прошивки " + displayName)
 	} else {
-		log.Printf("✅ Прошивка завершена для %s. Установлен кулдаун.", result.Device.GetDisplayName())
-		o.notifier.Speak("Прошивка " + result.Device.GetDisplayName() + " завершена")
+		log.Printf("✅ Прошивка завершена для %s. Установлен кулдаун.", displayName)
+		o.notifier.Speak("Прошивка " + displayName + " завершена")
 		o.cooldowns[result.Device.ECID] = time.Now().Add(o.cfg.DFUCooldown)
 	}
 }

@@ -119,15 +119,15 @@ func createDeviceFromProfiler(item *struct {
 		} else {
 			dev.ECID = ecidStr
 		}
-		return dev // ECID найден, выходим
+		return dev
 	}
 
 	// 2. Ищем по шаблону "ECID: XXXXX"
 	re := regexp.MustCompile(`(?i)ECID:?\s*([0-9A-F]+)`)
 	matches := re.FindStringSubmatch(item.SerialNum)
 	if len(matches) > 1 {
-		dev.ECID = "0x" + matches[1]
-		return dev // ECID найден, выходим
+		dev.ECID = "0x" + strings.ToLower(matches[1])
+		return dev
 	}
 
 	// 3. Проверяем, не является ли вся строка серийного номера валидным ECID (для DFU)
@@ -138,7 +138,7 @@ func createDeviceFromProfiler(item *struct {
 		} else {
 			dev.ECID = ecidStr
 		}
-		return dev // ECID найден, выходим
+		return dev
 	}
 
 	return dev

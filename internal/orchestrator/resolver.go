@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os/exec"
 	"strings"
@@ -11,53 +12,52 @@ import (
 	"time"
 )
 
-// Resolver вызывает `cfgutil list` для получения точных имен устройств.
+// ResolvedDevice содержит информацию, полученную из cfgutil.
+type ResolvedDevice struct {
+	ECID       string
+	DeviceType string
+	Name       string
+	LocationID string // Location ID в формате 0x...
+}
+
+// Resolver вызывает `cfgutil list`.
 type Resolver struct {
-	cache      map[string]string // Кэш [ECID -> Name]
-	cacheTime  time.Time
-	cacheTTL   time.Duration
-	mu         sync.Mutex
-	lastCallOk bool
+	cache     map[string]*ResolvedDevice // Кэш [LocationID -> ResolvedDevice]
+	cacheTime time.Time
+	cacheTTL  time.Duration
+	mu        sync.Mutex
 }
 
 func NewResolver() *Resolver {
 	return &Resolver{
-		cache:      make(map[string]string),
-		cacheTTL:   10 * time.Second,
-		lastCallOk: true,
+		cache:    make(map[string]*ResolvedDevice),
+		cacheTTL: 5 * time.Second, // Короткий TTL, так как состояние портов важно
 	}
 }
 
-// GetResolvedNames выполняет `cfgutil list` и возвращает карту [ECID -> Name].
-func (r *Resolver) GetResolvedNames(ctx context.Context) map[string]string {
+// GetResolvedDevices выполняет `cfgutil list` и возвращает карту устройств.
+func (r *Resolver) GetResolvedDevices(ctx context.Context) map[string]*ResolvedDevice {
 	r.mu.Lock()
-	// Используем кэш, если он свежий и последняя попытка была успешной
-	if time.Since(r.cacheTime) < r.cacheTTL && r.lastCallOk {
+	if time.Since(r.cacheTime) < r.cacheTTL {
 		defer r.mu.Unlock()
-		// Возвращаем копию, чтобы избежать гонки данных
-		cacheCopy := make(map[string]string, len(r.cache))
-		for k, v := range r.cache {
-			cacheCopy[k] = v
-		}
-		return cacheCopy
+		return r.copyCache()
 	}
 	r.mu.Unlock()
 
-	// Выполняем `cfgutil list`
 	cmd := exec.CommandContext(ctx, "cfgutil", "--format", "json", "list")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		r.lastCallOk = false
-		if !strings.Contains(err.Error(), "exit status 70") { // Игнорируем ошибку "нет устройств"
+		// Ошибка "нет устройств" (код 70) - это не ошибка приложения, а нормальная ситуация.
+		if !strings.Contains(err.Error(), "exit status 70") {
 			log.Printf("⚠️ Не удалось выполнить cfgutil list: %v.", err)
 		}
 		return nil
 	}
-	r.lastCallOk = true
 
 	var response struct {
 		Output map[string]struct {
+			LocationID int     `json:"locationID"`
 			ECID       string  `json:"ECID"`
 			Name       *string `json:"name"`
 			DeviceType string  `json:"deviceType"`
@@ -72,11 +72,21 @@ func (r *Resolver) GetResolvedNames(ctx context.Context) map[string]string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.cache = make(map[string]string) // Очищаем старый кэш
+	r.cache = make(map[string]*ResolvedDevice) // Очищаем старый кэш
 
 	for _, devInfo := range response.Output {
-		if devInfo.ECID == "" {
+		if devInfo.LocationID == 0 {
 			continue
+		}
+
+		// Приводим locationID к формату system_profiler (hex)
+		locationKey := fmt.Sprintf("0x%x", devInfo.LocationID)
+
+		var name string
+		if devInfo.Name != nil && *devInfo.Name != "" {
+			name = *devInfo.Name
+		} else {
+			name = devInfo.DeviceType
 		}
 
 		ecid := strings.ToLower(devInfo.ECID)
@@ -84,21 +94,20 @@ func (r *Resolver) GetResolvedNames(ctx context.Context) map[string]string {
 			ecid = "0x" + ecid
 		}
 
-		var name string
-		if devInfo.Name != nil && *devInfo.Name != "" {
-			name = *devInfo.Name // Приоритет у кастомного имени
-		} else {
-			name = devInfo.DeviceType // Иначе используем тип устройства
-		}
-
-		if name != "" {
-			r.cache[ecid] = name
+		r.cache[locationKey] = &ResolvedDevice{
+			ECID:       ecid,
+			DeviceType: devInfo.DeviceType,
+			Name:       name,
+			LocationID: locationKey,
 		}
 	}
 	r.cacheTime = time.Now()
 
-	// Возвращаем копию нового кэша
-	cacheCopy := make(map[string]string, len(r.cache))
+	return r.copyCache()
+}
+
+func (r *Resolver) copyCache() map[string]*ResolvedDevice {
+	cacheCopy := make(map[string]*ResolvedDevice, len(r.cache))
 	for k, v := range r.cache {
 		cacheCopy[k] = v
 	}

@@ -18,16 +18,21 @@ type Orchestrator struct {
 	knownDevices map[string]*model.Device // Карта известных устройств [ID -> Device]
 	cooldowns    map[string]time.Time     // Карта кулдаунов [ECID -> CooldownUntil]
 	processing   map[string]bool          // Карта устройств в процессе прошивки [ECID -> true]
-	mu           sync.RWMutex             // Мьютекс для защиты карт
+
+	// --- НОВОЕ ПОЛЕ ---
+	processingPorts map[string]bool // <-- ИЗМЕНЕНИЕ: Карта USB-портов, занятых прошивкой [USBLocation -> true]
+
+	mu sync.RWMutex // Мьютекс для защиты карт
 }
 
 func New(cfg *config.Config, notifier notifier.Notifier) *Orchestrator {
 	return &Orchestrator{
-		cfg:          cfg,
-		notifier:     notifier,
-		knownDevices: make(map[string]*model.Device),
-		cooldowns:    make(map[string]time.Time),
-		processing:   make(map[string]bool),
+		cfg:             cfg,
+		notifier:        notifier,
+		knownDevices:    make(map[string]*model.Device),
+		cooldowns:       make(map[string]time.Time),
+		processing:      make(map[string]bool),
+		processingPorts: make(map[string]bool), // <-- ИЗМЕНЕНИЕ: Инициализация новой карты
 	}
 }
 
@@ -71,21 +76,20 @@ func (o *Orchestrator) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case job := <-provisionJobsChan:
-				// Запускаем каждую прошивку в своей горутине, чтобы не блокировать пул
 				go runProvisioning(ctx, job, provisionResultsChan)
 			}
 		}
 	}()
 
 	// Главный цикл Оркестратора
-	dfuTriggerTicker := time.NewTicker(o.cfg.CheckInterval * 2) // Проверяем реже, чем сканируем
+	dfuTriggerTicker := time.NewTicker(o.cfg.CheckInterval * 2)
 	defer dfuTriggerTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("Orchestrator shutting down...")
-			wg.Wait() // Дожидаемся завершения всех воркеров
+			wg.Wait()
 			return
 		case devices := <-deviceScanChan:
 			o.processDeviceList(devices, provisionJobsChan)
@@ -108,18 +112,18 @@ func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *m
 		devID := dev.ID()
 		currentDevices[devID] = true
 
-		if dev.ECID != "" && o.processing[dev.ECID] {
-			continue // Устройство уже в процессе, пропускаем
+		// --- УЛУЧШЕННАЯ ПРОВЕРКА ---
+		// Игнорируем устройство, если его ECID или USB-порт уже в обработке
+		if (dev.ECID != "" && o.processing[dev.ECID]) || (dev.USBLocation != "" && o.processingPorts[dev.USBLocation]) { // <-- ИЗМЕНЕНИЕ
+			continue
 		}
 
 		prev, exists := o.knownDevices[devID]
 		if !exists {
-			// --- УЛУЧШЕННЫЙ ЛОГ ---
 			log.Printf("🔌 Подключено: %s (State: %s, ECID: %s)", dev.GetDisplayName(), dev.State, dev.ECID)
 			o.notifier.Speak("Подключено " + dev.GetReadableName())
 			o.knownDevices[devID] = dev
 		} else if prev.State != dev.State {
-			// --- УЛУЧШЕННЫЙ ЛОГ ---
 			log.Printf("🔄 Изменение состояния: %s -> %s (ECID: %s)", prev.GetDisplayName(), dev.State, dev.ECID)
 			o.knownDevices[devID] = dev
 		}
@@ -127,10 +131,13 @@ func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *m
 		// Проверяем, готово ли устройство к прошивке
 		if dev.State == model.StateDFU && dev.ECID != "" {
 			if cooldownTime, onCooldown := o.cooldowns[dev.ECID]; onCooldown && time.Now().Before(cooldownTime) {
-				// Находится в кулдауне, ничего не делаем
+				// В кулдауне
 			} else {
-				// Отправляем на прошивку
+				// --- ОТПРАВКА НА ПРОШИВКУ С БЛОКИРОВКОЙ ПОРТА ---
 				o.processing[dev.ECID] = true
+				if dev.USBLocation != "" {
+					o.processingPorts[dev.USBLocation] = true // <-- ИЗМЕНЕНИЕ: Блокируем порт
+				}
 				jobs <- dev
 			}
 		}
@@ -151,7 +158,11 @@ func (o *Orchestrator) processProvisionResult(result ProvisionResult) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	// --- ОСВОБОЖДАЕМ ECID И ПОРТ ---
 	delete(o.processing, result.Device.ECID)
+	if result.Device.USBLocation != "" {
+		delete(o.processingPorts, result.Device.USBLocation) // <-- ИЗМЕНЕНИЕ: Освобождаем порт
+	}
 
 	if result.Err != nil {
 		log.Printf("❌ Ошибка прошивки %s: %v", result.Device.GetDisplayName(), result.Err)
@@ -168,18 +179,20 @@ func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 
-	// Ищем устройство в нормальном режиме на DFU-порту, которое не в кулдауне и не в обработке
 	for _, dev := range o.knownDevices {
 		if isDFUPort(dev.USBLocation) && dev.State == model.StateNormal {
+			// --- УЛУЧШЕННАЯ ПРОВЕРКА ---
+			// Проверяем, что ни ECID, ни порт не заняты
+			if (dev.ECID != "" && o.processing[dev.ECID]) || (dev.USBLocation != "" && o.processingPorts[dev.USBLocation]) { // <-- ИЗМЕНЕНИЕ
+				continue
+			}
+
 			if dev.ECID != "" {
-				if o.processing[dev.ECID] {
-					continue
-				}
 				if cooldownTime, onCooldown := o.cooldowns[dev.ECID]; onCooldown && time.Now().Before(cooldownTime) {
 					continue
 				}
 			}
-			// Нашли кандидата, запускаем DFU и выходим
+
 			go triggerDFU(ctx)
 			return
 		}

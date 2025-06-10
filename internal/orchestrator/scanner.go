@@ -70,7 +70,6 @@ func parseDeviceTree(rawItem json.RawMessage) []*model.Device {
 // isValidHexECID проверяет, похожа ли строка на ECID в формате hex.
 func isValidHexECID(s string) bool {
 	s = strings.TrimPrefix(strings.ToLower(s), "0x")
-	// Эвристическая проверка длины для 64-битных ECID
 	if len(s) < 10 || len(s) > 20 {
 		return false
 	}
@@ -106,28 +105,45 @@ func createDeviceFromProfiler(item *struct {
 		dev.State = model.StateDFU
 	} else if strings.Contains(name, "recovery mode") || isRecoveryProduct {
 		dev.State = model.StateRecovery
-	} else if item.SerialNum != "" && len(item.SerialNum) > 5 { // Эвристика для обычного Mac
+	} else if item.SerialNum != "" && len(item.SerialNum) > 5 {
 		dev.State = model.StateNormal
 	} else {
-		return nil // Неизвестное устройство Apple, игнорируем
+		return nil
 	}
 
-	// --- ИСПРАВЛЕННАЯ ЛОГИКА ---
-	// Сначала ищем по шаблону "ECID: XXXXX"
+	// --- НАЧАЛО ГЛАВНОГО ИСПРАВЛЕНИЯ ---
+
+	// 1. Ищем ECID в формате 'XXXXXXXX-XXXXXXXXXXXXXXXX'
+	if parts := strings.Split(item.SerialNum, "-"); len(parts) == 2 && isValidHexECID(parts[1]) {
+		ecidStr := strings.ToLower(parts[1])
+		if !strings.HasPrefix(ecidStr, "0x") {
+			dev.ECID = "0x" + ecidStr
+		} else {
+			dev.ECID = ecidStr
+		}
+		return dev // ECID найден, выходим
+	}
+
+	// 2. Ищем по шаблону "ECID: XXXXX"
 	re := regexp.MustCompile(`(?i)ECID:?\s*([0-9A-F]+)`)
 	matches := re.FindStringSubmatch(item.SerialNum)
 	if len(matches) > 1 {
 		dev.ECID = "0x" + matches[1]
-	} else if isValidHexECID(item.SerialNum) {
-		// Если не нашли, проверяем, не является ли вся строка серийного номера валидным ECID
+		return dev // ECID найден, выходим
+	}
+
+	// 3. Проверяем, не является ли вся строка серийного номера валидным ECID (для DFU)
+	if isValidHexECID(item.SerialNum) {
 		ecidStr := strings.ToLower(item.SerialNum)
 		if !strings.HasPrefix(ecidStr, "0x") {
 			dev.ECID = "0x" + ecidStr
 		} else {
 			dev.ECID = ecidStr
 		}
+		return dev // ECID найден, выходим
 	}
-	// --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
+	// --- КОНЕЦ ГЛАВНОГО ИСПРАВЛЕНИЯ ---
 
 	return dev
 }

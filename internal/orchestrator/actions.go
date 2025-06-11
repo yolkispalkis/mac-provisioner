@@ -36,7 +36,6 @@ type ProvisionResult struct {
 
 func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- ProvisionResult, updateChan chan<- ProvisionUpdate, infoLogger, debugLogger *log.Logger) {
 	displayName := dev.GetDisplayName()
-	infoLogger.Printf("[PROVISION] Начинается прошивка %s", displayName)
 
 	ecid := strings.TrimPrefix(dev.ECID, "0x")
 	provCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
@@ -98,7 +97,6 @@ func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- P
 		return
 	}
 
-	infoLogger.Printf("[PROVISION] Успешная прошивка %s", displayName)
 	resultChan <- ProvisionResult{Device: dev, Err: nil}
 }
 

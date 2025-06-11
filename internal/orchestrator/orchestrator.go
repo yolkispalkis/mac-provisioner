@@ -195,11 +195,6 @@ type DeviceState struct {
 	AccurateName string
 }
 
-type jobStatus struct {
-	Name  string
-	Stage ProvisionStatusType
-}
-
 type Orchestrator struct {
 	cfg             *config.Config
 	notifier        notifier.Notifier
@@ -211,9 +206,7 @@ type Orchestrator struct {
 	mu              sync.RWMutex
 	infoLogger      *log.Logger
 	debugLogger     *log.Logger
-	jobStatuses     map[string]*jobStatus
-	logBuffer       []string
-	logBufferSize   int
+	activeJobs      int
 }
 
 func New(cfg *config.Config, notifier notifier.Notifier, infoLogger, debugLogger *log.Logger) *Orchestrator {
@@ -227,14 +220,12 @@ func New(cfg *config.Config, notifier notifier.Notifier, infoLogger, debugLogger
 		processingPorts: make(map[string]bool),
 		infoLogger:      infoLogger,
 		debugLogger:     debugLogger,
-		jobStatuses:     make(map[string]*jobStatus),
-		logBuffer:       make([]string, 0, 20),
-		logBufferSize:   20,
+		activeJobs:      0,
 	}
 }
 
 func (o *Orchestrator) Start(ctx context.Context) {
-	o.logAndBuffer("Orchestrator starting...")
+	o.infoLogger.Println("Orchestrator starting...")
 	o.notifier.Speak("Система запущена")
 	eventChan := make(chan DeviceEvent, 10)
 	provisionJobsChan := make(chan *model.Device, o.cfg.MaxConcurrentJobs)
@@ -262,16 +253,13 @@ func (o *Orchestrator) Start(ctx context.Context) {
 		}
 	}()
 
-	wg.Add(1)
-	go o.uiRenderer(ctx)
-
 	dfuTriggerTicker := time.NewTicker(o.cfg.CheckInterval * 2)
 	defer dfuTriggerTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			o.logAndBuffer("Orchestrator shutting down...")
+			o.infoLogger.Println("Orchestrator shutting down...")
 			wg.Wait()
 			return
 		case event := <-eventChan:
@@ -282,57 +270,6 @@ func (o *Orchestrator) Start(ctx context.Context) {
 			o.handleProvisionUpdate(update)
 		case <-dfuTriggerTicker.C:
 			o.checkAndTriggerDFU(ctx)
-		}
-	}
-}
-
-func (o *Orchestrator) logAndBuffer(msg string) {
-	o.infoLogger.Println(msg)
-	o.mu.Lock()
-	o.logBuffer = append(o.logBuffer, time.Now().Format("15:04:05 ")+msg)
-	if len(o.logBuffer) > o.logBufferSize {
-		o.logBuffer = o.logBuffer[1:]
-	}
-	o.mu.Unlock()
-}
-
-func (o *Orchestrator) uiRenderer(ctx context.Context) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	spinnerChars := []string{"|", "/", "-", "\\"}
-	i := 0
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			o.mu.RLock()
-
-			var b strings.Builder
-			fmt.Print("\033[H\033[2J")
-
-			for _, logLine := range o.logBuffer {
-				b.WriteString(logLine)
-				b.WriteString("\n")
-			}
-			b.WriteString(strings.Repeat("-", 40) + "\n")
-
-			if len(o.jobStatuses) > 0 {
-				for _, status := range o.jobStatuses {
-					stage := ""
-					if status.Stage != "" {
-						stage = fmt.Sprintf("(%s)", status.Stage)
-					}
-					b.WriteString(fmt.Sprintf("Прошивка: %-20s %-15s %s\n", status.Name, stage, spinnerChars[i]))
-				}
-			} else {
-				b.WriteString("Ожидание устройств...\n")
-			}
-
-			fmt.Print(b.String())
-			o.mu.RUnlock()
-
-			i = (i + 1) % len(spinnerChars)
 		}
 	}
 }
@@ -371,12 +308,10 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 				}
 			}
 		} else {
-			o.logAndBuffer(fmt.Sprintf("[WARN] Не удалось получить информацию от cfgutil: %v", err))
+			o.infoLogger.Printf("[WARN] Не удалось получить информацию от cfgutil: %v", err)
 		}
 	}
-
-	o.logAndBuffer(fmt.Sprintf("Подключено/Обновлено: %s (Состояние: %s, ECID: %s)", state.Device.GetDisplayName(), state.Device.State, state.Device.ECID))
-
+	o.infoLogger.Printf("Подключено/Обновлено: %s (Состояние: %s, ECID: %s)", state.Device.GetDisplayName(), state.Device.State, state.Device.ECID)
 	if dev.USBLocation != "" {
 		o.devicesByPort[dev.USBLocation] = state
 	}
@@ -385,17 +320,17 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 	}
 	if dev.State == model.StateDFU && dev.ECID != "" {
 		if cooldown, ok := o.cooldowns[dev.ECID]; ok && time.Now().Before(cooldown) {
-			o.logAndBuffer(fmt.Sprintf("Устройство %s (%s) в кулдауне, прошивка отложена.", state.Device.GetDisplayName(), dev.ECID))
+			o.infoLogger.Printf("Устройство %s (%s) в кулдауне, прошивка отложена.", state.Device.GetDisplayName(), dev.ECID)
 			o.notifier.Speak("Подключено " + state.Device.GetReadableName() + ", но в кулдауне")
 			return
 		}
 		if dev.USBLocation != "" {
 			o.processingPorts[dev.USBLocation] = true
 		}
-		o.jobStatuses[dev.ECID] = &jobStatus{Name: state.Device.GetDisplayName(), Stage: "Ожидание"}
-		o.debugLogger.Printf("Новое задание, активных прошивок: %d", len(o.jobStatuses))
+		o.activeJobs++
+		o.debugLogger.Printf("Новое задание, активных прошивок: %d", o.activeJobs)
 		jobDev := *state.Device
-		o.debugLogger.Printf("Отправляем %s на прошивку.", jobDev.GetDisplayName())
+		o.infoLogger.Printf("[PROVISION] Начинается прошивка %s", jobDev.GetDisplayName())
 		o.notifier.SpeakImmediately("Начинаю прошивку " + jobDev.GetReadableName())
 		jobs <- &jobDev
 	} else {
@@ -416,18 +351,20 @@ func (o *Orchestrator) onDeviceDisconnected(dev *model.Device) {
 	if state.AccurateName != "" {
 		displayName = state.AccurateName
 	}
-	o.logAndBuffer(fmt.Sprintf("Отключено: %s", displayName))
+	o.infoLogger.Printf("Отключено: %s", displayName)
 }
 
 func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	o.activeJobs--
+	if o.activeJobs < 0 {
+		o.activeJobs = 0
+	}
+	o.debugLogger.Printf("Завершено задание, активных прошивок: %d", o.activeJobs)
+
 	ecid := result.Device.ECID
-	delete(o.jobStatuses, ecid)
-
-	o.debugLogger.Printf("Завершено задание, активных прошивок: %d", len(o.jobStatuses))
-
 	var displayName = result.Device.GetDisplayName()
 	if state, ok := o.devicesByECID[ecid]; ok && state.AccurateName != "" {
 		displayName = state.AccurateName
@@ -436,45 +373,37 @@ func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 		delete(o.processingPorts, state.USBLocation)
 	}
 	if result.Err != nil {
-		o.logAndBuffer(fmt.Sprintf("[ERROR] Ошибка прошивки %s: %v", displayName, result.Err))
+		o.infoLogger.Printf("[ERROR] Ошибка прошивки %s: %v", displayName, result.Err)
 		o.notifier.SpeakImmediately("Ошибка прошивки " + result.Device.GetReadableName())
 	} else {
-		o.logAndBuffer(fmt.Sprintf("Прошивка завершена для %s. Установлен кулдаун.", displayName))
+		o.infoLogger.Printf("Прошивка завершена для %s. Установлен кулдаун.", displayName)
 		o.notifier.SpeakImmediately("Прошивка " + result.Device.GetReadableName() + " успешно завершена")
 		o.cooldowns[ecid] = time.Now().Add(o.cfg.DFUCooldown)
 	}
-	if len(o.jobStatuses) == 0 {
+	if o.activeJobs == 0 {
 		o.debugLogger.Printf("Все прошивки завершены, запускаем очистку кеша.")
 		go cleanupConfiguratorCache(o.infoLogger, o.debugLogger)
 	}
 }
 
 func (o *Orchestrator) handleProvisionUpdate(update ProvisionUpdate) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	status, ok := o.jobStatuses[update.Device.ECID]
-	if !ok {
-		return
-	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
 
 	var displayName = update.Device.GetReadableName()
 	if state, ok := o.devicesByECID[update.Device.ECID]; ok && state.AccurateName != "" {
 		displayName = state.AccurateName
 	}
-	status.Name = displayName
 
-	if update.Status != "" && status.Stage != update.Status {
-		status.Stage = update.Status
-		o.logAndBuffer(fmt.Sprintf("[PROVISION][%s] Этап: %s", displayName, update.Status))
+	if update.Status != "" {
+		o.infoLogger.Printf("[PROVISION][%s] Этап: %s", displayName, update.Status)
 		o.notifier.Announce(fmt.Sprintf("%s, этап %s", displayName, update.Status))
 	}
 }
 
 func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
+	o.mu.RLock()
+	defer o.mu.RUnlock()
 	for port, state := range o.devicesByPort {
 		if !isDFUPort(port) {
 			continue
@@ -496,9 +425,7 @@ func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
 		if state.AccurateName != "" {
 			name = state.AccurateName
 		}
-
-		o.logAndBuffer(fmt.Sprintf("Обнаружено устройство %s на свободном DFU-порту. Запуск авто-DFU...", name))
-
+		o.infoLogger.Printf("Обнаружено устройство %s на свободном DFU-порту. Запуск авто-DFU...", name)
 		o.notifier.SpeakImmediately("Перевожу " + name + " в режим ДФУ")
 		go triggerDFU(ctx, o.infoLogger)
 		return

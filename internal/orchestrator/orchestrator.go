@@ -44,12 +44,16 @@ type Scanner struct {
 	interval     time.Duration
 	knownDevices map[string]*model.Device
 	mu           sync.Mutex
+	infoLogger   *log.Logger
+	debugLogger  *log.Logger
 }
 
-func NewScanner(interval time.Duration) *Scanner {
+func NewScanner(interval time.Duration, infoLogger, debugLogger *log.Logger) *Scanner {
 	return &Scanner{
 		interval:     interval,
 		knownDevices: make(map[string]*model.Device),
+		infoLogger:   infoLogger,
+		debugLogger:  debugLogger,
 	}
 }
 func (s *Scanner) Start(ctx context.Context, eventChan chan<- DeviceEvent) {
@@ -70,7 +74,7 @@ func (s *Scanner) scanAndEmitEvents(ctx context.Context, eventChan chan<- Device
 	defer s.mu.Unlock()
 	devices, err := scanUSB(ctx)
 	if err != nil {
-		log.Printf("⚠️ Ошибка сканирования USB: %v", err)
+		s.infoLogger.Printf("⚠️ Ошибка сканирования USB: %v", err)
 		return
 	}
 	currentDevices := make(map[string]bool)
@@ -182,6 +186,7 @@ func createDeviceFromProfiler(item *struct {
 		if err == nil {
 			dev.ECID = normalized
 		} else {
+			// В этой точке у нас еще нет логгеров, поэтому используем стандартный
 			log.Printf("⚠️ Не удалось нормализовать ECID от system_profiler: %s", rawECID)
 		}
 	}
@@ -203,31 +208,35 @@ type Orchestrator struct {
 	cooldowns       map[string]time.Time
 	processingPorts map[string]bool
 	mu              sync.RWMutex
+	activeJobs      int
 
-	activeJobs int
+	infoLogger  *log.Logger
+	debugLogger *log.Logger
 }
 
-func New(cfg *config.Config, notifier notifier.Notifier) *Orchestrator {
+func New(cfg *config.Config, notifier notifier.Notifier, infoLogger, debugLogger *log.Logger) *Orchestrator {
 	return &Orchestrator{
 		cfg:             cfg,
 		notifier:        notifier,
-		resolver:        NewResolver(),
+		resolver:        NewResolver(infoLogger, debugLogger),
 		devicesByPort:   make(map[string]*DeviceState),
 		devicesByECID:   make(map[string]*DeviceState),
 		cooldowns:       make(map[string]time.Time),
 		processingPorts: make(map[string]bool),
 		activeJobs:      0,
+		infoLogger:      infoLogger,
+		debugLogger:     debugLogger,
 	}
 }
 
 func (o *Orchestrator) Start(ctx context.Context) {
-	log.Println("Orchestrator starting...")
+	o.infoLogger.Println("Orchestrator starting...")
 	o.notifier.Speak("Система запущена")
 	eventChan := make(chan DeviceEvent, 10)
 	provisionJobsChan := make(chan *model.Device, o.cfg.MaxConcurrentJobs)
 	provisionResultsChan := make(chan ProvisionResult, o.cfg.MaxConcurrentJobs)
 	var wg sync.WaitGroup
-	scanner := NewScanner(o.cfg.CheckInterval)
+	scanner := NewScanner(o.cfg.CheckInterval, o.infoLogger, o.debugLogger)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -241,7 +250,7 @@ func (o *Orchestrator) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case job := <-provisionJobsChan:
-				go runProvisioning(ctx, job, provisionResultsChan)
+				go runProvisioning(ctx, job, provisionResultsChan, o.infoLogger, o.debugLogger)
 			}
 		}
 	}()
@@ -250,7 +259,7 @@ func (o *Orchestrator) Start(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Orchestrator shutting down...")
+			o.infoLogger.Println("Orchestrator shutting down...")
 			wg.Wait()
 			return
 		case event := <-eventChan:
@@ -275,7 +284,7 @@ func (o *Orchestrator) handleDeviceEvent(ctx context.Context, event DeviceEvent,
 
 func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device, jobs chan<- *model.Device) {
 	if dev.USBLocation != "" && o.processingPorts[dev.USBLocation] {
-		log.Printf("... Порт %s уже в обработке, пропускаем.", dev.USBLocation)
+		o.debugLogger.Printf("Порт %s уже в обработке, пропускаем.", dev.USBLocation)
 		return
 	}
 
@@ -291,18 +300,18 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 		resolved, err := o.resolver.GetInfoByECID(ctx)
 		if err == nil {
 			if info, ok := resolved[dev.ECID]; ok {
-				log.Printf("✨ Найдена точная информация для ECID %s: Name=%s", dev.ECID, info.Name)
+				o.debugLogger.Printf("Найдена точная информация для ECID %s: Name=%s", dev.ECID, info.Name)
 				if info.Name != "" {
 					state.Device.Name = info.Name
 					state.AccurateName = info.Name
 				}
 			}
 		} else {
-			log.Printf("⚠️ Не удалось получить информацию от cfgutil: %v", err)
+			o.infoLogger.Printf("⚠️ Не удалось получить информацию от cfgutil: %v", err)
 		}
 	}
 
-	log.Printf("🔌 Подключено/Обновлено: %s (Состояние: %s, ECID: %s)", state.Device.GetDisplayName(), state.Device.State, state.Device.ECID)
+	o.infoLogger.Printf("🔌 Подключено/Обновлено: %s (Состояние: %s, ECID: %s)", state.Device.GetDisplayName(), state.Device.State, state.Device.ECID)
 
 	if dev.USBLocation != "" {
 		o.devicesByPort[dev.USBLocation] = state
@@ -313,7 +322,7 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 
 	if dev.State == model.StateDFU && dev.ECID != "" {
 		if cooldown, ok := o.cooldowns[dev.ECID]; ok && time.Now().Before(cooldown) {
-			log.Printf("🕒 Устройство %s (%s) в кулдауне, прошивка отложена.", state.Device.GetDisplayName(), dev.ECID)
+			o.infoLogger.Printf("🕒 Устройство %s (%s) в кулдауне, прошивка отложена.", state.Device.GetDisplayName(), dev.ECID)
 			o.notifier.Speak("Подключено " + state.Device.GetReadableName() + ", но в кулдауне")
 			return
 		}
@@ -323,10 +332,10 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 		}
 
 		o.activeJobs++
-		log.Printf("... Новое задание, активных прошивок: %d", o.activeJobs)
+		o.debugLogger.Printf("Новое задание, активных прошивок: %d", o.activeJobs)
 
 		jobDev := *state.Device
-		log.Printf("=> Отправляем %s на прошивку.", jobDev.GetDisplayName())
+		o.infoLogger.Printf("=> Отправляем %s на прошивку.", jobDev.GetDisplayName())
 		o.notifier.SpeakImmediately("Начинаю прошивку " + jobDev.GetReadableName())
 		jobs <- &jobDev
 
@@ -348,7 +357,7 @@ func (o *Orchestrator) onDeviceDisconnected(dev *model.Device) {
 	if state.AccurateName != "" {
 		displayName = state.AccurateName
 	}
-	log.Printf("🔌 Отключено: %s", displayName)
+	o.infoLogger.Printf("🔌 Отключено: %s", displayName)
 }
 
 func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
@@ -359,7 +368,7 @@ func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 	if o.activeJobs < 0 {
 		o.activeJobs = 0
 	}
-	log.Printf("... Завершено задание, активных прошивок: %d", o.activeJobs)
+	o.debugLogger.Printf("Завершено задание, активных прошивок: %d", o.activeJobs)
 
 	ecid := result.Device.ECID
 	var displayName = result.Device.GetDisplayName()
@@ -371,67 +380,51 @@ func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 	}
 
 	if result.Err != nil {
-		log.Printf("❌ Ошибка прошивки %s: %v", displayName, result.Err)
+		o.infoLogger.Printf("❌ Ошибка прошивки %s: %v", displayName, result.Err)
 		o.notifier.SpeakImmediately("Ошибка прошивки " + result.Device.GetReadableName())
 	} else {
-		log.Printf("✅ Прошивка завершена для %s. Установлен кулдаун.", displayName)
+		o.infoLogger.Printf("✅ Прошивка завершена для %s. Установлен кулдаун.", displayName)
 		o.notifier.SpeakImmediately("Прошивка " + result.Device.GetReadableName() + " успешно завершена")
 		o.cooldowns[ecid] = time.Now().Add(o.cfg.DFUCooldown)
 	}
 
 	if o.activeJobs == 0 {
-		log.Printf("... Все прошивки завершены, запускаем очистку кеша.")
-		go cleanupConfiguratorCache()
+		o.debugLogger.Printf("Все прошивки завершены, запускаем очистку кеша.")
+		go cleanupConfiguratorCache(o.infoLogger, o.debugLogger)
 	}
 }
 
-// ==================================================================================
-// === ИЗМЕНЕНИЯ ЗДЕСЬ: Усовершенствованная логика авто-DFU ===
-// ==================================================================================
 func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
-
-	// Итерируемся по всем портам, чтобы найти подходящий для авто-DFU
 	for port, state := range o.devicesByPort {
-		// 1. Проверяем, является ли порт специальным DFU-портом
 		if !isDFUPort(port) {
-			continue // Если нет, идем к следующему устройству
-		}
-
-		// 2. Проверяем, не занят ли этот порт уже идущей прошивкой
-		if o.processingPorts[port] {
-			log.Printf("... Порт для авто-DFU (%s) занят, пропуск.", port)
 			continue
 		}
-
-		// 3. Проверяем, что устройство на этом порту в нормальном режиме.
-		//    Нет смысла переводить в DFU то, что уже в DFU или Recovery.
+		if o.processingPorts[port] {
+			o.debugLogger.Printf("Порт для авто-DFU (%s) занят, пропуск.", port)
+			continue
+		}
 		if state.State != model.StateNormal {
 			continue
 		}
-
-		// 4. Проверяем, не находится ли конкретное устройство в кулдауне
 		if state.ECID != "" {
 			if cooldown, ok := o.cooldowns[state.ECID]; ok && time.Now().Before(cooldown) {
-				log.Printf("... Устройство %s на DFU-порту в кулдауне, пропуск.", state.GetDisplayName())
+				o.debugLogger.Printf("Устройство %s на DFU-порту в кулдауне, пропуск.", state.GetDisplayName())
 				continue
 			}
 		}
 
-		// Если все проверки пройдены, это наш кандидат!
 		var name = state.GetDisplayName()
 		if state.AccurateName != "" {
 			name = state.AccurateName
 		}
 
-		log.Printf("⚡️ Обнаружено устройство %s на свободном DFU-порту. Запуск авто-DFU...", name)
+		o.infoLogger.Printf("⚡️ Обнаружено устройство %s на свободном DFU-порту. Запуск авто-DFU...", name)
 		o.notifier.SpeakImmediately("Перевожу " + name + " в режим ДФУ")
 
-		// Запускаем в горутине, чтобы не блокировать цикл
-		go triggerDFU(ctx)
+		go triggerDFU(ctx, o.infoLogger, o.debugLogger)
 
-		// Важно! Выходим из функции после запуска, чтобы не триггерить несколько DFU за раз.
 		return
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -13,12 +14,25 @@ import (
 )
 
 func main() {
-	log.SetFlags(log.Ltime)
-	log.Println("🚀 Запуск Mac Provisioner")
+	// === НОВОЕ: Настройка логгеров ===
+	// infoLogger всегда пишет в stdout
+	infoLogger := log.New(os.Stdout, "", log.Ltime)
+
+	// debugLogger пишет в stdout только если DEBUG=1, иначе - в "никуда"
+	var debugOutput io.Writer = io.Discard
+	if os.Getenv("DEBUG") == "1" {
+		debugOutput = os.Stdout
+	}
+	debugLogger := log.New(debugOutput, "DEBUG: ", log.Ltime)
+
+	infoLogger.Println("🚀 Запуск Mac Provisioner")
+	if os.Getenv("DEBUG") == "1" {
+		infoLogger.Println("   (Режим отладки включен)")
+	}
 
 	cfg, err := config.Load("config.yaml")
 	if err != nil {
-		log.Fatalf("❌ Не удалось загрузить конфигурацию: %v", err)
+		infoLogger.Fatalf("❌ Не удалось загрузить конфигурацию: %v", err)
 	}
 
 	voiceNotifier := notifier.New(
@@ -27,22 +41,21 @@ func main() {
 		cfg.Notifications.Rate,
 	)
 
-	app := orchestrator.New(cfg, voiceNotifier)
+	// === ИЗМЕНЕНИЕ: Передаем логгеры в Orchestrator ===
+	app := orchestrator.New(cfg, voiceNotifier, infoLogger, debugLogger)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Обработка сигнала завершения для graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
 		<-sigChan
-		log.Println("🛑 Получен сигнал завершения, останавливаемся...")
+		infoLogger.Println("🛑 Получен сигнал завершения, останавливаемся...")
 		cancel()
 	}()
 
-	// Блокирующий вызов, который запускает всю логику приложения
 	app.Start(ctx)
 
-	log.Println("✅ Программа завершена.")
+	infoLogger.Println("✅ Программа завершена.")
 }

@@ -19,10 +19,16 @@ type ResolvedInfo struct {
 }
 
 // Resolver вызывает `cfgutil` для получения точных данных об устройствах.
-type Resolver struct{}
+type Resolver struct {
+	infoLogger  *log.Logger
+	debugLogger *log.Logger
+}
 
-func NewResolver() *Resolver {
-	return &Resolver{}
+func NewResolver(infoLogger, debugLogger *log.Logger) *Resolver {
+	return &Resolver{
+		infoLogger:  infoLogger,
+		debugLogger: debugLogger,
+	}
 }
 
 // GetInfoByECID выполняет `cfgutil list` и возвращает карту [ECID -> Info].
@@ -66,10 +72,9 @@ func (r *Resolver) GetInfoByECID(ctx context.Context) (map[string]ResolvedInfo, 
 			name = devInfo.DeviceType
 		}
 
-		// Используем нормализацию!
 		normalizedECID, err := normalizeECID(devInfo.ECID)
 		if err != nil {
-			log.Printf("⚠️ Не удалось нормализовать ECID от cfgutil: %s", devInfo.ECID)
+			r.infoLogger.Printf("⚠️ Не удалось нормализовать ECID от cfgutil: %s", devInfo.ECID)
 			continue
 		}
 

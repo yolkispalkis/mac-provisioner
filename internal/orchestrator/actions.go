@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -28,13 +30,9 @@ func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- P
 
 	cmd := exec.CommandContext(provCtx, "cfgutil", "--ecid", ecid, "restore")
 
-	// Контекст для спиннера, который отменится, когда прошивка закончится
 	spinnerCtx, spinnerCancel := context.WithCancel(ctx)
 
-	// Запускаем спиннер в отдельной горутине
 	go func() {
-		// \r (carriage return) возвращает курсор в начало строки,
-		// позволяя переписывать ее и создавать эффект анимации.
 		spinnerChars := []string{"|", "/", "-", "\\"}
 		i := 0
 		ticker := time.NewTicker(100 * time.Millisecond)
@@ -43,7 +41,6 @@ func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- P
 		for {
 			select {
 			case <-spinnerCtx.Done():
-				// Очищаем строку со спиннером перед выходом
 				fmt.Printf("\r%s\n", strings.Repeat(" ", len(displayName)+20))
 				return
 			case <-ticker.C:
@@ -55,13 +52,10 @@ func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- P
 
 	output, err := cmd.CombinedOutput()
 
-	// Останавливаем спиннер
 	spinnerCancel()
-	// Небольшая пауза, чтобы спиннер успел очистить строку
 	time.Sleep(150 * time.Millisecond)
 
 	if err != nil {
-		// Выводим ошибку на новой строке, чтобы не смешивать со спиннером
 		log.Printf("\n❌ Ошибка вывода cfgutil для %s:\n%s", displayName, string(output))
 		errMsg := fmt.Errorf("ошибка cfgutil: %w", err)
 		resultChan <- ProvisionResult{Device: dev, Err: errMsg}
@@ -72,7 +66,6 @@ func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- P
 	resultChan <- ProvisionResult{Device: dev, Err: nil}
 }
 
-// triggerDFU и isDFUPort остаются без изменений
 func triggerDFU(ctx context.Context) {
 	log.Println("⚡️ [DFU] Запуск macvdmtool dfu...")
 	cmd := exec.CommandContext(ctx, "macvdmtool", "dfu")
@@ -87,4 +80,47 @@ func isDFUPort(usbLocation string) bool {
 	}
 	base := strings.Split(usbLocation, "/")[0]
 	return strings.HasPrefix(base, "0x011") || strings.HasPrefix(base, "0x001")
+}
+
+// ==================================================================================
+// === НОВАЯ ФУНКЦИЯ ОЧИСТКИ КЕША ===
+// ==================================================================================
+func cleanupConfiguratorCache() {
+	log.Println("🧹 [CLEANUP] Попытка очистки кеша Apple Configurator...")
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("🧹 [CLEANUP] ❌ Не удалось определить домашнюю директорию: %v", err)
+		return
+	}
+
+	cachePath := filepath.Join(homeDir, "Library", "Containers", "com.apple.configurator.xpc.DeviceService", "Data", "tmp", "TemporaryItems")
+
+	entries, err := os.ReadDir(cachePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("🧹 [CLEANUP] Директория кеша не найдена, очистка не требуется.")
+			return
+		}
+		log.Printf("🧹 [CLEANUP] ❌ Ошибка чтения директории кеша %s: %v", cachePath, err)
+		return
+	}
+
+	if len(entries) == 0 {
+		log.Printf("🧹 [CLEANUP] Кеш уже пуст.")
+		return
+	}
+
+	var itemsDeleted int
+	for _, entry := range entries {
+		fullPath := filepath.Join(cachePath, entry.Name())
+		log.Printf("🧹 [CLEANUP] Удаление: %s", fullPath)
+		if err := os.RemoveAll(fullPath); err != nil {
+			log.Printf("🧹 [CLEANUP] ❌ Ошибка удаления %s: %v", fullPath, err)
+		} else {
+			itemsDeleted++
+		}
+	}
+
+	log.Printf("🧹 [CLEANUP] ✅ Очистка завершена. Удалено элементов: %d.", itemsDeleted)
 }

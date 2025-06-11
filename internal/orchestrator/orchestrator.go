@@ -258,7 +258,7 @@ func (o *Orchestrator) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case job := <-provisionJobsChan:
-				go runProvisioning(ctx, job, provisionResultsChan, provisionUpdateChan, o.infoLogger)
+				go runProvisioning(ctx, job, provisionResultsChan, provisionUpdateChan, o.infoLogger, o.debugLogger)
 			}
 		}
 	}()
@@ -298,12 +298,15 @@ func (o *Orchestrator) uiRenderer(ctx context.Context) {
 			return
 		case <-ticker.C:
 			o.mu.Lock()
+
+			numJobs := len(o.jobStatuses)
+
 			if o.lastRenderedLines > 0 {
 				fmt.Printf("\033[%dA", o.lastRenderedLines)
 				fmt.Printf("\033[J")
 			}
 
-			if len(o.jobStatuses) == 0 {
+			if numJobs == 0 {
 				o.lastRenderedLines = 0
 				o.mu.Unlock()
 				continue
@@ -324,7 +327,7 @@ func (o *Orchestrator) uiRenderer(ctx context.Context) {
 			}
 
 			fmt.Print(b.String())
-			o.lastRenderedLines = len(o.jobStatuses)
+			o.lastRenderedLines = numJobs
 			o.mu.Unlock()
 
 			i = (i + 1) % len(spinnerChars)
@@ -461,6 +464,7 @@ func (o *Orchestrator) handleProvisionUpdate(update ProvisionUpdate) {
 
 	if update.Status != "" {
 		status.Stage = update.Status
+		o.infoLogger.Printf("[PROVISION][%s] Этап: %s", displayName, update.Status)
 		o.notifier.Announce(fmt.Sprintf("%s, этап %s", displayName, update.Status))
 		o.lastAnnouncedPercent[update.Device.ECID] = 0
 		return

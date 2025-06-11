@@ -36,7 +36,7 @@ type ProvisionResult struct {
 	Err    error
 }
 
-func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- ProvisionResult, updateChan chan<- ProvisionUpdate, infoLogger *log.Logger) {
+func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- ProvisionResult, updateChan chan<- ProvisionUpdate, infoLogger, debugLogger *log.Logger) {
 	displayName := dev.GetDisplayName()
 	infoLogger.Printf("[PROVISION] Начинается прошивка %s", displayName)
 
@@ -65,6 +65,7 @@ func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- P
 		scanner := bufio.NewScanner(stream)
 		for scanner.Scan() {
 			line := scanner.Text()
+			debugLogger.Printf("[CFGUTIL] %s", line)
 			outputCollector.WriteString(line + "\n")
 
 			var currentStatus ProvisionStatusType
@@ -95,12 +96,12 @@ func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- P
 	go processStream(stdout)
 	go processStream(stderr)
 
-	wg.Wait()
 	err := cmd.Wait()
+	wg.Wait()
 
 	if err != nil {
 		infoLogger.Printf("[ERROR] Процесс cfgutil для %s завершился с ошибкой: %v", displayName, err)
-		infoLogger.Printf("[ERROR] Полный вывод cfgutil для %s:\n%s", displayName, outputCollector.String())
+		debugLogger.Printf("[ERROR] Полный вывод cfgutil для %s:\n%s", displayName, outputCollector.String())
 		resultChan <- ProvisionResult{Device: dev, Err: err}
 		return
 	}

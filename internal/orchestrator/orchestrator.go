@@ -16,7 +16,7 @@ import (
 	"mac-provisioner/internal/notifier"
 )
 
-// --- КОД ИЗ SCANNER.GO, ВКЛЮЧАЯ ВСЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+// --- КОД ИЗ SCANNER.GO, ВКЛЮЧАЯ ВСЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (без изменений) ---
 
 // EventType определяет тип события, связанного с устройством.
 type EventType string
@@ -68,7 +68,7 @@ func (s *Scanner) scanAndEmitEvents(ctx context.Context, eventChan chan<- Device
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	devices, err := scanUSB(ctx) // <--- ВОТ ВЫЗОВ
+	devices, err := scanUSB(ctx)
 	if err != nil {
 		log.Printf("⚠️ Ошибка сканирования USB: %v", err)
 		return
@@ -96,9 +96,8 @@ func (s *Scanner) scanAndEmitEvents(ctx context.Context, eventChan chan<- Device
 	}
 }
 
-// --- НЕДОСТАЮЩИЕ ФУНКЦИИ ---
+// --- НЕДОСТАЮЩИЕ ФУНКЦИИ (без изменений) ---
 
-// scanUSB выполняет системный вызов для получения списка USB-устройств.
 func scanUSB(ctx context.Context) ([]*model.Device, error) {
 	cmd := exec.CommandContext(ctx, "system_profiler", "SPUSBDataType", "-json")
 	var out bytes.Buffer
@@ -122,7 +121,6 @@ func scanUSB(ctx context.Context) ([]*model.Device, error) {
 	return devices, nil
 }
 
-// parseDeviceTree рекурсивно обходит дерево USB-устройств из JSON.
 func parseDeviceTree(rawItem json.RawMessage) []*model.Device {
 	var item struct {
 		Name         string            `json:"_name"`
@@ -224,7 +222,7 @@ func createDeviceFromProfiler(item *struct {
 	return dev
 }
 
-// --- КОД ОРКЕСТРАТОРА ---
+// --- КОД ОРКЕСТРАТОРА (изменения здесь) ---
 
 // DeviceState представляет полное состояние известного устройства.
 type DeviceState struct {
@@ -318,38 +316,56 @@ func (o *Orchestrator) handleDeviceEvent(ctx context.Context, event DeviceEvent,
 	}
 }
 
+// ==================================================================================
+// === ИЗМЕНЕНИЯ ЗДЕСЬ: Полностью переработанная функция onDeviceConnected ===
+// ==================================================================================
 func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device, jobs chan<- *model.Device) {
 	if dev.USBLocation != "" && o.processingPorts[dev.USBLocation] {
+		log.Printf("... Порт %s уже в обработке, пропускаем.", dev.USBLocation)
 		return
-	}
-
-	if dev.ECID == "" {
-		resolved, err := o.resolver.GetInfoByLocation(ctx)
-		if err == nil {
-			baseLocation := strings.Split(dev.USBLocation, "/")[0]
-			if info, ok := resolved[baseLocation]; ok {
-				dev.ECID = info.ECID
-				dev.Name = info.Name
-			}
-		}
 	}
 
 	if dev.ECID != "" {
 		dev.ECID = strings.ToLower(dev.ECID)
 	}
 
+	// Шаг 1: Создаем новый объект состояния и пытаемся перенести "красивое" имя из предыдущего состояния по ECID.
+	// Это важно для сохранения имени при переходе из Normal в DFU.
 	state := &DeviceState{Device: dev}
 	if dev.ECID != "" {
 		if existing, ok := o.devicesByECID[dev.ECID]; ok && existing.AccurateName != "" {
 			state.AccurateName = existing.AccurateName
+			// Применим сохраненное имя к текущему объекту для консистентности отображения
+			state.Device.Name = existing.AccurateName
 		}
 	}
 
-	if dev.State == model.StateNormal && dev.Name != "" {
-		state.AccurateName = dev.Name
+	// Шаг 2: Пытаемся получить более точные данные через cfgutil.
+	// Это возможно только когда устройство в Normal или Recovery режиме.
+	if dev.State == model.StateNormal || dev.State == model.StateRecovery {
+		resolved, err := o.resolver.GetInfoByLocation(ctx)
+		if err == nil {
+			// Ключ для карты от resolver'а - это базовая часть USB Location.
+			baseLocation := strings.Split(dev.USBLocation, "/")[0]
+			if info, ok := resolved[baseLocation]; ok {
+				log.Printf("✨ Найдена точная информация для %s: Name=%s, ECID=%s", baseLocation, info.Name, info.ECID)
+				// Если cfgutil дал нам имя, оно считается самым точным.
+				if info.Name != "" {
+					state.Device.Name = info.Name
+					state.AccurateName = info.Name
+				}
+				// Если у нас не было ECID, а cfgutil его дал - сохраняем.
+				if state.Device.ECID == "" && info.ECID != "" {
+					state.Device.ECID = strings.ToLower(info.ECID)
+				}
+			}
+		} else {
+			log.Printf("⚠️ Не удалось получить информацию от cfgutil: %v", err)
+		}
 	}
 
-	log.Printf("🔌 Подключено/Обновлено: %s (State: %s, ECID: %s)", state.Device.GetDisplayName(), state.Device.State, state.Device.ECID)
+	// Шаг 3: Обновляем кеш устройств.
+	log.Printf("🔌 Подключено/Обновлено: %s (Состояние: %s, ECID: %s)", state.Device.GetDisplayName(), state.Device.State, state.Device.ECID)
 
 	if dev.USBLocation != "" {
 		o.devicesByPort[dev.USBLocation] = state
@@ -358,24 +374,31 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 		o.devicesByECID[dev.ECID] = state
 	}
 
+	// Шаг 4: Принимаем решение о запуске прошивки.
 	if dev.State == model.StateDFU && dev.ECID != "" {
+		// Проверяем кулдаун
 		if cooldown, ok := o.cooldowns[dev.ECID]; ok && time.Now().Before(cooldown) {
-			log.Printf("🕒 Устройство %s в кулдауне", state.AccurateName)
+			log.Printf("🕒 Устройство %s (%s) в кулдауне, прошивка отложена.", state.Device.GetDisplayName(), dev.ECID)
 			return
 		}
 
+		// Отмечаем порт как занятый
 		if dev.USBLocation != "" {
 			o.processingPorts[dev.USBLocation] = true
 		}
 
-		jobDev := *dev
-		if state.AccurateName != "" {
-			jobDev.Name = state.AccurateName
-		}
+		// Создаем копию устройства для задачи, чтобы избежать гонки состояний.
+		// Важно передать в задачу устройство с максимально точным именем.
+		jobDev := *state.Device
 
+		log.Printf("=> Отправляем %s на прошивку.", jobDev.GetDisplayName())
 		jobs <- &jobDev
 	}
 }
+
+// ==================================================================================
+// === КОНЕЦ ИЗМЕНЕНИЙ ===
+// ==================================================================================
 
 func (o *Orchestrator) onDeviceDisconnected(dev *model.Device) {
 	if dev.USBLocation == "" {
@@ -390,6 +413,7 @@ func (o *Orchestrator) onDeviceDisconnected(dev *model.Device) {
 	delete(o.devicesByPort, dev.USBLocation)
 
 	var displayName = dev.GetDisplayName()
+	// Используем сохраненное "красивое" имя для лога отключения
 	if state.AccurateName != "" {
 		displayName = state.AccurateName
 	}
@@ -404,20 +428,23 @@ func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 	ecid := strings.ToLower(result.Device.ECID)
 
 	var displayName = result.Device.GetDisplayName()
+	// Используем сохраненное "красивое" имя для результата
 	if state, ok := o.devicesByECID[ecid]; ok && state.AccurateName != "" {
 		displayName = state.AccurateName
 	}
 
+	// Освобождаем порт от обработки
 	if state, ok := o.devicesByECID[ecid]; ok {
+		log.Printf("... Освобождаем порт %s", state.USBLocation)
 		delete(o.processingPorts, state.USBLocation)
 	}
 
 	if result.Err != nil {
 		log.Printf("❌ Ошибка прошивки %s: %v", displayName, result.Err)
-		o.notifier.Speak("Ошибка прошивки " + displayName)
+		o.notifier.Speak("Ошибка прошивки " + result.Device.GetReadableName())
 	} else {
 		log.Printf("✅ Прошивка завершена для %s. Установлен кулдаун.", displayName)
-		o.notifier.Speak("Прошивка " + displayName + " завершена")
+		o.notifier.Speak("Прошивка " + result.Device.GetReadableName() + " завершена")
 		o.cooldowns[ecid] = time.Now().Add(o.cfg.DFUCooldown)
 	}
 }
@@ -437,13 +464,16 @@ func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
 					continue
 				}
 			}
-			var name = state.AccurateName
-			if name == "" {
-				name = state.GetDisplayName()
+
+			// Используем сохраненное "красивое" имя
+			var name = state.Device.GetDisplayName()
+			if state.AccurateName != "" {
+				name = state.AccurateName
 			}
 
 			log.Printf("⚡️ Запуск DFU для %s на порту %s", name, port)
 			go triggerDFU(ctx)
+			// Возвращаемся, чтобы не триггерить DFU для нескольких устройств одновременно
 			return
 		}
 	}

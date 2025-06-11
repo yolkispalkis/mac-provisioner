@@ -282,6 +282,8 @@ func (o *Orchestrator) handleDeviceEvent(ctx context.Context, event DeviceEvent,
 	}
 }
 
+// В файле internal/orchestrator/orchestrator.go
+
 func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device, jobs chan<- *model.Device) {
 	if dev.USBLocation != "" && o.processingPorts[dev.USBLocation] {
 		o.debugLogger.Printf("Порт %s уже в обработке, пропускаем.", dev.USBLocation)
@@ -335,7 +337,10 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 		o.debugLogger.Printf("Новое задание, активных прошивок: %d", o.activeJobs)
 
 		jobDev := *state.Device
-		o.infoLogger.Printf("=> Отправляем %s на прошивку.", jobDev.GetDisplayName())
+
+		// === ИЗМЕНЕНИЕ ЗДЕСЬ: log.Printf заменен на o.debugLogger.Printf ===
+		o.debugLogger.Printf("=> Отправляем %s на прошивку.", jobDev.GetDisplayName())
+
 		o.notifier.SpeakImmediately("Начинаю прошивку " + jobDev.GetReadableName())
 		jobs <- &jobDev
 

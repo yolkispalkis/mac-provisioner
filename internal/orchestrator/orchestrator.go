@@ -1,8 +1,12 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"log"
+	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -12,25 +16,243 @@ import (
 	"mac-provisioner/internal/notifier"
 )
 
+// --- КОД ИЗ SCANNER.GO, ВКЛЮЧАЯ ВСЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
+// EventType определяет тип события, связанного с устройством.
+type EventType string
+
+const (
+	EventConnected    EventType = "Connected"
+	EventDisconnected EventType = "Disconnected"
+)
+
+// DeviceEvent представляет событие, связанное с устройством.
+type DeviceEvent struct {
+	Type   EventType
+	Device *model.Device
+}
+
+// Scanner отслеживает USB-устройства и генерирует события.
+type Scanner struct {
+	interval     time.Duration
+	knownDevices map[string]*model.Device // Ключ: USB Location
+	mu           sync.Mutex
+}
+
+func NewScanner(interval time.Duration) *Scanner {
+	return &Scanner{
+		interval:     interval,
+		knownDevices: make(map[string]*model.Device),
+	}
+}
+
+// Start запускает цикл сканирования, отправляя события в канал.
+func (s *Scanner) Start(ctx context.Context, eventChan chan<- DeviceEvent) {
+	ticker := time.NewTicker(s.interval)
+	defer ticker.Stop()
+
+	// Выполняем первое сканирование сразу
+	s.scanAndEmitEvents(ctx, eventChan)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.scanAndEmitEvents(ctx, eventChan)
+		}
+	}
+}
+
+func (s *Scanner) scanAndEmitEvents(ctx context.Context, eventChan chan<- DeviceEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	devices, err := scanUSB(ctx) // <--- ВОТ ВЫЗОВ
+	if err != nil {
+		log.Printf("⚠️ Ошибка сканирования USB: %v", err)
+		return
+	}
+
+	currentDevices := make(map[string]bool)
+	for _, dev := range devices {
+		if dev.USBLocation == "" {
+			continue
+		}
+		currentDevices[dev.USBLocation] = true
+
+		oldDev, exists := s.knownDevices[dev.USBLocation]
+		if !exists || oldDev.State != dev.State || oldDev.ECID != dev.ECID {
+			s.knownDevices[dev.USBLocation] = dev
+			eventChan <- DeviceEvent{Type: EventConnected, Device: dev}
+		}
+	}
+
+	for location, dev := range s.knownDevices {
+		if !currentDevices[location] {
+			delete(s.knownDevices, location)
+			eventChan <- DeviceEvent{Type: EventDisconnected, Device: dev}
+		}
+	}
+}
+
+// --- НЕДОСТАЮЩИЕ ФУНКЦИИ ---
+
+// scanUSB выполняет системный вызов для получения списка USB-устройств.
+func scanUSB(ctx context.Context) ([]*model.Device, error) {
+	cmd := exec.CommandContext(ctx, "system_profiler", "SPUSBDataType", "-json")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+
+	var data struct {
+		USB []json.RawMessage `json:"SPUSBDataType"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &data); err != nil {
+		return nil, err
+	}
+
+	var devices []*model.Device
+	for _, rawItem := range data.USB {
+		devices = append(devices, parseDeviceTree(rawItem)...)
+	}
+
+	return devices, nil
+}
+
+// parseDeviceTree рекурсивно обходит дерево USB-устройств из JSON.
+func parseDeviceTree(rawItem json.RawMessage) []*model.Device {
+	var item struct {
+		Name         string            `json:"_name"`
+		ProductID    string            `json:"product_id"`
+		VendorID     string            `json:"vendor_id"`
+		SerialNum    string            `json:"serial_num"`
+		LocationID   string            `json:"location_id"`
+		Manufacturer string            `json:"manufacturer"`
+		Items        []json.RawMessage `json:"_items"`
+	}
+	if err := json.Unmarshal(rawItem, &item); err != nil {
+		return nil
+	}
+
+	var found []*model.Device
+
+	if strings.EqualFold(item.VendorID, "0x05ac") || strings.Contains(item.Manufacturer, "Apple") {
+		if dev := createDeviceFromProfiler(&item); dev != nil {
+			found = append(found, dev)
+		}
+	}
+
+	for _, subItem := range item.Items {
+		found = append(found, parseDeviceTree(subItem)...)
+	}
+
+	return found
+}
+
+func isValidHexECID(s string) bool {
+	s = strings.TrimPrefix(strings.ToLower(s), "0x")
+	if len(s) < 10 || len(s) > 20 {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func createDeviceFromProfiler(item *struct {
+	Name         string            `json:"_name"`
+	ProductID    string            `json:"product_id"`
+	VendorID     string            `json:"vendor_id"`
+	SerialNum    string            `json:"serial_num"`
+	LocationID   string            `json:"location_id"`
+	Manufacturer string            `json:"manufacturer"`
+	Items        []json.RawMessage `json:"_items"`
+}) *model.Device {
+	dev := &model.Device{
+		Name:        item.Name,
+		USBLocation: item.LocationID,
+		State:       model.StateUnknown,
+	}
+
+	name := strings.ToLower(item.Name)
+	isDFUProduct := item.ProductID == "0x1281" || item.ProductID == "0x1227"
+	isRecoveryProduct := item.ProductID == "0x1280"
+
+	if strings.Contains(name, "dfu mode") || isDFUProduct {
+		dev.State = model.StateDFU
+	} else if strings.Contains(name, "recovery mode") || isRecoveryProduct {
+		dev.State = model.StateRecovery
+	} else if item.SerialNum != "" && len(item.SerialNum) > 5 {
+		dev.State = model.StateNormal
+	} else {
+		return nil
+	}
+
+	if parts := strings.Split(item.SerialNum, "-"); len(parts) == 2 && isValidHexECID(parts[1]) {
+		ecidStr := strings.ToLower(parts[1])
+		if !strings.HasPrefix(ecidStr, "0x") {
+			dev.ECID = "0x" + ecidStr
+		} else {
+			dev.ECID = ecidStr
+		}
+		return dev
+	}
+
+	re := regexp.MustCompile(`(?i)ECID:?\s*([0-9A-F]+)`)
+	matches := re.FindStringSubmatch(item.SerialNum)
+	if len(matches) > 1 {
+		dev.ECID = "0x" + strings.ToLower(matches[1])
+		return dev
+	}
+
+	if isValidHexECID(item.SerialNum) {
+		ecidStr := strings.ToLower(item.SerialNum)
+		if !strings.HasPrefix(ecidStr, "0x") {
+			dev.ECID = "0x" + ecidStr
+		} else {
+			dev.ECID = ecidStr
+		}
+		return dev
+	}
+
+	return dev
+}
+
+// --- КОД ОРКЕСТРАТОРА ---
+
+// DeviceState представляет полное состояние известного устройства.
+type DeviceState struct {
+	*model.Device
+	AccurateName string // Самое точное имя, которое мы знаем
+}
+
 type Orchestrator struct {
-	cfg             *config.Config
-	notifier        notifier.Notifier
-	resolver        *Resolver // <-- Возвращаем резолвер
-	knownDevices    map[string]*model.Device
+	cfg      *config.Config
+	notifier notifier.Notifier
+	resolver *Resolver
+
+	devicesByPort   map[string]*DeviceState
+	devicesByECID   map[string]*DeviceState
 	cooldowns       map[string]time.Time
-	processing      map[string]bool
 	processingPorts map[string]bool
-	mu              sync.RWMutex
+
+	mu sync.RWMutex
 }
 
 func New(cfg *config.Config, notifier notifier.Notifier) *Orchestrator {
 	return &Orchestrator{
 		cfg:             cfg,
 		notifier:        notifier,
-		resolver:        NewResolver(), // <-- Инициализируем резолвер
-		knownDevices:    make(map[string]*model.Device),
+		resolver:        NewResolver(),
+		devicesByPort:   make(map[string]*DeviceState),
+		devicesByECID:   make(map[string]*DeviceState),
 		cooldowns:       make(map[string]time.Time),
-		processing:      make(map[string]bool),
 		processingPorts: make(map[string]bool),
 	}
 }
@@ -39,42 +261,19 @@ func (o *Orchestrator) Start(ctx context.Context) {
 	log.Println("Orchestrator starting...")
 	o.notifier.Speak("Система запущена")
 
-	deviceScanChan := make(chan []*model.Device, 1)
+	eventChan := make(chan DeviceEvent, 10)
 	provisionJobsChan := make(chan *model.Device, o.cfg.MaxConcurrentJobs)
 	provisionResultsChan := make(chan ProvisionResult, o.cfg.MaxConcurrentJobs)
 
 	var wg sync.WaitGroup
 
+	scanner := NewScanner(o.cfg.CheckInterval)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(o.cfg.CheckInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				// 1. Получаем список от system_profiler
-				devices, err := scanUSB(ctx)
-				if err != nil {
-					log.Printf("⚠️ Ошибка сканирования USB: %v", err)
-					continue
-				}
-
-				// 2. Получаем список от cfgutil
-				resolvedDevices := o.resolver.GetResolvedDevices(ctx)
-
-				// 3. "Склеиваем" информацию
-				o.mergeDeviceData(devices, resolvedDevices)
-
-				// 4. Отправляем обогащенный список дальше
-				deviceScanChan <- devices
-			}
-		}
+		scanner.Start(ctx, eventChan)
 	}()
 
-	// ... остальная часть Start остается без изменений
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -97,108 +296,120 @@ func (o *Orchestrator) Start(ctx context.Context) {
 			log.Println("Orchestrator shutting down...")
 			wg.Wait()
 			return
-		case devices := <-deviceScanChan:
-			o.processDeviceList(devices, provisionJobsChan)
+		case event := <-eventChan:
+			o.handleDeviceEvent(ctx, event, provisionJobsChan)
 		case result := <-provisionResultsChan:
-			o.processProvisionResult(result)
+			o.handleProvisionResult(result)
 		case <-dfuTriggerTicker.C:
 			o.checkAndTriggerDFU(ctx)
 		}
 	}
 }
 
-// mergeDeviceData обогащает устройства из system_profiler данными из cfgutil.
-func (o *Orchestrator) mergeDeviceData(profilerDevices []*model.Device, cfgutilDevices map[string]*ResolvedDevice) {
-	if len(cfgutilDevices) == 0 {
+func (o *Orchestrator) handleDeviceEvent(ctx context.Context, event DeviceEvent, jobs chan<- *model.Device) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	switch event.Type {
+	case EventConnected:
+		o.onDeviceConnected(ctx, event.Device, jobs)
+	case EventDisconnected:
+		o.onDeviceDisconnected(event.Device)
+	}
+}
+
+func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device, jobs chan<- *model.Device) {
+	if dev.USBLocation != "" && o.processingPorts[dev.USBLocation] {
 		return
 	}
 
-	for _, pDev := range profilerDevices {
-		// Если у устройства уже есть ECID, ничего не делаем, доверяем сканеру
-		if pDev.ECID != "" {
-			continue
-		}
-
-		// Если ECID нет, ищем по LocationID
-		if pDev.USBLocation != "" {
-			baseLocation := strings.TrimSpace(strings.Split(pDev.USBLocation, "/")[0])
-			if rDev, ok := cfgutilDevices[baseLocation]; ok {
-				pDev.ECID = rDev.ECID
-				pDev.Name = rDev.Name
-			}
-		}
-	}
-}
-
-func (o *Orchestrator) processDeviceList(devices []*model.Device, jobs chan<- *model.Device) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	currentDeviceIDs := make(map[string]bool)
-	newDeviceMap := make(map[string]*model.Device)
-
-	for _, dev := range devices {
-		if dev.ECID != "" {
-			dev.ECID = strings.ToLower(dev.ECID)
-		}
-
-		devID := dev.ID()
-		if devID == "" {
-			continue
-		}
-		currentDeviceIDs[devID] = true
-
-		if oldDev, exists := o.knownDevices[devID]; exists && oldDev.Name != "" && !strings.Contains(strings.ToLower(dev.Name), "dfu") {
-			dev.Name = oldDev.Name
-		}
-		newDeviceMap[devID] = dev
-	}
-
-	for devID, dev := range newDeviceMap {
-		oldDev, exists := o.knownDevices[devID]
-
-		if (dev.ECID != "" && o.processing[dev.ECID]) || (dev.USBLocation != "" && o.processingPorts[dev.USBLocation]) {
-			continue
-		}
-
-		if !exists {
-			log.Printf("🔌 Подключено: %s (State: %s, ECID: %s)", dev.GetDisplayName(), dev.State, dev.ECID)
-			o.notifier.Speak("Подключено " + dev.GetReadableName())
-		} else if oldDev.State != dev.State || oldDev.Name != dev.Name {
-			log.Printf("🔄 Изменение состояния: %s -> %s (ECID: %s)", dev.GetDisplayName(), dev.State, dev.ECID)
-		}
-
-		if dev.State == model.StateDFU && dev.ECID != "" {
-			if cooldownTime, onCooldown := o.cooldowns[dev.ECID]; !onCooldown || time.Now().After(cooldownTime) {
-				o.processing[dev.ECID] = true
-				if dev.USBLocation != "" {
-					o.processingPorts[dev.USBLocation] = true
-				}
-				jobs <- dev
+	if dev.ECID == "" {
+		resolved, err := o.resolver.GetInfoByLocation(ctx)
+		if err == nil {
+			baseLocation := strings.Split(dev.USBLocation, "/")[0]
+			if info, ok := resolved[baseLocation]; ok {
+				dev.ECID = info.ECID
+				dev.Name = info.Name
 			}
 		}
 	}
 
-	for devID, dev := range o.knownDevices {
-		if !currentDeviceIDs[devID] {
-			log.Printf("🔌 Отключено: %s", dev.GetDisplayName())
+	if dev.ECID != "" {
+		dev.ECID = strings.ToLower(dev.ECID)
+	}
+
+	state := &DeviceState{Device: dev}
+	if dev.ECID != "" {
+		if existing, ok := o.devicesByECID[dev.ECID]; ok && existing.AccurateName != "" {
+			state.AccurateName = existing.AccurateName
 		}
 	}
 
-	o.knownDevices = newDeviceMap
+	if dev.State == model.StateNormal && dev.Name != "" {
+		state.AccurateName = dev.Name
+	}
+
+	log.Printf("🔌 Подключено/Обновлено: %s (State: %s, ECID: %s)", state.Device.GetDisplayName(), state.Device.State, state.Device.ECID)
+
+	if dev.USBLocation != "" {
+		o.devicesByPort[dev.USBLocation] = state
+	}
+	if dev.ECID != "" {
+		o.devicesByECID[dev.ECID] = state
+	}
+
+	if dev.State == model.StateDFU && dev.ECID != "" {
+		if cooldown, ok := o.cooldowns[dev.ECID]; ok && time.Now().Before(cooldown) {
+			log.Printf("🕒 Устройство %s в кулдауне", state.AccurateName)
+			return
+		}
+
+		if dev.USBLocation != "" {
+			o.processingPorts[dev.USBLocation] = true
+		}
+
+		jobDev := *dev
+		if state.AccurateName != "" {
+			jobDev.Name = state.AccurateName
+		}
+
+		jobs <- &jobDev
+	}
 }
 
-// ... Функции processProvisionResult и checkAndTriggerDFU остаются без изменений ...
-func (o *Orchestrator) processProvisionResult(result ProvisionResult) {
+func (o *Orchestrator) onDeviceDisconnected(dev *model.Device) {
+	if dev.USBLocation == "" {
+		return
+	}
+
+	state, exists := o.devicesByPort[dev.USBLocation]
+	if !exists {
+		return
+	}
+
+	delete(o.devicesByPort, dev.USBLocation)
+
+	var displayName = dev.GetDisplayName()
+	if state.AccurateName != "" {
+		displayName = state.AccurateName
+	}
+
+	log.Printf("🔌 Отключено: %s", displayName)
+}
+
+func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	displayName := result.Device.GetDisplayName()
-	ecidKey := strings.ToLower(result.Device.ECID)
+	ecid := strings.ToLower(result.Device.ECID)
 
-	delete(o.processing, ecidKey)
-	if result.Device.USBLocation != "" {
-		delete(o.processingPorts, result.Device.USBLocation)
+	var displayName = result.Device.GetDisplayName()
+	if state, ok := o.devicesByECID[ecid]; ok && state.AccurateName != "" {
+		displayName = state.AccurateName
+	}
+
+	if state, ok := o.devicesByECID[ecid]; ok {
+		delete(o.processingPorts, state.USBLocation)
 	}
 
 	if result.Err != nil {
@@ -207,7 +418,7 @@ func (o *Orchestrator) processProvisionResult(result ProvisionResult) {
 	} else {
 		log.Printf("✅ Прошивка завершена для %s. Установлен кулдаун.", displayName)
 		o.notifier.Speak("Прошивка " + displayName + " завершена")
-		o.cooldowns[ecidKey] = time.Now().Add(o.cfg.DFUCooldown)
+		o.cooldowns[ecid] = time.Now().Add(o.cfg.DFUCooldown)
 	}
 }
 
@@ -215,19 +426,23 @@ func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 
-	for _, dev := range o.knownDevices {
-		if isDFUPort(dev.USBLocation) && dev.State == model.StateNormal {
-			ecidKey := strings.ToLower(dev.ECID)
-			if (ecidKey != "" && o.processing[ecidKey]) || (dev.USBLocation != "" && o.processingPorts[dev.USBLocation]) {
-				continue
-			}
+	for port, state := range o.devicesByPort {
+		if o.processingPorts[port] {
+			continue
+		}
 
-			if ecidKey != "" {
-				if cooldownTime, onCooldown := o.cooldowns[ecidKey]; onCooldown && time.Now().Before(cooldownTime) {
+		if isDFUPort(port) && state.State == model.StateNormal {
+			if state.ECID != "" {
+				if cooldown, ok := o.cooldowns[state.ECID]; ok && time.Now().Before(cooldown) {
 					continue
 				}
 			}
+			var name = state.AccurateName
+			if name == "" {
+				name = state.GetDisplayName()
+			}
 
+			log.Printf("⚡️ Запуск DFU для %s на порту %s", name, port)
 			go triggerDFU(ctx)
 			return
 		}

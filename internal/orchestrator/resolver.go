@@ -5,54 +5,39 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os/exec"
 	"strings"
-	"sync"
 	"time"
 )
 
-// ResolvedDevice содержит информацию, полученную из cfgutil.
-type ResolvedDevice struct {
+// ResolvedInfo содержит точные данные об устройстве из cfgutil.
+type ResolvedInfo struct {
 	ECID       string
 	DeviceType string
 	Name       string
-	LocationID string // Location ID в формате 0x...
 }
 
-// Resolver вызывает `cfgutil list`.
-type Resolver struct {
-	cache     map[string]*ResolvedDevice // Кэш [LocationID -> ResolvedDevice]
-	cacheTime time.Time
-	cacheTTL  time.Duration
-	mu        sync.Mutex
-}
+// Resolver вызывает `cfgutil` для получения точных данных об устройствах.
+type Resolver struct{}
 
 func NewResolver() *Resolver {
-	return &Resolver{
-		cache:    make(map[string]*ResolvedDevice),
-		cacheTTL: 5 * time.Second, // Короткий TTL, так как состояние портов важно
-	}
+	return &Resolver{}
 }
 
-// GetResolvedDevices выполняет `cfgutil list` и возвращает карту устройств.
-func (r *Resolver) GetResolvedDevices(ctx context.Context) map[string]*ResolvedDevice {
-	r.mu.Lock()
-	if time.Since(r.cacheTime) < r.cacheTTL {
-		defer r.mu.Unlock()
-		return r.copyCache()
-	}
-	r.mu.Unlock()
+// GetInfoByLocation выполняет `cfgutil list` и возвращает карту [LocationID -> Info].
+func (r *Resolver) GetInfoByLocation(ctx context.Context) (map[string]ResolvedInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second) // Таймаут на вызов
+	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "cfgutil", "--format", "json", "list")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		// Ошибка "нет устройств" (код 70) - это не ошибка приложения, а нормальная ситуация.
-		if !strings.Contains(err.Error(), "exit status 70") {
-			log.Printf("⚠️ Не удалось выполнить cfgutil list: %v.", err)
+		// Ошибка "нет устройств" (код 70) - не является ошибкой для нас.
+		if strings.Contains(err.Error(), "exit status 70") {
+			return make(map[string]ResolvedInfo), nil // Возвращаем пустую карту
 		}
-		return nil
+		return nil, fmt.Errorf("ошибка выполнения cfgutil list: %w", err)
 	}
 
 	var response struct {
@@ -65,21 +50,15 @@ func (r *Resolver) GetResolvedDevices(ctx context.Context) map[string]*ResolvedD
 	}
 
 	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
-		log.Printf("⚠️ Не удалось разобрать JSON от cfgutil: %v", err)
-		return nil
+		return nil, fmt.Errorf("ошибка парсинга JSON от cfgutil: %w", err)
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.cache = make(map[string]*ResolvedDevice) // Очищаем старый кэш
-
+	resolvedMap := make(map[string]ResolvedInfo)
 	for _, devInfo := range response.Output {
 		if devInfo.LocationID == 0 {
 			continue
 		}
 
-		// Приводим locationID к формату system_profiler (hex)
 		locationKey := fmt.Sprintf("0x%x", devInfo.LocationID)
 
 		var name string
@@ -94,22 +73,12 @@ func (r *Resolver) GetResolvedDevices(ctx context.Context) map[string]*ResolvedD
 			ecid = "0x" + ecid
 		}
 
-		r.cache[locationKey] = &ResolvedDevice{
+		resolvedMap[locationKey] = ResolvedInfo{
 			ECID:       ecid,
 			DeviceType: devInfo.DeviceType,
 			Name:       name,
-			LocationID: locationKey,
 		}
 	}
-	r.cacheTime = time.Now()
 
-	return r.copyCache()
-}
-
-func (r *Resolver) copyCache() map[string]*ResolvedDevice {
-	cacheCopy := make(map[string]*ResolvedDevice, len(r.cache))
-	for k, v := range r.cache {
-		cacheCopy[k] = v
-	}
-	return cacheCopy
+	return resolvedMap, nil
 }

@@ -24,8 +24,8 @@ func NewResolver() *Resolver {
 	return &Resolver{}
 }
 
-// GetInfoByLocation выполняет `cfgutil list` и возвращает карту [LocationID -> Info].
-func (r *Resolver) GetInfoByLocation(ctx context.Context) (map[string]ResolvedInfo, error) {
+// GetInfoByECID выполняет `cfgutil list` и возвращает карту [ECID -> Info].
+func (r *Resolver) GetInfoByECID(ctx context.Context) (map[string]ResolvedInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second) // Таймаут на вызов
 	defer cancel()
 
@@ -55,11 +55,9 @@ func (r *Resolver) GetInfoByLocation(ctx context.Context) (map[string]ResolvedIn
 
 	resolvedMap := make(map[string]ResolvedInfo)
 	for _, devInfo := range response.Output {
-		if devInfo.LocationID == 0 {
+		if devInfo.ECID == "" {
 			continue
 		}
-
-		locationKey := fmt.Sprintf("0x%x", devInfo.LocationID)
 
 		var name string
 		if devInfo.Name != nil && *devInfo.Name != "" {
@@ -73,7 +71,7 @@ func (r *Resolver) GetInfoByLocation(ctx context.Context) (map[string]ResolvedIn
 			ecid = "0x" + ecid
 		}
 
-		resolvedMap[locationKey] = ResolvedInfo{
+		resolvedMap[ecid] = ResolvedInfo{
 			ECID:       ecid,
 			DeviceType: devInfo.DeviceType,
 			Name:       name,

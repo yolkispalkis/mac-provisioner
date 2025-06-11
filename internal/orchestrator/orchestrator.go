@@ -225,7 +225,6 @@ func New(cfg *config.Config, notifier notifier.Notifier, infoLogger, debugLogger
 }
 
 func (o *Orchestrator) Start(ctx context.Context) {
-	o.infoLogger.Println("Orchestrator starting...")
 	o.notifier.Speak("Система запущена")
 	eventChan := make(chan DeviceEvent, 10)
 	provisionJobsChan := make(chan *model.Device, o.cfg.MaxConcurrentJobs)

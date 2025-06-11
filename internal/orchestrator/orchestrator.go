@@ -385,27 +385,53 @@ func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 	}
 }
 
+// ==================================================================================
+// === ИЗМЕНЕНИЯ ЗДЕСЬ: Усовершенствованная логика авто-DFU ===
+// ==================================================================================
 func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
+
+	// Итерируемся по всем портам, чтобы найти подходящий для авто-DFU
 	for port, state := range o.devicesByPort {
+		// 1. Проверяем, является ли порт специальным DFU-портом
+		if !isDFUPort(port) {
+			continue // Если нет, идем к следующему устройству
+		}
+
+		// 2. Проверяем, не занят ли этот порт уже идущей прошивкой
 		if o.processingPorts[port] {
+			log.Printf("... Порт для авто-DFU (%s) занят, пропуск.", port)
 			continue
 		}
-		if isDFUPort(port) && state.State == model.StateNormal {
-			if state.ECID != "" {
-				if cooldown, ok := o.cooldowns[state.ECID]; ok && time.Now().Before(cooldown) {
-					continue
-				}
-			}
-			var name = state.Device.GetDisplayName()
-			if state.AccurateName != "" {
-				name = state.AccurateName
-			}
-			log.Printf("⚡️ Запуск DFU для %s на порту %s", name, port)
-			o.notifier.SpeakImmediately("Перевожу " + name + " в режим ДФУ")
-			go triggerDFU(ctx)
-			return
+
+		// 3. Проверяем, что устройство на этом порту в нормальном режиме.
+		//    Нет смысла переводить в DFU то, что уже в DFU или Recovery.
+		if state.State != model.StateNormal {
+			continue
 		}
+
+		// 4. Проверяем, не находится ли конкретное устройство в кулдауне
+		if state.ECID != "" {
+			if cooldown, ok := o.cooldowns[state.ECID]; ok && time.Now().Before(cooldown) {
+				log.Printf("... Устройство %s на DFU-порту в кулдауне, пропуск.", state.GetDisplayName())
+				continue
+			}
+		}
+
+		// Если все проверки пройдены, это наш кандидат!
+		var name = state.GetDisplayName()
+		if state.AccurateName != "" {
+			name = state.AccurateName
+		}
+
+		log.Printf("⚡️ Обнаружено устройство %s на свободном DFU-порту. Запуск авто-DFU...", name)
+		o.notifier.SpeakImmediately("Перевожу " + name + " в режим ДФУ")
+
+		// Запускаем в горутине, чтобы не блокировать цикл
+		go triggerDFU(ctx)
+
+		// Важно! Выходим из функции после запуска, чтобы не триггерить несколько DFU за раз.
+		return
 	}
 }

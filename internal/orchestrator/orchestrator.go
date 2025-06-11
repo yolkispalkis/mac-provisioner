@@ -173,7 +173,6 @@ func createDeviceFromProfiler(item *struct {
 	} else {
 		return nil
 	}
-
 	var rawECID string
 	if parts := strings.Split(item.SerialNum, "-"); len(parts) == 2 && isValidHexECID(parts[1]) {
 		rawECID = parts[1]
@@ -182,7 +181,6 @@ func createDeviceFromProfiler(item *struct {
 	} else if isValidHexECID(item.SerialNum) {
 		rawECID = item.SerialNum
 	}
-
 	if rawECID != "" {
 		normalized, err := normalizeECID(rawECID)
 		if err == nil {
@@ -274,6 +272,9 @@ func (o *Orchestrator) handleDeviceEvent(ctx context.Context, event DeviceEvent,
 	}
 }
 
+// ==================================================================================
+// === ИЗМЕНЕНИЯ ЗДЕСЬ: Логика выбора голосового уведомления ===
+// ==================================================================================
 func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device, jobs chan<- *model.Device) {
 	if dev.USBLocation != "" && o.processingPorts[dev.USBLocation] {
 		log.Printf("... Порт %s уже в обработке, пропускаем.", dev.USBLocation)
@@ -305,8 +306,7 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 
 	log.Printf("🔌 Подключено/Обновлено: %s (Состояние: %s, ECID: %s)", state.Device.GetDisplayName(), state.Device.State, state.Device.ECID)
 
-	o.notifier.Speak("Подключено " + state.Device.GetReadableName())
-
+	// Сохраняем состояние в карты
 	if dev.USBLocation != "" {
 		o.devicesByPort[dev.USBLocation] = state
 	}
@@ -314,24 +314,38 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 		o.devicesByECID[dev.ECID] = state
 	}
 
+	// Умный выбор голосового уведомления
 	if dev.State == model.StateDFU && dev.ECID != "" {
+		// Проверяем кулдаун
 		if cooldown, ok := o.cooldowns[dev.ECID]; ok && time.Now().Before(cooldown) {
 			log.Printf("🕒 Устройство %s (%s) в кулдауне, прошивка отложена.", state.Device.GetDisplayName(), dev.ECID)
+			// Устройство просто подключено, но ничего не происходит. Говорим "Подключено".
+			o.notifier.Speak("Подключено " + state.Device.GetReadableName() + ", но в кулдауне")
 			return
 		}
 
+		// Если нет кулдауна, мы начинаем прошивку.
+		// Поэтому говорим ТОЛЬКО "Начинаю прошивку" и НЕ говорим "Подключено".
 		if dev.USBLocation != "" {
 			o.processingPorts[dev.USBLocation] = true
 		}
 
 		jobDev := *state.Device
 		log.Printf("=> Отправляем %s на прошивку.", jobDev.GetDisplayName())
-
 		o.notifier.SpeakImmediately("Начинаю прошивку " + jobDev.GetReadableName())
-
 		jobs <- &jobDev
+
+	} else {
+		// Во всех остальных случаях (Normal, Recovery, или DFU без ECID)
+		// это просто событие подключения.
+		o.notifier.Speak("Подключено " + state.Device.GetReadableName())
 	}
 }
+
+// ==================================================================================
+// === КОНЕЦ ИЗМЕНЕНИЙ ===
+// ==================================================================================
+
 func (o *Orchestrator) onDeviceDisconnected(dev *model.Device) {
 	if dev.USBLocation == "" {
 		return

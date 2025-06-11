@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -26,9 +25,8 @@ const (
 )
 
 type ProvisionUpdate struct {
-	Device     *model.Device
-	Status     ProvisionStatusType
-	Percentage string
+	Device *model.Device
+	Status ProvisionStatusType
 }
 
 type ProvisionResult struct {
@@ -58,7 +56,6 @@ func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- P
 	var wg sync.WaitGroup
 	var lastStatus ProvisionStatusType
 	var outputCollector strings.Builder
-	percentRegex := regexp.MustCompile(`\[\s*(\d{1,3}(?:\.\d{1,2})?)\s*%`)
 
 	processStream := func(stream io.Reader) {
 		defer wg.Done()
@@ -83,11 +80,6 @@ func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- P
 			if currentStatus != "" && currentStatus != lastStatus {
 				lastStatus = currentStatus
 				updateChan <- ProvisionUpdate{Device: dev, Status: currentStatus}
-			}
-
-			if matches := percentRegex.FindStringSubmatch(line); len(matches) > 1 {
-				percentStr := matches[1]
-				updateChan <- ProvisionUpdate{Device: dev, Percentage: percentStr}
 			}
 		}
 	}

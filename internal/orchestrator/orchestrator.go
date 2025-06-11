@@ -17,8 +17,6 @@ import (
 )
 
 // --- КОД ИЗ SCANNER.GO, ВКЛЮЧАЯ ВСЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-
-// EventType определяет тип события, связанного с устройством.
 type EventType string
 
 const (
@@ -26,16 +24,13 @@ const (
 	EventDisconnected EventType = "Disconnected"
 )
 
-// DeviceEvent представляет событие, связанное с устройством.
 type DeviceEvent struct {
 	Type   EventType
 	Device *model.Device
 }
-
-// Scanner отслеживает USB-устройства и генерирует события.
 type Scanner struct {
 	interval     time.Duration
-	knownDevices map[string]*model.Device // Ключ: USB Location
+	knownDevices map[string]*model.Device
 	mu           sync.Mutex
 }
 
@@ -45,15 +40,10 @@ func NewScanner(interval time.Duration) *Scanner {
 		knownDevices: make(map[string]*model.Device),
 	}
 }
-
-// Start запускает цикл сканирования, отправляя события в канал.
 func (s *Scanner) Start(ctx context.Context, eventChan chan<- DeviceEvent) {
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
-
-	// Выполняем первое сканирование сразу
 	s.scanAndEmitEvents(ctx, eventChan)
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -63,31 +53,26 @@ func (s *Scanner) Start(ctx context.Context, eventChan chan<- DeviceEvent) {
 		}
 	}
 }
-
 func (s *Scanner) scanAndEmitEvents(ctx context.Context, eventChan chan<- DeviceEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	devices, err := scanUSB(ctx)
 	if err != nil {
 		log.Printf("⚠️ Ошибка сканирования USB: %v", err)
 		return
 	}
-
 	currentDevices := make(map[string]bool)
 	for _, dev := range devices {
 		if dev.USBLocation == "" {
 			continue
 		}
 		currentDevices[dev.USBLocation] = true
-
 		oldDev, exists := s.knownDevices[dev.USBLocation]
 		if !exists || oldDev.State != dev.State || oldDev.ECID != dev.ECID {
 			s.knownDevices[dev.USBLocation] = dev
 			eventChan <- DeviceEvent{Type: EventConnected, Device: dev}
 		}
 	}
-
 	for location, dev := range s.knownDevices {
 		if !currentDevices[location] {
 			delete(s.knownDevices, location)
@@ -95,10 +80,6 @@ func (s *Scanner) scanAndEmitEvents(ctx context.Context, eventChan chan<- Device
 		}
 	}
 }
-
-// --- НЕДОСТАЮЩИЕ ФУНКЦИИ ---
-
-// scanUSB выполняет системный вызов для получения списка USB-устройств.
 func scanUSB(ctx context.Context) ([]*model.Device, error) {
 	cmd := exec.CommandContext(ctx, "system_profiler", "SPUSBDataType", "-json")
 	var out bytes.Buffer
@@ -106,23 +87,18 @@ func scanUSB(ctx context.Context) ([]*model.Device, error) {
 	if err := cmd.Run(); err != nil {
 		return nil, err
 	}
-
 	var data struct {
 		USB []json.RawMessage `json:"SPUSBDataType"`
 	}
 	if err := json.Unmarshal(out.Bytes(), &data); err != nil {
 		return nil, err
 	}
-
 	var devices []*model.Device
 	for _, rawItem := range data.USB {
 		devices = append(devices, parseDeviceTree(rawItem)...)
 	}
-
 	return devices, nil
 }
-
-// parseDeviceTree рекурсивно обходит дерево USB-устройств из JSON.
 func parseDeviceTree(rawItem json.RawMessage) []*model.Device {
 	var item struct {
 		Name         string            `json:"_name"`
@@ -136,22 +112,17 @@ func parseDeviceTree(rawItem json.RawMessage) []*model.Device {
 	if err := json.Unmarshal(rawItem, &item); err != nil {
 		return nil
 	}
-
 	var found []*model.Device
-
 	if strings.EqualFold(item.VendorID, "0x05ac") || strings.Contains(item.Manufacturer, "Apple") {
 		if dev := createDeviceFromProfiler(&item); dev != nil {
 			found = append(found, dev)
 		}
 	}
-
 	for _, subItem := range item.Items {
 		found = append(found, parseDeviceTree(subItem)...)
 	}
-
 	return found
 }
-
 func isValidHexECID(s string) bool {
 	s = strings.TrimPrefix(strings.ToLower(s), "0x")
 	if len(s) < 10 || len(s) > 20 {
@@ -164,7 +135,6 @@ func isValidHexECID(s string) bool {
 	}
 	return true
 }
-
 func createDeviceFromProfiler(item *struct {
 	Name         string            `json:"_name"`
 	ProductID    string            `json:"product_id"`
@@ -179,11 +149,9 @@ func createDeviceFromProfiler(item *struct {
 		USBLocation: item.LocationID,
 		State:       model.StateUnknown,
 	}
-
 	name := strings.ToLower(item.Name)
 	isDFUProduct := item.ProductID == "0x1281" || item.ProductID == "0x1227"
 	isRecoveryProduct := item.ProductID == "0x1280"
-
 	if strings.Contains(name, "dfu mode") || isDFUProduct {
 		dev.State = model.StateDFU
 	} else if strings.Contains(name, "recovery mode") || isRecoveryProduct {
@@ -193,7 +161,6 @@ func createDeviceFromProfiler(item *struct {
 	} else {
 		return nil
 	}
-
 	if parts := strings.Split(item.SerialNum, "-"); len(parts) == 2 && isValidHexECID(parts[1]) {
 		ecidStr := strings.ToLower(parts[1])
 		if !strings.HasPrefix(ecidStr, "0x") {
@@ -203,14 +170,12 @@ func createDeviceFromProfiler(item *struct {
 		}
 		return dev
 	}
-
 	re := regexp.MustCompile(`(?i)ECID:?\s*([0-9A-F]+)`)
 	matches := re.FindStringSubmatch(item.SerialNum)
 	if len(matches) > 1 {
 		dev.ECID = "0x" + strings.ToLower(matches[1])
 		return dev
 	}
-
 	if isValidHexECID(item.SerialNum) {
 		ecidStr := strings.ToLower(item.SerialNum)
 		if !strings.HasPrefix(ecidStr, "0x") {
@@ -220,29 +185,23 @@ func createDeviceFromProfiler(item *struct {
 		}
 		return dev
 	}
-
 	return dev
 }
 
 // --- КОД ОРКЕСТРАТОРА ---
-
-// DeviceState представляет полное состояние известного устройства.
 type DeviceState struct {
 	*model.Device
-	AccurateName string // Самое точное имя, которое мы знаем
+	AccurateName string
 }
-
 type Orchestrator struct {
-	cfg      *config.Config
-	notifier notifier.Notifier
-	resolver *Resolver
-
+	cfg             *config.Config
+	notifier        notifier.Notifier
+	resolver        *Resolver
 	devicesByPort   map[string]*DeviceState
 	devicesByECID   map[string]*DeviceState
 	cooldowns       map[string]time.Time
 	processingPorts map[string]bool
-
-	mu sync.RWMutex
+	mu              sync.RWMutex
 }
 
 func New(cfg *config.Config, notifier notifier.Notifier) *Orchestrator {
@@ -256,24 +215,19 @@ func New(cfg *config.Config, notifier notifier.Notifier) *Orchestrator {
 		processingPorts: make(map[string]bool),
 	}
 }
-
 func (o *Orchestrator) Start(ctx context.Context) {
 	log.Println("Orchestrator starting...")
 	o.notifier.Speak("Система запущена")
-
 	eventChan := make(chan DeviceEvent, 10)
 	provisionJobsChan := make(chan *model.Device, o.cfg.MaxConcurrentJobs)
 	provisionResultsChan := make(chan ProvisionResult, o.cfg.MaxConcurrentJobs)
-
 	var wg sync.WaitGroup
-
 	scanner := NewScanner(o.cfg.CheckInterval)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		scanner.Start(ctx, eventChan)
 	}()
-
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -286,10 +240,8 @@ func (o *Orchestrator) Start(ctx context.Context) {
 			}
 		}
 	}()
-
 	dfuTriggerTicker := time.NewTicker(o.cfg.CheckInterval * 2)
 	defer dfuTriggerTicker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -305,11 +257,9 @@ func (o *Orchestrator) Start(ctx context.Context) {
 		}
 	}
 }
-
 func (o *Orchestrator) handleDeviceEvent(ctx context.Context, event DeviceEvent, jobs chan<- *model.Device) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-
 	switch event.Type {
 	case EventConnected:
 		o.onDeviceConnected(ctx, event.Device, jobs)
@@ -318,6 +268,9 @@ func (o *Orchestrator) handleDeviceEvent(ctx context.Context, event DeviceEvent,
 	}
 }
 
+// ==================================================================================
+// === ИЗМЕНЕНИЯ ЗДЕСЬ: Убрано ошибочное условие ===
+// ==================================================================================
 func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device, jobs chan<- *model.Device) {
 	if dev.USBLocation != "" && o.processingPorts[dev.USBLocation] {
 		log.Printf("... Порт %s уже в обработке, пропускаем.", dev.USBLocation)
@@ -336,12 +289,11 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 		}
 	}
 
-	// cfgutil работает только для Normal/Recovery, но не DFU.
-	if dev.ECID != "" && (dev.State == model.StateNormal || dev.State == model.StateRecovery) {
-		// Вызываем новую функцию GetInfoByECID
+	// ИСПРАВЛЕНИЕ: Убираем проверку `dev.State`. Теперь `resolver` вызывается
+	// для любого состояния, если есть ECID.
+	if dev.ECID != "" {
 		resolved, err := o.resolver.GetInfoByECID(ctx)
 		if err == nil {
-			// Ищем информацию по ECID устройства
 			if info, ok := resolved[dev.ECID]; ok {
 				log.Printf("✨ Найдена точная информация для ECID %s: Name=%s", dev.ECID, info.Name)
 				if info.Name != "" {
@@ -374,7 +326,6 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 		}
 
 		jobDev := *state.Device
-
 		log.Printf("=> Отправляем %s на прошивку.", jobDev.GetDisplayName())
 		jobs <- &jobDev
 	}
@@ -384,37 +335,29 @@ func (o *Orchestrator) onDeviceDisconnected(dev *model.Device) {
 	if dev.USBLocation == "" {
 		return
 	}
-
 	state, exists := o.devicesByPort[dev.USBLocation]
 	if !exists {
 		return
 	}
-
 	delete(o.devicesByPort, dev.USBLocation)
-
 	var displayName = dev.GetDisplayName()
 	if state.AccurateName != "" {
 		displayName = state.AccurateName
 	}
-
 	log.Printf("🔌 Отключено: %s", displayName)
 }
 
 func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-
 	ecid := strings.ToLower(result.Device.ECID)
-
 	var displayName = result.Device.GetDisplayName()
 	if state, ok := o.devicesByECID[ecid]; ok && state.AccurateName != "" {
 		displayName = state.AccurateName
 	}
-
 	if state, ok := o.devicesByECID[ecid]; ok {
 		delete(o.processingPorts, state.USBLocation)
 	}
-
 	if result.Err != nil {
 		log.Printf("❌ Ошибка прошивки %s: %v", displayName, result.Err)
 		o.notifier.Speak("Ошибка прошивки " + result.Device.GetReadableName())
@@ -428,12 +371,10 @@ func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
-
 	for port, state := range o.devicesByPort {
 		if o.processingPorts[port] {
 			continue
 		}
-
 		if isDFUPort(port) && state.State == model.StateNormal {
 			if state.ECID != "" {
 				if cooldown, ok := o.cooldowns[state.ECID]; ok && time.Now().Before(cooldown) {
@@ -444,7 +385,6 @@ func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
 			if state.AccurateName != "" {
 				name = state.AccurateName
 			}
-
 			log.Printf("⚡️ Запуск DFU для %s на порту %s", name, port)
 			go triggerDFU(ctx)
 			return

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,7 +18,25 @@ import (
 	"mac-provisioner/internal/notifier"
 )
 
+// normalizeECID приводит строку с ECID к каноническому виду (lowercase, без лишних нулей).
+// Это ключевая функция для исправления бага.
+func normalizeECID(rawECID string) (string, error) {
+	// Убираем префикс "0x" и приводим к нижнему регистру
+	cleanECID := strings.TrimPrefix(strings.ToLower(rawECID), "0x")
+
+	// Парсим как 64-битное беззнаковое целое
+	val, err := strconv.ParseUint(cleanECID, 16, 64)
+	if err != nil {
+		return "", fmt.Errorf("не удалось спарсить ECID '%s': %w", rawECID, err)
+	}
+
+	// Форматируем обратно в стандартную строку
+	return fmt.Sprintf("0x%x", val), nil
+}
+
 // --- КОД ИЗ SCANNER.GO, ВКЛЮЧАЯ ВСЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+// ... (здесь идет весь код сканера без изменений, кроме createDeviceFromProfiler)
+
 type EventType string
 
 const (
@@ -125,7 +145,7 @@ func parseDeviceTree(rawItem json.RawMessage) []*model.Device {
 }
 func isValidHexECID(s string) bool {
 	s = strings.TrimPrefix(strings.ToLower(s), "0x")
-	if len(s) < 10 || len(s) > 20 {
+	if len(s) < 10 || len(s) > 24 { // Увеличил диапазон для надежности
 		return false
 	}
 	for _, r := range s {
@@ -135,6 +155,8 @@ func isValidHexECID(s string) bool {
 	}
 	return true
 }
+
+// ИЗМЕНЕНИЕ: createDeviceFromProfiler теперь использует normalizeECID
 func createDeviceFromProfiler(item *struct {
 	Name         string            `json:"_name"`
 	ProductID    string            `json:"product_id"`
@@ -161,34 +183,31 @@ func createDeviceFromProfiler(item *struct {
 	} else {
 		return nil
 	}
+
+	var rawECID string
 	if parts := strings.Split(item.SerialNum, "-"); len(parts) == 2 && isValidHexECID(parts[1]) {
-		ecidStr := strings.ToLower(parts[1])
-		if !strings.HasPrefix(ecidStr, "0x") {
-			dev.ECID = "0x" + ecidStr
-		} else {
-			dev.ECID = ecidStr
-		}
-		return dev
+		rawECID = parts[1]
+	} else if matches := regexp.MustCompile(`(?i)ECID:?\s*([0-9A-F]+)`).FindStringSubmatch(item.SerialNum); len(matches) > 1 {
+		rawECID = matches[1]
+	} else if isValidHexECID(item.SerialNum) {
+		rawECID = item.SerialNum
 	}
-	re := regexp.MustCompile(`(?i)ECID:?\s*([0-9A-F]+)`)
-	matches := re.FindStringSubmatch(item.SerialNum)
-	if len(matches) > 1 {
-		dev.ECID = "0x" + strings.ToLower(matches[1])
-		return dev
-	}
-	if isValidHexECID(item.SerialNum) {
-		ecidStr := strings.ToLower(item.SerialNum)
-		if !strings.HasPrefix(ecidStr, "0x") {
-			dev.ECID = "0x" + ecidStr
+
+	if rawECID != "" {
+		// Используем нормализацию!
+		normalized, err := normalizeECID(rawECID)
+		if err == nil {
+			dev.ECID = normalized
 		} else {
-			dev.ECID = ecidStr
+			log.Printf("⚠️ Не удалось нормализовать ECID от system_profiler: %s", rawECID)
 		}
-		return dev
 	}
 	return dev
 }
 
 // --- КОД ОРКЕСТРАТОРА ---
+// ... (остальной код оркестратора без изменений, он будет работать с нормализованным ECID)
+
 type DeviceState struct {
 	*model.Device
 	AccurateName string
@@ -267,19 +286,13 @@ func (o *Orchestrator) handleDeviceEvent(ctx context.Context, event DeviceEvent,
 		o.onDeviceDisconnected(event.Device)
 	}
 }
-
-// ==================================================================================
-// === ИЗМЕНЕНИЯ ЗДЕСЬ: Убрано ошибочное условие ===
-// ==================================================================================
 func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device, jobs chan<- *model.Device) {
 	if dev.USBLocation != "" && o.processingPorts[dev.USBLocation] {
 		log.Printf("... Порт %s уже в обработке, пропускаем.", dev.USBLocation)
 		return
 	}
 
-	if dev.ECID != "" {
-		dev.ECID = strings.ToLower(dev.ECID)
-	}
+	// ECID уже должен быть нормализован на этапе создания
 
 	state := &DeviceState{Device: dev}
 	if dev.ECID != "" {
@@ -289,8 +302,6 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 		}
 	}
 
-	// ИСПРАВЛЕНИЕ: Убираем проверку `dev.State`. Теперь `resolver` вызывается
-	// для любого состояния, если есть ECID.
 	if dev.ECID != "" {
 		resolved, err := o.resolver.GetInfoByECID(ctx)
 		if err == nil {
@@ -330,7 +341,6 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 		jobs <- &jobDev
 	}
 }
-
 func (o *Orchestrator) onDeviceDisconnected(dev *model.Device) {
 	if dev.USBLocation == "" {
 		return
@@ -346,11 +356,10 @@ func (o *Orchestrator) onDeviceDisconnected(dev *model.Device) {
 	}
 	log.Printf("🔌 Отключено: %s", displayName)
 }
-
 func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	ecid := strings.ToLower(result.Device.ECID)
+	ecid := result.Device.ECID
 	var displayName = result.Device.GetDisplayName()
 	if state, ok := o.devicesByECID[ecid]; ok && state.AccurateName != "" {
 		displayName = state.AccurateName
@@ -367,7 +376,6 @@ func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 		o.cooldowns[ecid] = time.Now().Add(o.cfg.DFUCooldown)
 	}
 }
-
 func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()

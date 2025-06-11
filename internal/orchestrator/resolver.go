@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os/exec"
 	"strings"
 	"time"
@@ -26,16 +27,15 @@ func NewResolver() *Resolver {
 
 // GetInfoByECID выполняет `cfgutil list` и возвращает карту [ECID -> Info].
 func (r *Resolver) GetInfoByECID(ctx context.Context) (map[string]ResolvedInfo, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second) // Таймаут на вызов
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "cfgutil", "--format", "json", "list")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		// Ошибка "нет устройств" (код 70) - не является ошибкой для нас.
 		if strings.Contains(err.Error(), "exit status 70") {
-			return make(map[string]ResolvedInfo), nil // Возвращаем пустую карту
+			return make(map[string]ResolvedInfo), nil
 		}
 		return nil, fmt.Errorf("ошибка выполнения cfgutil list: %w", err)
 	}
@@ -66,13 +66,15 @@ func (r *Resolver) GetInfoByECID(ctx context.Context) (map[string]ResolvedInfo, 
 			name = devInfo.DeviceType
 		}
 
-		ecid := strings.ToLower(devInfo.ECID)
-		if !strings.HasPrefix(ecid, "0x") {
-			ecid = "0x" + ecid
+		// Используем нормализацию!
+		normalizedECID, err := normalizeECID(devInfo.ECID)
+		if err != nil {
+			log.Printf("⚠️ Не удалось нормализовать ECID от cfgutil: %s", devInfo.ECID)
+			continue
 		}
 
-		resolvedMap[ecid] = ResolvedInfo{
-			ECID:       ecid,
+		resolvedMap[normalizedECID] = ResolvedInfo{
+			ECID:       normalizedECID,
 			DeviceType: devInfo.DeviceType,
 			Name:       name,
 		}

@@ -18,7 +18,6 @@ import (
 	"mac-provisioner/internal/notifier"
 )
 
-// normalizeECID приводит строку с ECID к каноническому виду (lowercase, без лишних нулей).
 func normalizeECID(rawECID string) (string, error) {
 	cleanECID := strings.TrimPrefix(strings.ToLower(rawECID), "0x")
 	val, err := strconv.ParseUint(cleanECID, 16, 64)
@@ -28,7 +27,6 @@ func normalizeECID(rawECID string) (string, error) {
 	return fmt.Sprintf("0x%x", val), nil
 }
 
-// --- КОД ИЗ SCANNER.GO, ВКЛЮЧАЯ ВСЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 type EventType string
 
 const (
@@ -192,11 +190,11 @@ func createDeviceFromProfiler(item *struct {
 	return dev
 }
 
-// --- КОД ОРКЕСТРАТОРА ---
 type DeviceState struct {
 	*model.Device
 	AccurateName string
 }
+
 type Orchestrator struct {
 	cfg             *config.Config
 	notifier        notifier.Notifier
@@ -225,11 +223,14 @@ func New(cfg *config.Config, notifier notifier.Notifier, infoLogger, debugLogger
 		debugLogger:     debugLogger,
 	}
 }
+
 func (o *Orchestrator) Start(ctx context.Context) {
+	o.infoLogger.Println("Orchestrator starting...")
 	o.notifier.Speak("Система запущена")
 	eventChan := make(chan DeviceEvent, 10)
 	provisionJobsChan := make(chan *model.Device, o.cfg.MaxConcurrentJobs)
 	provisionResultsChan := make(chan ProvisionResult, o.cfg.MaxConcurrentJobs)
+	provisionUpdateChan := make(chan ProvisionUpdate, o.cfg.MaxConcurrentJobs)
 	var wg sync.WaitGroup
 	scanner := NewScanner(o.cfg.CheckInterval, o.infoLogger, o.debugLogger)
 	wg.Add(1)
@@ -245,7 +246,7 @@ func (o *Orchestrator) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case job := <-provisionJobsChan:
-				go runProvisioning(ctx, job, provisionResultsChan, o.infoLogger)
+				go runProvisioning(ctx, job, provisionResultsChan, provisionUpdateChan, o.infoLogger)
 			}
 		}
 	}()
@@ -261,11 +262,14 @@ func (o *Orchestrator) Start(ctx context.Context) {
 			o.handleDeviceEvent(ctx, event, provisionJobsChan)
 		case result := <-provisionResultsChan:
 			o.handleProvisionResult(result)
+		case update := <-provisionUpdateChan:
+			o.handleProvisionUpdate(update)
 		case <-dfuTriggerTicker.C:
 			o.checkAndTriggerDFU(ctx)
 		}
 	}
 }
+
 func (o *Orchestrator) handleDeviceEvent(ctx context.Context, event DeviceEvent, jobs chan<- *model.Device) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -276,6 +280,7 @@ func (o *Orchestrator) handleDeviceEvent(ctx context.Context, event DeviceEvent,
 		o.onDeviceDisconnected(event.Device)
 	}
 }
+
 func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device, jobs chan<- *model.Device) {
 	if dev.USBLocation != "" && o.processingPorts[dev.USBLocation] {
 		o.debugLogger.Printf("Порт %s уже в обработке, пропускаем.", dev.USBLocation)
@@ -328,6 +333,7 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 		o.notifier.Speak("Подключено " + state.Device.GetReadableName())
 	}
 }
+
 func (o *Orchestrator) onDeviceDisconnected(dev *model.Device) {
 	if dev.USBLocation == "" {
 		return
@@ -343,6 +349,7 @@ func (o *Orchestrator) onDeviceDisconnected(dev *model.Device) {
 	}
 	o.infoLogger.Printf("Отключено: %s", displayName)
 }
+
 func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -372,6 +379,17 @@ func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 		go cleanupConfiguratorCache(o.infoLogger, o.debugLogger)
 	}
 }
+
+func (o *Orchestrator) handleProvisionUpdate(update ProvisionUpdate) {
+	var displayName = update.Device.GetReadableName()
+	o.mu.RLock()
+	if state, ok := o.devicesByECID[update.Device.ECID]; ok && state.AccurateName != "" {
+		displayName = state.AccurateName
+	}
+	o.mu.RUnlock()
+	o.notifier.Announce(fmt.Sprintf("%s, этап %s", displayName, update.Status))
+}
+
 func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()

@@ -294,7 +294,7 @@ func (o *Orchestrator) uiRenderer(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			o.mu.Lock()
+			o.mu.RLock()
 
 			numJobs := len(o.jobStatuses)
 
@@ -303,24 +303,20 @@ func (o *Orchestrator) uiRenderer(ctx context.Context) {
 				fmt.Printf("\033[J")
 			}
 
-			if numJobs == 0 {
-				o.lastRenderedLines = 0
-				o.mu.Unlock()
-				continue
-			}
-
-			var b strings.Builder
-			for _, status := range o.jobStatuses {
-				stage := ""
-				if status.Stage != "" {
-					stage = fmt.Sprintf("(%s)", status.Stage)
+			if numJobs > 0 {
+				var b strings.Builder
+				for _, status := range o.jobStatuses {
+					stage := ""
+					if status.Stage != "" {
+						stage = fmt.Sprintf("(%s)", status.Stage)
+					}
+					b.WriteString(fmt.Sprintf("Прошивка: %-20s %-15s %s\n", status.Name, stage, spinnerChars[i]))
 				}
-				b.WriteString(fmt.Sprintf("Прошивка: %-20s %-15s %s\n", status.Name, stage, spinnerChars[i]))
+				fmt.Print(b.String())
 			}
 
-			fmt.Print(b.String())
 			o.lastRenderedLines = numJobs
-			o.mu.Unlock()
+			o.mu.RUnlock()
 
 			i = (i + 1) % len(spinnerChars)
 		}
@@ -330,6 +326,9 @@ func (o *Orchestrator) uiRenderer(ctx context.Context) {
 func (o *Orchestrator) handleDeviceEvent(ctx context.Context, event DeviceEvent, jobs chan<- *model.Device) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+
+	o.clearUIArea()
+
 	switch event.Type {
 	case EventConnected:
 		o.onDeviceConnected(ctx, event.Device, jobs)
@@ -338,78 +337,11 @@ func (o *Orchestrator) handleDeviceEvent(ctx context.Context, event DeviceEvent,
 	}
 }
 
-func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device, jobs chan<- *model.Device) {
-	if dev.USBLocation != "" && o.processingPorts[dev.USBLocation] {
-		o.debugLogger.Printf("Порт %s уже в обработке, пропускаем.", dev.USBLocation)
-		return
-	}
-	state := &DeviceState{Device: dev}
-	if dev.ECID != "" {
-		if existing, ok := o.devicesByECID[dev.ECID]; ok && existing.AccurateName != "" {
-			state.AccurateName = existing.AccurateName
-			state.Device.Name = existing.AccurateName
-		}
-	}
-	if dev.ECID != "" {
-		resolved, err := o.resolver.GetInfoByECID(ctx)
-		if err == nil {
-			if info, ok := resolved[dev.ECID]; ok {
-				o.debugLogger.Printf("Найдена точная информация для ECID %s: Name=%s", dev.ECID, info.Name)
-				if info.Name != "" {
-					state.Device.Name = info.Name
-					state.AccurateName = info.Name
-				}
-			}
-		} else {
-			o.infoLogger.Printf("[WARN] Не удалось получить информацию от cfgutil: %v", err)
-		}
-	}
-	o.infoLogger.Printf("Подключено/Обновлено: %s (Состояние: %s, ECID: %s)", state.Device.GetDisplayName(), state.Device.State, state.Device.ECID)
-	if dev.USBLocation != "" {
-		o.devicesByPort[dev.USBLocation] = state
-	}
-	if dev.ECID != "" {
-		o.devicesByECID[dev.ECID] = state
-	}
-	if dev.State == model.StateDFU && dev.ECID != "" {
-		if cooldown, ok := o.cooldowns[dev.ECID]; ok && time.Now().Before(cooldown) {
-			o.infoLogger.Printf("Устройство %s (%s) в кулдауне, прошивка отложена.", state.Device.GetDisplayName(), dev.ECID)
-			o.notifier.Speak("Подключено " + state.Device.GetReadableName() + ", но в кулдауне")
-			return
-		}
-		if dev.USBLocation != "" {
-			o.processingPorts[dev.USBLocation] = true
-		}
-		o.jobStatuses[dev.ECID] = &jobStatus{Name: state.Device.GetDisplayName(), Stage: "Ожидание"}
-		o.debugLogger.Printf("Новое задание, активных прошивок: %d", len(o.jobStatuses))
-		jobDev := *state.Device
-		o.debugLogger.Printf("Отправляем %s на прошивку.", jobDev.GetDisplayName())
-		o.notifier.SpeakImmediately("Начинаю прошивку " + jobDev.GetReadableName())
-		jobs <- &jobDev
-	} else {
-		o.notifier.Speak("Подключено " + state.Device.GetReadableName())
-	}
-}
-
-func (o *Orchestrator) onDeviceDisconnected(dev *model.Device) {
-	if dev.USBLocation == "" {
-		return
-	}
-	state, exists := o.devicesByPort[dev.USBLocation]
-	if !exists {
-		return
-	}
-	delete(o.devicesByPort, dev.USBLocation)
-	var displayName = dev.GetDisplayName()
-	if state.AccurateName != "" {
-		displayName = state.AccurateName
-	}
-	o.infoLogger.Printf("Отключено: %s", displayName)
-}
-
 func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+
+	o.clearUIArea()
 
 	ecid := result.Device.ECID
 	delete(o.jobStatuses, ecid)
@@ -452,11 +384,91 @@ func (o *Orchestrator) handleProvisionUpdate(update ProvisionUpdate) {
 	}
 	status.Name = displayName
 
-	if update.Status != "" {
+	if update.Status != "" && status.Stage != update.Status {
 		status.Stage = update.Status
+		o.clearUIArea()
 		o.infoLogger.Printf("[PROVISION][%s] Этап: %s", displayName, update.Status)
 		o.notifier.Announce(fmt.Sprintf("%s, этап %s", displayName, update.Status))
 	}
+}
+
+func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device, jobs chan<- *model.Device) {
+	if dev.USBLocation != "" && o.processingPorts[dev.USBLocation] {
+		o.debugLogger.Printf("Порт %s уже в обработке, пропускаем.", dev.USBLocation)
+		return
+	}
+	state := &DeviceState{Device: dev}
+	if dev.ECID != "" {
+		if existing, ok := o.devicesByECID[dev.ECID]; ok && existing.AccurateName != "" {
+			state.AccurateName = existing.AccurateName
+			state.Device.Name = existing.AccurateName
+		}
+	}
+	if dev.ECID != "" {
+		resolved, err := o.resolver.GetInfoByECID(ctx)
+		if err == nil {
+			if info, ok := resolved[dev.ECID]; ok {
+				o.debugLogger.Printf("Найдена точная информация для ECID %s: Name=%s", dev.ECID, info.Name)
+				if info.Name != "" {
+					state.Device.Name = info.Name
+					state.AccurateName = info.Name
+				}
+			}
+		} else {
+			o.infoLogger.Printf("[WARN] Не удалось получить информацию от cfgutil: %v", err)
+		}
+	}
+
+	o.infoLogger.Printf("Подключено/Обновлено: %s (Состояние: %s, ECID: %s)", state.Device.GetDisplayName(), state.Device.State, state.Device.ECID)
+
+	if dev.USBLocation != "" {
+		o.devicesByPort[dev.USBLocation] = state
+	}
+	if dev.ECID != "" {
+		o.devicesByECID[dev.ECID] = state
+	}
+	if dev.State == model.StateDFU && dev.ECID != "" {
+		if cooldown, ok := o.cooldowns[dev.ECID]; ok && time.Now().Before(cooldown) {
+			o.infoLogger.Printf("Устройство %s (%s) в кулдауне, прошивка отложена.", state.Device.GetDisplayName(), dev.ECID)
+			o.notifier.Speak("Подключено " + state.Device.GetReadableName() + ", но в кулдауне")
+			return
+		}
+		if dev.USBLocation != "" {
+			o.processingPorts[dev.USBLocation] = true
+		}
+		o.jobStatuses[dev.ECID] = &jobStatus{Name: state.Device.GetDisplayName(), Stage: "Ожидание"}
+		o.debugLogger.Printf("Новое задание, активных прошивок: %d", len(o.jobStatuses))
+		jobDev := *state.Device
+		o.debugLogger.Printf("Отправляем %s на прошивку.", jobDev.GetDisplayName())
+		o.notifier.SpeakImmediately("Начинаю прошивку " + jobDev.GetReadableName())
+		jobs <- &jobDev
+	} else {
+		o.notifier.Speak("Подключено " + state.Device.GetReadableName())
+	}
+}
+
+func (o *Orchestrator) onDeviceDisconnected(dev *model.Device) {
+	if dev.USBLocation == "" {
+		return
+	}
+	state, exists := o.devicesByPort[dev.USBLocation]
+	if !exists {
+		return
+	}
+	delete(o.devicesByPort, dev.USBLocation)
+	var displayName = dev.GetDisplayName()
+	if state.AccurateName != "" {
+		displayName = state.AccurateName
+	}
+	o.infoLogger.Printf("Отключено: %s", displayName)
+}
+
+func (o *Orchestrator) clearUIArea() {
+	if o.lastRenderedLines > 0 {
+		fmt.Printf("\033[%dA", o.lastRenderedLines)
+		fmt.Printf("\033[J")
+	}
+	o.lastRenderedLines = 0
 }
 
 func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
@@ -483,7 +495,14 @@ func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
 		if state.AccurateName != "" {
 			name = state.AccurateName
 		}
+
+		o.mu.RUnlock()
+		o.mu.Lock()
+		o.clearUIArea()
 		o.infoLogger.Printf("Обнаружено устройство %s на свободном DFU-порту. Запуск авто-DFU...", name)
+		o.mu.Unlock()
+		o.mu.RLock()
+
 		o.notifier.SpeakImmediately("Перевожу " + name + " в режим ДФУ")
 		go triggerDFU(ctx, o.infoLogger)
 		return

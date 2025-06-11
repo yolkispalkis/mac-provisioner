@@ -196,31 +196,33 @@ type DeviceState struct {
 }
 
 type Orchestrator struct {
-	cfg             *config.Config
-	notifier        notifier.Notifier
-	resolver        *Resolver
-	devicesByPort   map[string]*DeviceState
-	devicesByECID   map[string]*DeviceState
-	cooldowns       map[string]time.Time
-	processingPorts map[string]bool
-	mu              sync.RWMutex
-	activeJobs      int
-	infoLogger      *log.Logger
-	debugLogger     *log.Logger
+	cfg                  *config.Config
+	notifier             notifier.Notifier
+	resolver             *Resolver
+	devicesByPort        map[string]*DeviceState
+	devicesByECID        map[string]*DeviceState
+	cooldowns            map[string]time.Time
+	processingPorts      map[string]bool
+	mu                   sync.RWMutex
+	activeJobs           int
+	lastAnnouncedPercent map[string]int
+	infoLogger           *log.Logger
+	debugLogger          *log.Logger
 }
 
 func New(cfg *config.Config, notifier notifier.Notifier, infoLogger, debugLogger *log.Logger) *Orchestrator {
 	return &Orchestrator{
-		cfg:             cfg,
-		notifier:        notifier,
-		resolver:        NewResolver(infoLogger, debugLogger),
-		devicesByPort:   make(map[string]*DeviceState),
-		devicesByECID:   make(map[string]*DeviceState),
-		cooldowns:       make(map[string]time.Time),
-		processingPorts: make(map[string]bool),
-		activeJobs:      0,
-		infoLogger:      infoLogger,
-		debugLogger:     debugLogger,
+		cfg:                  cfg,
+		notifier:             notifier,
+		resolver:             NewResolver(infoLogger, debugLogger),
+		devicesByPort:        make(map[string]*DeviceState),
+		devicesByECID:        make(map[string]*DeviceState),
+		cooldowns:            make(map[string]time.Time),
+		processingPorts:      make(map[string]bool),
+		activeJobs:           0,
+		lastAnnouncedPercent: make(map[string]int),
+		infoLogger:           infoLogger,
+		debugLogger:          debugLogger,
 	}
 }
 
@@ -328,6 +330,7 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 		jobDev := *state.Device
 		o.debugLogger.Printf("Отправляем %s на прошивку.", jobDev.GetDisplayName())
 		o.notifier.SpeakImmediately("Начинаю прошивку " + jobDev.GetReadableName())
+		o.lastAnnouncedPercent[dev.ECID] = 0
 		jobs <- &jobDev
 	} else {
 		o.notifier.Speak("Подключено " + state.Device.GetReadableName())
@@ -359,6 +362,7 @@ func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 	}
 	o.debugLogger.Printf("Завершено задание, активных прошивок: %d", o.activeJobs)
 	ecid := result.Device.ECID
+	delete(o.lastAnnouncedPercent, ecid)
 	var displayName = result.Device.GetDisplayName()
 	if state, ok := o.devicesByECID[ecid]; ok && state.AccurateName != "" {
 		displayName = state.AccurateName
@@ -381,13 +385,34 @@ func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 }
 
 func (o *Orchestrator) handleProvisionUpdate(update ProvisionUpdate) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
 	var displayName = update.Device.GetReadableName()
-	o.mu.RLock()
 	if state, ok := o.devicesByECID[update.Device.ECID]; ok && state.AccurateName != "" {
 		displayName = state.AccurateName
 	}
-	o.mu.RUnlock()
-	o.notifier.Announce(fmt.Sprintf("%s, этап %s", displayName, update.Status))
+
+	if update.Status != "" {
+		o.notifier.Announce(fmt.Sprintf("%s, этап %s", displayName, update.Status))
+		o.lastAnnouncedPercent[update.Device.ECID] = 0
+		return
+	}
+
+	if update.Percentage != "" {
+		percentValue, err := strconv.ParseFloat(update.Percentage, 64)
+		if err != nil {
+			return
+		}
+		currentPercent := int(percentValue)
+		lastAnnounced := o.lastAnnouncedPercent[update.Device.ECID]
+
+		announceThreshold := 10
+		if (currentPercent/announceThreshold) > (lastAnnounced/announceThreshold) || currentPercent == 100 && lastAnnounced != 100 {
+			o.notifier.Announce(strconv.Itoa(currentPercent))
+			o.lastAnnouncedPercent[update.Device.ECID] = currentPercent
+		}
+	}
 }
 
 func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {

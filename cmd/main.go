@@ -14,25 +14,22 @@ import (
 )
 
 func main() {
-	// === НОВОЕ: Настройка логгеров ===
-	// infoLogger всегда пишет в stdout
 	infoLogger := log.New(os.Stdout, "", log.Ltime)
 
-	// debugLogger пишет в stdout только если DEBUG=1, иначе - в "никуда"
 	var debugOutput io.Writer = io.Discard
 	if os.Getenv("DEBUG") == "1" {
 		debugOutput = os.Stdout
 	}
 	debugLogger := log.New(debugOutput, "DEBUG: ", log.Ltime)
 
-	infoLogger.Println("🚀 Запуск Mac Provisioner")
+	infoLogger.Println("Запуск Mac Provisioner")
 	if os.Getenv("DEBUG") == "1" {
 		infoLogger.Println("   (Режим отладки включен)")
 	}
 
 	cfg, err := config.Load("config.yaml")
 	if err != nil {
-		infoLogger.Fatalf("❌ Не удалось загрузить конфигурацию: %v", err)
+		infoLogger.Fatalf("[FATAL] Не удалось загрузить конфигурацию: %v", err)
 	}
 
 	voiceNotifier := notifier.New(
@@ -41,7 +38,6 @@ func main() {
 		cfg.Notifications.Rate,
 	)
 
-	// === ИЗМЕНЕНИЕ: Передаем логгеры в Orchestrator ===
 	app := orchestrator.New(cfg, voiceNotifier, infoLogger, debugLogger)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -51,11 +47,11 @@ func main() {
 
 	go func() {
 		<-sigChan
-		infoLogger.Println("🛑 Получен сигнал завершения, останавливаемся...")
+		infoLogger.Println("Получен сигнал завершения, остановка...")
 		cancel()
 	}()
 
 	app.Start(ctx)
 
-	infoLogger.Println("✅ Программа завершена.")
+	infoLogger.Println("Программа завершена.")
 }

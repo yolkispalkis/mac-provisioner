@@ -11,7 +11,7 @@ import (
 // Notifier - интерфейс для отправки уведомлений.
 type Notifier interface {
 	Speak(text string)
-	SpeakImmediately(text string) // Новая функция для важных сообщений
+	SpeakImmediately(text string)
 }
 
 // VoiceNotifier реализует Notifier с помощью системной команды 'say'.
@@ -45,8 +45,7 @@ func (n *VoiceNotifier) Speak(text string) {
 	}
 
 	n.mu.Lock()
-	// Защита от спама одинаковыми сообщениями
-	if time.Since(n.lastSpoken[text]) < 10*time.Second { // Увеличим интервал для обычных сообщений
+	if time.Since(n.lastSpoken[text]) < 10*time.Second {
 		n.mu.Unlock()
 		return
 	}
@@ -56,12 +55,11 @@ func (n *VoiceNotifier) Speak(text string) {
 	select {
 	case n.queue <- text:
 	default:
-		log.Println("⚠️ Очередь уведомлений переполнена, сообщение пропущено:", text)
+		log.Println("[WARN] Очередь уведомлений переполнена, сообщение пропущено:", text)
 	}
 }
 
 // SpeakImmediately озвучивает текст немедленно в отдельной горутине.
-// Используется для критически важных, уникальных сообщений.
 func (n *VoiceNotifier) SpeakImmediately(text string) {
 	if !n.enabled || text == "" {
 		return
@@ -70,7 +68,7 @@ func (n *VoiceNotifier) SpeakImmediately(text string) {
 		args := []string{"-v", n.voice, "-r", strconv.Itoa(n.rate), text}
 		cmd := exec.Command("say", args...)
 		if err := cmd.Run(); err != nil {
-			log.Printf("⚠️ Ошибка синтеза речи (немедленно): %v", err)
+			log.Printf("[WARN] Ошибка синтеза речи (немедленно): %v", err)
 		}
 	}()
 }
@@ -80,9 +78,8 @@ func (n *VoiceNotifier) processQueue() {
 		args := []string{"-v", n.voice, "-r", strconv.Itoa(n.rate), text}
 		cmd := exec.Command("say", args...)
 		if err := cmd.Run(); err != nil {
-			log.Printf("⚠️ Ошибка синтеза речи: %v", err)
+			log.Printf("[WARN] Ошибка синтеза речи: %v", err)
 		}
-		// Небольшая пауза, чтобы сообщения не сливались
 		time.Sleep(200 * time.Millisecond)
 	}
 }

@@ -20,9 +20,9 @@ type ProvisionResult struct {
 }
 
 // runProvisioning выполняет прошивку устройства и отправляет результат в канал.
-func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- ProvisionResult, infoLogger, debugLogger *log.Logger) {
+func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- ProvisionResult, infoLogger *log.Logger) {
 	displayName := dev.GetDisplayName()
-	infoLogger.Printf("⚙️  [PROVISION] Начинается прошивка %s", displayName)
+	infoLogger.Printf("[PROVISION] Начинается прошивка %s", displayName)
 
 	ecid := strings.TrimPrefix(dev.ECID, "0x")
 	provCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
@@ -56,21 +56,21 @@ func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- P
 	time.Sleep(150 * time.Millisecond)
 
 	if err != nil {
-		infoLogger.Printf("\n❌ Ошибка вывода cfgutil для %s:\n%s", displayName, string(output))
+		infoLogger.Printf("\n[ERROR] Ошибка вывода cfgutil для %s:\n%s", displayName, string(output))
 		errMsg := fmt.Errorf("ошибка cfgutil: %w", err)
 		resultChan <- ProvisionResult{Device: dev, Err: errMsg}
 		return
 	}
 
-	infoLogger.Printf("✅ [PROVISION] Успешная прошивка %s", displayName)
+	infoLogger.Printf("[PROVISION] Успешная прошивка %s", displayName)
 	resultChan <- ProvisionResult{Device: dev, Err: nil}
 }
 
-func triggerDFU(ctx context.Context, infoLogger, debugLogger *log.Logger) {
-	infoLogger.Println("⚡️ [DFU] Запуск macvdmtool dfu...")
+func triggerDFU(ctx context.Context, infoLogger *log.Logger) {
+	infoLogger.Println("[DFU] Запуск macvdmtool dfu...")
 	cmd := exec.CommandContext(ctx, "macvdmtool", "dfu")
 	if err := cmd.Run(); err != nil {
-		infoLogger.Printf("⚠️ [DFU] macvdmtool завершился с ошибкой: %v", err)
+		infoLogger.Printf("[WARN] macvdmtool завершился с ошибкой: %v", err)
 	}
 }
 
@@ -83,11 +83,11 @@ func isDFUPort(usbLocation string) bool {
 }
 
 func cleanupConfiguratorCache(infoLogger, debugLogger *log.Logger) {
-	infoLogger.Println("🧹 [CLEANUP] Попытка очистки кеша Apple Configurator...")
+	infoLogger.Println("[CLEANUP] Попытка очистки кеша Apple Configurator...")
 
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		infoLogger.Printf("🧹 [CLEANUP] ❌ Не удалось определить домашнюю директорию: %v", err)
+		infoLogger.Printf("[CLEANUP][ERROR] Не удалось определить домашнюю директорию: %v", err)
 		return
 	}
 
@@ -96,28 +96,28 @@ func cleanupConfiguratorCache(infoLogger, debugLogger *log.Logger) {
 	entries, err := os.ReadDir(cachePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			infoLogger.Printf("🧹 [CLEANUP] Директория кеша не найдена, очистка не требуется.")
+			infoLogger.Printf("[CLEANUP] Директория кеша не найдена, очистка не требуется.")
 			return
 		}
-		infoLogger.Printf("🧹 [CLEANUP] ❌ Ошибка чтения директории кеша %s: %v", cachePath, err)
+		infoLogger.Printf("[CLEANUP][ERROR] Ошибка чтения директории кеша %s: %v", cachePath, err)
 		return
 	}
 
 	if len(entries) == 0 {
-		infoLogger.Printf("🧹 [CLEANUP] Кеш уже пуст.")
+		infoLogger.Printf("[CLEANUP] Кеш уже пуст.")
 		return
 	}
 
 	var itemsDeleted int
 	for _, entry := range entries {
 		fullPath := filepath.Join(cachePath, entry.Name())
-		debugLogger.Printf("🧹 [CLEANUP] Удаление: %s", fullPath)
+		debugLogger.Printf("[CLEANUP] Удаление: %s", fullPath)
 		if err := os.RemoveAll(fullPath); err != nil {
-			infoLogger.Printf("🧹 [CLEANUP] ❌ Ошибка удаления %s: %v", fullPath, err)
+			infoLogger.Printf("[CLEANUP][ERROR] Ошибка удаления %s: %v", fullPath, err)
 		} else {
 			itemsDeleted++
 		}
 	}
 
-	infoLogger.Printf("🧹 [CLEANUP] ✅ Очистка завершена. Удалено элементов: %d.", itemsDeleted)
+	infoLogger.Printf("[CLEANUP] Очистка завершена. Удалено элементов: %d.", itemsDeleted)
 }

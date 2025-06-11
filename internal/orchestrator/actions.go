@@ -3,7 +3,6 @@ package orchestrator
 import (
 	"bufio"
 	"context"
-	"fmt"
 	"io"
 	"log"
 	"os"
@@ -42,7 +41,7 @@ func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- P
 	infoLogger.Printf("[PROVISION] Начинается прошивка %s", displayName)
 
 	ecid := strings.TrimPrefix(dev.ECID, "0x")
-	provCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	provCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 
 	cmd := exec.CommandContext(provCtx, "cfgutil", "--ecid", ecid, "restore")
@@ -59,38 +58,7 @@ func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- P
 	var wg sync.WaitGroup
 	var lastStatus ProvisionStatusType
 	var outputCollector strings.Builder
-
-	var mu sync.RWMutex
-	currentPercentage := ""
 	percentRegex := regexp.MustCompile(`\[\s*(\d{1,3}(?:\.\d{1,2})?)\s*%`)
-
-	spinnerCtx, spinnerCancel := context.WithCancel(ctx)
-	go func() {
-		defer spinnerCancel()
-		spinnerChars := []string{"|", "/", "-", "\\"}
-		i := 0
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-spinnerCtx.Done():
-				fmt.Printf("\r%s\n", strings.Repeat(" ", 80))
-				return
-			case <-ticker.C:
-				mu.RLock()
-				p := currentPercentage
-				mu.RUnlock()
-
-				progress := ""
-				if p != "" {
-					progress = fmt.Sprintf("[ %s%% ] ", p)
-				}
-				fmt.Printf("\rПрошивка %s %s... %s", displayName, progress, spinnerChars[i])
-				i = (i + 1) % len(spinnerChars)
-			}
-		}
-	}()
 
 	processStream := func(stream io.Reader) {
 		defer wg.Done()
@@ -113,15 +81,11 @@ func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- P
 
 			if currentStatus != "" && currentStatus != lastStatus {
 				lastStatus = currentStatus
-				infoLogger.Printf("[PROVISION][%s] Этап: %s", displayName, currentStatus)
 				updateChan <- ProvisionUpdate{Device: dev, Status: currentStatus}
 			}
 
 			if matches := percentRegex.FindStringSubmatch(line); len(matches) > 1 {
 				percentStr := matches[1]
-				mu.Lock()
-				currentPercentage = percentStr
-				mu.Unlock()
 				updateChan <- ProvisionUpdate{Device: dev, Percentage: percentStr}
 			}
 		}
@@ -133,8 +97,6 @@ func runProvisioning(ctx context.Context, dev *model.Device, resultChan chan<- P
 
 	wg.Wait()
 	err := cmd.Wait()
-	spinnerCancel()
-	time.Sleep(150 * time.Millisecond)
 
 	if err != nil {
 		infoLogger.Printf("[ERROR] Процесс cfgutil для %s завершился с ошибкой: %v", displayName, err)

@@ -195,6 +195,12 @@ type DeviceState struct {
 	AccurateName string
 }
 
+type jobStatus struct {
+	Name       string
+	Stage      ProvisionStatusType
+	Percentage string
+}
+
 type Orchestrator struct {
 	cfg                  *config.Config
 	notifier             notifier.Notifier
@@ -204,10 +210,10 @@ type Orchestrator struct {
 	cooldowns            map[string]time.Time
 	processingPorts      map[string]bool
 	mu                   sync.RWMutex
-	activeJobs           int
 	lastAnnouncedPercent map[string]int
 	infoLogger           *log.Logger
 	debugLogger          *log.Logger
+	jobStatuses          map[string]*jobStatus
 }
 
 func New(cfg *config.Config, notifier notifier.Notifier, infoLogger, debugLogger *log.Logger) *Orchestrator {
@@ -219,10 +225,10 @@ func New(cfg *config.Config, notifier notifier.Notifier, infoLogger, debugLogger
 		devicesByECID:        make(map[string]*DeviceState),
 		cooldowns:            make(map[string]time.Time),
 		processingPorts:      make(map[string]bool),
-		activeJobs:           0,
 		lastAnnouncedPercent: make(map[string]int),
 		infoLogger:           infoLogger,
 		debugLogger:          debugLogger,
+		jobStatuses:          make(map[string]*jobStatus),
 	}
 }
 
@@ -234,12 +240,14 @@ func (o *Orchestrator) Start(ctx context.Context) {
 	provisionResultsChan := make(chan ProvisionResult, o.cfg.MaxConcurrentJobs)
 	provisionUpdateChan := make(chan ProvisionUpdate, o.cfg.MaxConcurrentJobs)
 	var wg sync.WaitGroup
+
 	scanner := NewScanner(o.cfg.CheckInterval, o.infoLogger, o.debugLogger)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		scanner.Start(ctx, eventChan)
 	}()
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -252,8 +260,13 @@ func (o *Orchestrator) Start(ctx context.Context) {
 			}
 		}
 	}()
+
+	wg.Add(1)
+	go o.uiRenderer(ctx)
+
 	dfuTriggerTicker := time.NewTicker(o.cfg.CheckInterval * 2)
 	defer dfuTriggerTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -268,6 +281,45 @@ func (o *Orchestrator) Start(ctx context.Context) {
 			o.handleProvisionUpdate(update)
 		case <-dfuTriggerTicker.C:
 			o.checkAndTriggerDFU(ctx)
+		}
+	}
+}
+
+func (o *Orchestrator) uiRenderer(ctx context.Context) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	spinnerChars := []string{"|", "/", "-", "\\"}
+	i := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			o.mu.RLock()
+			if len(o.jobStatuses) == 0 {
+				o.mu.RUnlock()
+				continue
+			}
+
+			var b strings.Builder
+			for _, status := range o.jobStatuses {
+				progress := ""
+				if status.Percentage != "" {
+					progress = fmt.Sprintf("[ %s%% ] ", status.Percentage)
+				}
+				stage := ""
+				if status.Stage != "" {
+					stage = fmt.Sprintf("(%s) ", status.Stage)
+				}
+
+				b.WriteString(fmt.Sprintf("Прошивка %s %s%s... %s\n", status.Name, stage, progress, spinnerChars[i]))
+			}
+			o.mu.RUnlock()
+
+			fmt.Print("\033[H\033[2J")
+			fmt.Print(b.String())
+
+			i = (i + 1) % len(spinnerChars)
 		}
 	}
 }
@@ -325,8 +377,8 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 		if dev.USBLocation != "" {
 			o.processingPorts[dev.USBLocation] = true
 		}
-		o.activeJobs++
-		o.debugLogger.Printf("Новое задание, активных прошивок: %d", o.activeJobs)
+		o.jobStatuses[dev.ECID] = &jobStatus{Name: state.Device.GetDisplayName(), Stage: "Ожидание"}
+		o.debugLogger.Printf("Новое задание, активных прошивок: %d", len(o.jobStatuses))
 		jobDev := *state.Device
 		o.debugLogger.Printf("Отправляем %s на прошивку.", jobDev.GetDisplayName())
 		o.notifier.SpeakImmediately("Начинаю прошивку " + jobDev.GetReadableName())
@@ -356,13 +408,13 @@ func (o *Orchestrator) onDeviceDisconnected(dev *model.Device) {
 func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.activeJobs--
-	if o.activeJobs < 0 {
-		o.activeJobs = 0
-	}
-	o.debugLogger.Printf("Завершено задание, активных прошивок: %d", o.activeJobs)
+
 	ecid := result.Device.ECID
+	delete(o.jobStatuses, ecid)
 	delete(o.lastAnnouncedPercent, ecid)
+
+	o.debugLogger.Printf("Завершено задание, активных прошивок: %d", len(o.jobStatuses))
+
 	var displayName = result.Device.GetDisplayName()
 	if state, ok := o.devicesByECID[ecid]; ok && state.AccurateName != "" {
 		displayName = state.AccurateName
@@ -378,7 +430,7 @@ func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 		o.notifier.SpeakImmediately("Прошивка " + result.Device.GetReadableName() + " успешно завершена")
 		o.cooldowns[ecid] = time.Now().Add(o.cfg.DFUCooldown)
 	}
-	if o.activeJobs == 0 {
+	if len(o.jobStatuses) == 0 {
 		o.debugLogger.Printf("Все прошивки завершены, запускаем очистку кеша.")
 		go cleanupConfiguratorCache(o.infoLogger, o.debugLogger)
 	}
@@ -388,18 +440,26 @@ func (o *Orchestrator) handleProvisionUpdate(update ProvisionUpdate) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	status, ok := o.jobStatuses[update.Device.ECID]
+	if !ok {
+		return
+	}
+
 	var displayName = update.Device.GetReadableName()
 	if state, ok := o.devicesByECID[update.Device.ECID]; ok && state.AccurateName != "" {
 		displayName = state.AccurateName
 	}
+	status.Name = displayName
 
 	if update.Status != "" {
+		status.Stage = update.Status
 		o.notifier.Announce(fmt.Sprintf("%s, этап %s", displayName, update.Status))
 		o.lastAnnouncedPercent[update.Device.ECID] = 0
 		return
 	}
 
 	if update.Percentage != "" {
+		status.Percentage = update.Percentage
 		percentValue, err := strconv.ParseFloat(update.Percentage, 64)
 		if err != nil {
 			return
@@ -408,7 +468,7 @@ func (o *Orchestrator) handleProvisionUpdate(update ProvisionUpdate) {
 		lastAnnounced := o.lastAnnouncedPercent[update.Device.ECID]
 
 		announceThreshold := 10
-		if (currentPercent/announceThreshold) > (lastAnnounced/announceThreshold) || currentPercent == 100 && lastAnnounced != 100 {
+		if (currentPercent/announceThreshold) > (lastAnnounced/announceThreshold) || (currentPercent == 100 && lastAnnounced != 100) {
 			o.notifier.Announce(strconv.Itoa(currentPercent))
 			o.lastAnnouncedPercent[update.Device.ECID] = currentPercent
 		}

@@ -19,24 +19,16 @@ import (
 )
 
 // normalizeECID приводит строку с ECID к каноническому виду (lowercase, без лишних нулей).
-// Это ключевая функция для исправления бага.
 func normalizeECID(rawECID string) (string, error) {
-	// Убираем префикс "0x" и приводим к нижнему регистру
 	cleanECID := strings.TrimPrefix(strings.ToLower(rawECID), "0x")
-
-	// Парсим как 64-битное беззнаковое целое
 	val, err := strconv.ParseUint(cleanECID, 16, 64)
 	if err != nil {
 		return "", fmt.Errorf("не удалось спарсить ECID '%s': %w", rawECID, err)
 	}
-
-	// Форматируем обратно в стандартную строку
 	return fmt.Sprintf("0x%x", val), nil
 }
 
 // --- КОД ИЗ SCANNER.GO, ВКЛЮЧАЯ ВСЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-// ... (здесь идет весь код сканера без изменений, кроме createDeviceFromProfiler)
-
 type EventType string
 
 const (
@@ -145,7 +137,7 @@ func parseDeviceTree(rawItem json.RawMessage) []*model.Device {
 }
 func isValidHexECID(s string) bool {
 	s = strings.TrimPrefix(strings.ToLower(s), "0x")
-	if len(s) < 10 || len(s) > 24 { // Увеличил диапазон для надежности
+	if len(s) < 10 || len(s) > 24 {
 		return false
 	}
 	for _, r := range s {
@@ -155,8 +147,6 @@ func isValidHexECID(s string) bool {
 	}
 	return true
 }
-
-// ИЗМЕНЕНИЕ: createDeviceFromProfiler теперь использует normalizeECID
 func createDeviceFromProfiler(item *struct {
 	Name         string            `json:"_name"`
 	ProductID    string            `json:"product_id"`
@@ -194,7 +184,6 @@ func createDeviceFromProfiler(item *struct {
 	}
 
 	if rawECID != "" {
-		// Используем нормализацию!
 		normalized, err := normalizeECID(rawECID)
 		if err == nil {
 			dev.ECID = normalized
@@ -206,8 +195,6 @@ func createDeviceFromProfiler(item *struct {
 }
 
 // --- КОД ОРКЕСТРАТОРА ---
-// ... (остальной код оркестратора без изменений, он будет работать с нормализованным ECID)
-
 type DeviceState struct {
 	*model.Device
 	AccurateName string
@@ -286,13 +273,12 @@ func (o *Orchestrator) handleDeviceEvent(ctx context.Context, event DeviceEvent,
 		o.onDeviceDisconnected(event.Device)
 	}
 }
+
 func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device, jobs chan<- *model.Device) {
 	if dev.USBLocation != "" && o.processingPorts[dev.USBLocation] {
 		log.Printf("... Порт %s уже в обработке, пропускаем.", dev.USBLocation)
 		return
 	}
-
-	// ECID уже должен быть нормализован на этапе создания
 
 	state := &DeviceState{Device: dev}
 	if dev.ECID != "" {
@@ -319,6 +305,8 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 
 	log.Printf("🔌 Подключено/Обновлено: %s (Состояние: %s, ECID: %s)", state.Device.GetDisplayName(), state.Device.State, state.Device.ECID)
 
+	o.notifier.Speak("Подключено " + state.Device.GetReadableName())
+
 	if dev.USBLocation != "" {
 		o.devicesByPort[dev.USBLocation] = state
 	}
@@ -338,6 +326,9 @@ func (o *Orchestrator) onDeviceConnected(ctx context.Context, dev *model.Device,
 
 		jobDev := *state.Device
 		log.Printf("=> Отправляем %s на прошивку.", jobDev.GetDisplayName())
+
+		o.notifier.SpeakImmediately("Начинаю прошивку " + jobDev.GetReadableName())
+
 		jobs <- &jobDev
 	}
 }
@@ -359,6 +350,7 @@ func (o *Orchestrator) onDeviceDisconnected(dev *model.Device) {
 func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+
 	ecid := result.Device.ECID
 	var displayName = result.Device.GetDisplayName()
 	if state, ok := o.devicesByECID[ecid]; ok && state.AccurateName != "" {
@@ -367,12 +359,13 @@ func (o *Orchestrator) handleProvisionResult(result ProvisionResult) {
 	if state, ok := o.devicesByECID[ecid]; ok {
 		delete(o.processingPorts, state.USBLocation)
 	}
+
 	if result.Err != nil {
 		log.Printf("❌ Ошибка прошивки %s: %v", displayName, result.Err)
-		o.notifier.Speak("Ошибка прошивки " + result.Device.GetReadableName())
+		o.notifier.SpeakImmediately("Ошибка прошивки " + result.Device.GetReadableName())
 	} else {
 		log.Printf("✅ Прошивка завершена для %s. Установлен кулдаун.", displayName)
-		o.notifier.Speak("Прошивка " + result.Device.GetReadableName() + " завершена")
+		o.notifier.SpeakImmediately("Прошивка " + result.Device.GetReadableName() + " успешно завершена")
 		o.cooldowns[ecid] = time.Now().Add(o.cfg.DFUCooldown)
 	}
 }
@@ -394,6 +387,9 @@ func (o *Orchestrator) checkAndTriggerDFU(ctx context.Context) {
 				name = state.AccurateName
 			}
 			log.Printf("⚡️ Запуск DFU для %s на порту %s", name, port)
+
+			o.notifier.SpeakImmediately("Перевожу " + name + " в режим ДФУ")
+
 			go triggerDFU(ctx)
 			return
 		}

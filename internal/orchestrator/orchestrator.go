@@ -214,6 +214,7 @@ type Orchestrator struct {
 	infoLogger           *log.Logger
 	debugLogger          *log.Logger
 	jobStatuses          map[string]*jobStatus
+	lastRenderedLines    int
 }
 
 func New(cfg *config.Config, notifier notifier.Notifier, infoLogger, debugLogger *log.Logger) *Orchestrator {
@@ -229,6 +230,7 @@ func New(cfg *config.Config, notifier notifier.Notifier, infoLogger, debugLogger
 		infoLogger:           infoLogger,
 		debugLogger:          debugLogger,
 		jobStatuses:          make(map[string]*jobStatus),
+		lastRenderedLines:    0,
 	}
 }
 
@@ -295,9 +297,15 @@ func (o *Orchestrator) uiRenderer(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			o.mu.RLock()
+			o.mu.Lock()
+			if o.lastRenderedLines > 0 {
+				fmt.Printf("\033[%dA", o.lastRenderedLines)
+				fmt.Printf("\033[J")
+			}
+
 			if len(o.jobStatuses) == 0 {
-				o.mu.RUnlock()
+				o.lastRenderedLines = 0
+				o.mu.Unlock()
 				continue
 			}
 
@@ -305,19 +313,19 @@ func (o *Orchestrator) uiRenderer(ctx context.Context) {
 			for _, status := range o.jobStatuses {
 				progress := ""
 				if status.Percentage != "" {
-					progress = fmt.Sprintf("[ %s%% ] ", status.Percentage)
+					progress = fmt.Sprintf("[ %s%% ]", status.Percentage)
 				}
 				stage := ""
 				if status.Stage != "" {
-					stage = fmt.Sprintf("(%s) ", status.Stage)
+					stage = fmt.Sprintf("(%s)", status.Stage)
 				}
 
-				b.WriteString(fmt.Sprintf("Прошивка %s %s%s... %s\n", status.Name, stage, progress, spinnerChars[i]))
+				b.WriteString(fmt.Sprintf("Прошивка: %-20s %-15s %-15s %s\n", status.Name, stage, progress, spinnerChars[i]))
 			}
-			o.mu.RUnlock()
 
-			fmt.Print("\033[H\033[2J")
 			fmt.Print(b.String())
+			o.lastRenderedLines = len(o.jobStatuses)
+			o.mu.Unlock()
 
 			i = (i + 1) % len(spinnerChars)
 		}
